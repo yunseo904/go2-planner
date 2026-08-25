@@ -1,6 +1,6 @@
-67f72cd09e8ccccfd87ed1b5cb0d8568722ca923
-describe: 67f72cd-dirty
-dirty: yes
+0212482543b7dbf74b0f8a36f26bbe408e12fac9
+describe: 0212482
+dirty: no
 benchmark_module: extreme-parkour/legged_gym/legged_gym/utils/set_terrain_benchmark.py
 benchmark_module_blob: 0f05a0cf6bf9333f29caea65454a117320f86834
 benchmark_module_sha256: 429c3a8a285b197b068ed68bdf93517676e7784fbd31a0c526005f4348620c50
