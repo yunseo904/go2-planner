@@ -4,7 +4,7 @@ __pycache__/
 
 # 대용량 산출물
 data/*.npz
-outputs/
+outputs/*
 logs/
 *.pt
 *.pkl

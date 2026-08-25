@@ -1,0 +1,116 @@
+{
+  "horizontal_scale": 0.05,
+  "vertical_scale": 0.005,
+  "terrain_length_m": 18.0,
+  "terrain_width_m": 4.0,
+  "x_cells": 360,
+  "y_cells": 80,
+  "num_goals": 8,
+  "num_rows": 10,
+  "num_cols": 20,
+  "spawn_x": 1.0,
+  "spawn_y": 2.0,
+  "upstream_commit": "67f72cd09e8ccccfd87ed1b5cb0d8568722ca923",
+  "upstream_module_sha256": "429c3a8a285b197b068ed68bdf93517676e7784fbd31a0c526005f4348620c50",
+  "content_sha256": "c117de08f15cf41a3797e920d561d5c4f95400e29dd397379155bf0c90538596",
+  "npz_sha256": "a8602bc0e4908ce215d4614aed45a164b8bf1663d6be19a06da81603c29a63fc",
+  "task_names": [
+    "jump_on_and_off_box",
+    "forward_ramp_lips",
+    "sphere_bump_lips",
+    "forward_ramp_no_lips",
+    "flush_a_frame",
+    "sphere_bump",
+    "box_jump_even",
+    "box_jump_uneven",
+    "flat_circle_jump",
+    "bump_jump",
+    "sideways_ramp",
+    "stepping_stones_cylinder",
+    "stepping_stones_randomly_arranged",
+    "staircase_walking_full_width",
+    "staircase_walking",
+    "staircase_climbing",
+    "staircase_spiral",
+    "squeeze",
+    "agility_poles",
+    "balance_beam"
+  ],
+  "shapes": {
+    "height_fields": [
+      20,
+      10,
+      360,
+      80
+    ],
+    "height_fields_before_fix": [
+      20,
+      10,
+      360,
+      80
+    ],
+    "goals": [
+      20,
+      10,
+      8,
+      2
+    ],
+    "goals_before_fix": [
+      20,
+      10,
+      8,
+      2
+    ],
+    "set_idx": [
+      20,
+      10
+    ],
+    "seeds": [
+      20,
+      10
+    ],
+    "difficulties": [
+      10
+    ],
+    "variations": [
+      20
+    ],
+    "task_names": [
+      20
+    ],
+    "fix_descs": [
+      20,
+      10
+    ],
+    "difficulty_scaling": [
+      20,
+      2
+    ],
+    "scaled_difficulties": [
+      20,
+      10
+    ]
+  },
+  "fix_desc_counts": {
+    "jump_on_and_off_box": 3,
+    "forward_ramp_lips": 0,
+    "sphere_bump_lips": 10,
+    "forward_ramp_no_lips": 0,
+    "flush_a_frame": 0,
+    "sphere_bump": 10,
+    "box_jump_even": 0,
+    "box_jump_uneven": 0,
+    "flat_circle_jump": 0,
+    "bump_jump": 0,
+    "sideways_ramp": 0,
+    "stepping_stones_cylinder": 0,
+    "stepping_stones_randomly_arranged": 0,
+    "staircase_walking_full_width": 0,
+    "staircase_walking": 0,
+    "staircase_climbing": 0,
+    "staircase_spiral": 0,
+    "squeeze": 0,
+    "agility_poles": 1,
+    "balance_beam": 0
+  }
+}
