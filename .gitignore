@@ -6,6 +6,7 @@ __pycache__/
 data/*.npz
 outputs/*
 logs/
+.venv/
 *.pt
 *.pkl
 

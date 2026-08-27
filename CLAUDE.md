@@ -13,11 +13,17 @@ Go2 파쿠르: 룰베이스 스킬 플래너 vs E2E 학습 정책 비교 (Isaac 
 
 | 경로 | 권한 | 내용 |
 |---|---|---|
-| `~/projects/eurekaverse-go2-parkour` | **읽기 전용** | upstream 리포 (chmod a-w 적용됨) |
-| `~/projects/curated` | **읽기 전용** | 실 로봇 텔레옵 로그 36세션 |
+| `~/projects/eurekaverse-go2-parkour` | **읽기 전용** | upstream 리포. 서버(z4)에서는 `~/ev-go2` 로 가는 심링크 |
+| `~/projects/curated` | **읽기 전용** | 실 로봇 텔레옵 로그 36세션. 서버에는 없어도 된다 |
 | `~/projects/go2-planner` | 읽기/쓰기 | 이 프로젝트. 모든 생성·수정은 여기서만 |
 
 - 원본 두 곳은 어떤 이유로도 수정하지 않는다. 패치가 필요하면 `go2-planner/patches/`에 파일로 만든다.
+- **eurekaverse: 서버에서는 `~/ev-go2` 심링크다. `chmod` 잠금을 걸지 않고 읽기만 하며, 해당
+  트리에는 어떤 수정도 하지 않는다.** 잠금을 걸지 않는 이유는 `~/ev-go2` 가 다른 사람이
+  distillation에 쓰는 살아 있는 작업 트리이기 때문이다 — 잠그면 그쪽 산출물 기록이 막힌다.
+  쓰기 권한이 있다는 사실은 쓰라는 뜻이 아니다. 규율로 지킨다.
+- **`curated/` 는 서버에 없어도 된다.** 필요한 관절 궤적 클립은 이미 `data/skill_clips.npz` 로
+  추출되어 있고 해시로 검증된다. 원본 로그가 다시 필요한 모션 분석(§6)은 노트북에서 한다.
 - 경로는 `pathlib` + `terrain_toolkit/paths.py`를 쓴다. 하드코딩 금지.
 
 ---
