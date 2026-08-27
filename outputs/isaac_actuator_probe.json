@@ -1,0 +1,49 @@
+{
+  "upstream_config": "/workspace/eurekaverse-go2-parkour/extreme-parkour/legged_gym/legged_gym/envs/base/legged_robot_config.py",
+  "control_hz": 50.0,
+  "actuator_classes": {
+    "hip_thigh": "IdealPDActuator",
+    "calf": "IdealPDActuator"
+  },
+  "q1_explicit": true,
+  "stiffness_shape": [
+    1,
+    8
+  ],
+  "q2_runtime_gain_write": true,
+  "q2_torque_ratio_for_2x_gain": 2.0,
+  "q3_has_set_joint_effort_target": true,
+  "q3_effort_delta_for_5nm": 5.0,
+  "q3_effort_is_additive": true,
+  "q3_effort_replaces_pd": false,
+  "q4_has_write_joint_stiffness_to_sim": true,
+  "q4_write_result": "accepted",
+  "q5_saturated_torque_per_joint": [
+    23.7,
+    23.7,
+    23.7,
+    23.7,
+    23.7,
+    23.7,
+    23.7,
+    23.7,
+    45.43,
+    45.43,
+    45.43,
+    45.43
+  ],
+  "q5_joint_names": [
+    "FL_hip_joint",
+    "FR_hip_joint",
+    "RL_hip_joint",
+    "RR_hip_joint",
+    "FL_thigh_joint",
+    "FR_thigh_joint",
+    "RL_thigh_joint",
+    "RR_thigh_joint",
+    "FL_calf_joint",
+    "FR_calf_joint",
+    "RL_calf_joint",
+    "RR_calf_joint"
+  ]
+}
