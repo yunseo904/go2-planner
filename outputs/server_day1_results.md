@@ -37,7 +37,7 @@ The calibration archive was checked **read-only**: `freeze_calibration.py --veri
 
 → full fidelity available; the torque-headroom analysis in `gain_feasibility.md` stands.
 
-## 2 · Convention — **settled: the hip sign is flipped**
+## 2 · Convention — **REOPENED, see the addendum at the end**
 
 The offline `--convention` prediction is confirmed in simulation.
 
@@ -48,9 +48,11 @@ The offline `--convention` prediction is confirmed in simulation.
 | TROT, `--hip-sign keep` | collapses at 0.944 s |
 | TROT, `--hip-sign flip` | survives all 256 steps, min base 0.247 m |
 
-The decisive evidence is not the correlation margin but the **collapse**: TROT replayed with
-the hip columns as logged goes down at 0.94 s and with them negated it does not. Use
-`--hip-sign flip` everywhere.
+The decisive evidence here was the **collapse**: TROT replayed with the hip columns as
+logged goes down at 0.94 s and with them negated it does not.
+
+**This conclusion did not survive the traction measurement. Read the addendum before
+acting on it.**
 
 Two things the doc expected that did not hold:
 
@@ -109,3 +111,112 @@ runs a single `SimulationContext` in a loop. At 20 s budget each that is 2.0 h s
 so **≈ 30 min wall clock on CPU**, less with early termination. No GPU is needed, and none
 would help much: one robot per episode uses no parallelism. Both GPUs on this box are
 occupied by another user's training (17 GB each, ~7.4 GB free).
+
+
+---
+
+# Addendum — the convention question is reopened
+
+Written at the end of day 1, after the forward-speed investigation. **It contradicts the
+step 2 conclusion above.** Do not act on `--hip-sign flip` until this is resolved.
+
+## What was measured
+
+A traction probe (foot slip, foot position in the base frame, base travel) on WALK,
+8 cycles = 5.85 s simulated, Isaac Lab's default ground friction (0.5):
+
+| | `--hip-sign keep` | `--hip-sign flip` |
+|---|---|---|
+| base travel, x | **+1.589 m** | −0.130 m |
+| vx mean | **+0.270 m/s** (log: 0.187) | −0.013 m/s |
+| yaw drift | **−0.08 °/s** | 8.59 °/s |
+
+`keep` walks forward at close to the logged speed and holds a straight line. `flip` does
+not travel at all and yaws. The same split shows in the step 3 verdicts: WALK `keep` read
+vx 0.338 m/s, WALK `flip` read 0.024 m/s.
+
+## Why the day-1 evidence pointed the other way
+
+Both readings that favoured `flip` are weaker than they looked:
+
+* **The mapping margin** (identity at 0.060 with `flip`, 0.020 with `keep`) is computed from
+  the correlation between commanded and measured joint angles. It says the joints track
+  their commands; it says nothing about whether the resulting gait moves the robot.
+* **The TROT collapse** under `keep` is real and unexplained. It is the one piece of
+  evidence still standing for `flip`.
+
+So the two clips disagree: WALK wants `keep`, TROT survives only under `flip`. That is not
+a convention — a joint-frame sign difference cannot be per-clip. Something else is being
+attributed to the hip sign.
+
+## What the foot geometry says — nothing decisive
+
+Both conventions put the feet on the correct side of the body. Foot y in the base frame,
+against a nominal stance of FL +0.172 / FR −0.172 / RL +0.176 / RR −0.176:
+
+* `keep`: +0.130 / −0.130 / +0.155 / −0.155
+* `flip`: +0.158 / −0.157 / +0.151 / −0.152
+
+Neither crosses the midline, so this test does not separate them. An earlier reading of
+this table as evidence *for* `flip` was wrong: it only checked `flip` against nominal and
+never ran `keep`.
+
+## Ground friction is measured, and it is not the forward-speed cause
+
+* Isaac Lab's `RigidBodyMaterialCfg` defaults to **static 0.5 / dynamic 0.5**, and the
+  harness spawns `GroundPlaneCfg()` with no override, so 0.5 is what both replay scripts
+  have been running on.
+* Upstream sets `randomize_friction = True`, `friction_range = [0.6, 2.0]`
+  (`legged_robot_config.py: CustomDomainRandCfg`). **The env never uses 0.5** — the harness
+  ground is below the entire range training and evaluation sample from.
+
+Friction sweep, WALK, `--hip-sign flip`:
+
+| mu | base travel x | vx mean | yaw °/s | foot slip total, FL/FR/RL/RR (m) |
+|---|---|---|---|---|
+| 0.5 (Isaac default) | −0.130 | −0.013 | 8.59 | 0.67 / 0.23 / 0.73 / 0.85 |
+| 0.6 (range min) | −0.156 | −0.019 | 5.74 | 0.36 / 0.25 / 0.38 / 0.65 |
+| 1.0 | −0.243 | −0.063 | 3.83 | 0.17 / 0.18 / 0.27 / 0.34 |
+| 1.3 (range mean) | −0.017 | +0.009 | 3.75 | 0.15 / 0.15 / 0.21 / 0.18 |
+| 2.0 (range max) | −0.023 | −0.001 | 2.31 | 0.14 / 0.17 / 0.17 / 0.15 |
+
+Raising friction does what it should to **slip** — the feet slide 0.85 m less per run at the
+top of the range — and yaw drift falls monotonically with it. But **forward travel stays at
+zero** across the whole range. Under `flip` the gait does not generate forward motion at
+all, and no friction value rescues it. Friction is a real defect in the harness setup, but
+it is not what is holding the robot still.
+
+## Recommended ground friction — proposed, not applied
+
+Nothing has been changed. The proposal is **static = dynamic = 1.3**, and the reason is that
+it is the **midpoint of the env's own `friction_range = [0.6, 2.0]`**, not a value chosen to
+make a number come out. Rationale:
+
+* It is inside the distribution the E2E policy trains and is evaluated on, so both arms of
+  the comparison stand on ground the E2E arm has seen. 0.5 is outside it.
+* A single fixed value, not a per-episode sample: the calibration sweep measures "how tall a
+  step does this skill clear", and randomising the ground would fold friction variance into
+  a geometric threshold. The midpoint is the least arbitrary fixed choice.
+* It must be applied identically to the rule-planner and E2E evaluation runs, and recorded
+  next to the results. CLAUDE.md §2 forbids tuning it to performance data — this value comes
+  from the env config, and it should not be revisited because a score improves.
+
+The alternative worth considering is **0.6**, the range minimum, as the conservative choice:
+any skill threshold measured there is a lower bound that holds across the whole range.
+
+## Where to pick up
+
+1. **Resolve the convention conflict first.** WALK travels only under `keep`; TROT stands
+   only under `flip`. Both cannot be true. Suspect the TROT collapse is a different fault
+   being masked by the hip sign — re-run TROT `keep` with friction 1.3 and threshold 30 N,
+   which is a combination that has never been tried (the collapse was measured at friction
+   0.5). If TROT survives `keep` there, the convention is `keep` and the day-1 step 2
+   conclusion is simply wrong.
+2. **Then decide friction**, apply it in both `verify_skill_replay.py` and
+   `run_calibration.py`, and record the value in this file.
+3. **Then step 4 (RUN)** — not re-judged since the physics-rate fix and the 30 N threshold.
+4. **Then step 5 (calibration)** — ~30 min wall clock on CPU, no GPU needed.
+
+What is settled and should not be re-litigated: the physics rate (`harness_findings.md` §5),
+the contact threshold (30 N, from CLAUDE.md §6's measured 24-51 N), the actuator probe
+answers, and the archive hashes.
