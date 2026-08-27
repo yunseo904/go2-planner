@@ -4,3 +4,44 @@ dirty: no
 benchmark_module: extreme-parkour/legged_gym/legged_gym/utils/set_terrain_benchmark.py
 benchmark_module_blob: 0f05a0cf6bf9333f29caea65454a117320f86834
 benchmark_module_sha256: 429c3a8a285b197b068ed68bdf93517676e7784fbd31a0c526005f4348620c50
+
+--------------------------------------------------------------------------
+2026-08-26  Accidental regeneration of benchmark_frozen.npz
+--------------------------------------------------------------------------
+
+What happened
+  `scripts/freeze_benchmark.py --verify` was run as a verification step. It is
+  not one: `--verify` REGENERATES the archive twice and asserts the two agree.
+  `--check` is the read-only option. The archive on disk was overwritten.
+
+What changed
+  npz container sha256   a8602bc0e4908ce215d4614aed45a164b8bf1663d6be19a06da81603c29a63fc  (before)
+                         01e3bc1706aa5db7dace46cfe25bee879c5c0492df22d166790771dc3b786cb9  (after)
+  meta.upstream_commit   rewritten by the script from 67f72cd... to 0212482...; restored to
+                         67f72cd..., which is the commit the CONTENT was frozen from.
+
+What did not change
+  content_sha256         c117de08f15cf41a3797e920d561d5c4f95400e29dd397379155bf0c90538596
+  This hash covers the terrain arrays themselves, independent of the npz
+  container (terrain_toolkit/freeze.py: content_sha256). It is identical before
+  and after. The 20 tasks x 10 levels are bit-for-bit the same terrain, so the
+  benchmark is unaffected and no result computed against it is invalidated.
+
+  The container hash differs because np.savez_compressed stamps zip member
+  mtimes; the archive is content-deterministic, not byte-deterministic. The
+  original container bytes cannot be reproduced and are not recoverable (the
+  .npz is gitignored). data/benchmark_frozen.sha256 now records the file that
+  actually exists; meta.json keeps the previous value under
+  `npz_sha256_previous_container`.
+
+Incidental confirmation
+  The regeneration ran against the CURRENT checkout (0212482...) and produced
+  the same content_sha256 as the original freeze from 67f72cd... . That is an
+  independent confirmation of the drift analysis above: the two commits carry
+  identical set_terrain_benchmark.py and terrain_utils.py blobs and therefore
+  generate identical terrain.
+
+Guard added
+  freeze_benchmark.py now refuses to overwrite an existing archive without
+  --force, so the read-only intent of a verification run cannot be misfired
+  again. Use --check to verify.

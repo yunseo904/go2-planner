@@ -1,0 +1,273 @@
+{
+  "npz_sha256": "aab85a03f5d9063568e2018aa15effce08482978756b8308a6676e34bdcde396",
+  "n_clips": 4,
+  "leg_order_native": [
+    "FR",
+    "FL",
+    "RR",
+    "RL"
+  ],
+  "leg_order_stored": [
+    "FL",
+    "FR",
+    "RL",
+    "RR"
+  ],
+  "joint_order": [
+    "hip",
+    "thigh",
+    "calf"
+  ],
+  "target_fs_hz": 50.0,
+  "lowpass_frac_of_target": 0.4,
+  "channels": [
+    "t",
+    "q_des",
+    "dq_des",
+    "tau_ff",
+    "q",
+    "dq",
+    "tau",
+    "kp",
+    "kd",
+    "contact",
+    "q_des_valid"
+  ],
+  "convention_verified": false,
+  "convention_note": "Joint sign convention, zero offsets and hip abduction direction are taken from the log as-is and have NOT been checked against the Isaac Lab Go2 asset. Run scripts/verify_skill_replay.py on a machine with Isaac Lab before trusting a replay.",
+  "gain_note": "kp/kd are scheduled per skill and within a skill (walk 40/40/40, running trot 13/3/2 with ~11 Nm RMS calf tau_ff). They are stored as per-sample time series and must be applied; a position-only replay under the fork's configured gains (kp 40 / kd 1) will not reproduce the running trot.",
+  "clips": {
+    "WALK": {
+      "kind": "cyclic",
+      "session": "gait_classic_walk_20260824_224559",
+      "group": "03_slow_walk",
+      "fs_hi_hz": 418.30126600969464,
+      "fs_lo_hz": 50.578911249538244,
+      "n_hi": 306,
+      "n_lo": 37,
+      "cycle_s": 0.7315301790000035,
+      "cycle_hz": 1.3669976013388714,
+      "cycle_s_spread": 0.050892808319802293,
+      "n_cycles_kept": 4,
+      "n_cycles_seen": 4,
+      "ref_leg": "FR",
+      "duty_clip": 0.6625816993464052,
+      "loop_seam_rad": 0.08856555819511414,
+      "loop_seam_over_max_step": 1.1567956493150424,
+      "loop_seam_over_p2p": 0.15825302019641527,
+      "q_des_update_hz": 43.19923802169436,
+      "alias_energy_frac_above_25hz": 0.002659733303782153,
+      "lowpass_cutoff_hz": 20.0,
+      "lowpass_method": "Fourier harmonic truncation (periodic, zero-phase)",
+      "q_des_spread_rad_max": 0.20009923293810775,
+      "q_des_invalid_frac": 0.0,
+      "note": "slow walk, duty ~0.64, no flight phase",
+      "selection": {
+        "session": "gait_classic_walk_20260824_224559",
+        "group": "03_slow_walk",
+        "why": "lowest stride_cv (steadiest cycle) among 3 candidates",
+        "duty_mean": 0.6379545454545454,
+        "stride_hz": 1.3807119426568644,
+        "vx_steady_mean": 0.18746616149213685,
+        "flight_frac": 0.0
+      },
+      "n_candidates": 3,
+      "gains": {
+        "kp": [
+          40.0,
+          40.0,
+          40.0
+        ],
+        "kd": [
+          1.0,
+          1.0,
+          1.0
+        ],
+        "tau_ff_rms": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "joint_order": [
+          "hip",
+          "thigh",
+          "calf"
+        ],
+        "position_controlled": true
+      }
+    },
+    "TROT": {
+      "kind": "cyclic",
+      "session": "run_06_20260824_225352",
+      "group": "03_slow_walk",
+      "fs_hi_hz": 416.85702035499236,
+      "fs_lo_hz": 49.773972579700576,
+      "n_hi": 268,
+      "n_lo": 32,
+      "cycle_s": 0.6429062889999386,
+      "cycle_hz": 1.555436643115643,
+      "cycle_s_spread": 0.03694756630834709,
+      "n_cycles_kept": 5,
+      "n_cycles_seen": 5,
+      "ref_leg": "FR",
+      "duty_clip": 0.5774253731343284,
+      "loop_seam_rad": 0.018727779388427734,
+      "loop_seam_over_max_step": 0.1503963429462067,
+      "loop_seam_over_p2p": 0.028389048874702196,
+      "q_des_update_hz": 42.740244876743745,
+      "alias_energy_frac_above_25hz": 0.004268638832488319,
+      "lowpass_cutoff_hz": 20.0,
+      "lowpass_method": "Fourier harmonic truncation (periodic, zero-phase)",
+      "q_des_spread_rad_max": 0.20300960439479737,
+      "q_des_invalid_frac": 0.0,
+      "note": "trot, duty ~0.52, no flight phase",
+      "selection": {
+        "session": "run_06_20260824_225352",
+        "group": "03_slow_walk",
+        "why": "lowest stride_cv (steadiest cycle) among 4 candidates",
+        "duty_mean": 0.570404984423676,
+        "stride_hz": 1.5442217135226264,
+        "vx_steady_mean": 0.443721311481766,
+        "flight_frac": 0.0
+      },
+      "n_candidates": 4,
+      "gains": {
+        "kp": [
+          40.0,
+          40.0,
+          40.0
+        ],
+        "kd": [
+          1.0,
+          1.0,
+          1.0
+        ],
+        "tau_ff_rms": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "joint_order": [
+          "hip",
+          "thigh",
+          "calf"
+        ],
+        "position_controlled": true
+      }
+    },
+    "RUN": {
+      "kind": "cyclic",
+      "session": "run_trot_20_lvl0_20260824_232530",
+      "group": "01_running_trot_flight",
+      "fs_hi_hz": 425.8185421122765,
+      "fs_lo_hz": 49.37026575214799,
+      "n_hi": 138,
+      "n_lo": 16,
+      "cycle_s": 0.3240817070000048,
+      "cycle_hz": 3.0856416095092496,
+      "cycle_s_spread": 0.02705020460203281,
+      "n_cycles_kept": 7,
+      "n_cycles_seen": 8,
+      "ref_leg": "FR",
+      "duty_clip": 0.32608695652173914,
+      "loop_seam_rad": 0.34594106674194336,
+      "loop_seam_over_max_step": 1.3368524176361998,
+      "loop_seam_over_p2p": 0.4039374784137173,
+      "q_des_update_hz": 165.07623382898788,
+      "alias_energy_frac_above_25hz": 0.01256124901613605,
+      "lowpass_cutoff_hz": 20.0,
+      "lowpass_method": "Fourier harmonic truncation (periodic, zero-phase)",
+      "q_des_spread_rad_max": 0.31740123400306564,
+      "q_des_invalid_frac": 0.0,
+      "note": "running trot, duty ~0.31, flight phase present",
+      "selection": {
+        "session": "run_trot_20_lvl0_20260824_232530",
+        "group": "01_running_trot_flight",
+        "why": "lowest stride_cv (steadiest cycle) among 11 candidates",
+        "duty_mean": 0.2998659517426273,
+        "stride_hz": 2.9288002222602523,
+        "vx_steady_mean": 0.5138499244208923,
+        "flight_frac": 0.27989276139410185
+      },
+      "n_candidates": 11,
+      "gains": {
+        "kp": [
+          13.0,
+          3.0,
+          2.0
+        ],
+        "kd": [
+          1.7999999523162842,
+          2.0,
+          1.5
+        ],
+        "tau_ff_rms": [
+          3.666915150551025,
+          2.591491276949296,
+          11.788148791667984
+        ],
+        "joint_order": [
+          "hip",
+          "thigh",
+          "calf"
+        ],
+        "position_controlled": false
+      }
+    },
+    "JUMP": {
+      "kind": "oneshot",
+      "session": "front_jump_20260824_232314",
+      "group": "06_jump_four_leg_sync",
+      "fs_hi_hz": 410.5378497843246,
+      "fs_lo_hz": 50.0,
+      "n_hi": 1805,
+      "n_lo": 221,
+      "duration_s": 4.398453411999981,
+      "pad_s": 0.25,
+      "q_des_update_hz": 158.38932563741125,
+      "flight_frac": 0.4221606648199446,
+      "flight_s": 1.856101697810118,
+      "n_airborne_runs": 6,
+      "alias_energy_frac_above_25hz": 0.0035171681389211153,
+      "lowpass_cutoff_hz": 20.0,
+      "lowpass_method": "4th-order zero-phase Butterworth (filtfilt) then linear resample",
+      "q_des_invalid_frac": 0.001108033240997175,
+      "loopable": false,
+      "note": "front_jump: vertical hop, ~0.45 s flight, ~26 mm horizontal",
+      "selection": {
+        "session": "front_jump_20260824_232314",
+        "group": "06_jump_four_leg_sync",
+        "why": "flight fraction closest to the cohort median of 5",
+        "duty_mean": 0.27440577249575554,
+        "stride_hz": 1.4946339658827135,
+        "vx_steady_mean": 0.006316836468584555,
+        "flight_frac": 0.3174872665534805
+      },
+      "n_candidates": 5,
+      "gains": {
+        "kp": [
+          40.0,
+          40.0,
+          40.0
+        ],
+        "kd": [
+          1.7999999523162842,
+          2.0,
+          1.5
+        ],
+        "tau_ff_rms": [
+          2.9091798420372093,
+          4.168575438884964,
+          12.230523259396236
+        ],
+        "joint_order": [
+          "hip",
+          "thigh",
+          "calf"
+        ],
+        "position_controlled": true
+      }
+    }
+  },
+  "source": "motion_toolkit/clips.py from the read-only curated log set"
+}

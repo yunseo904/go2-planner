@@ -13,7 +13,15 @@ The only upstream code that is executed is
 scripts/freeze_benchmark.py   generate → fix_terrain → data/benchmark_frozen.npz (+ sha256, upstream commit)
 scripts/profile_terrains.py   per-goal-segment features → outputs/terrain_profile.csv (+ summary, plots)
 scripts/render_terrains.py    height-field PNGs → outputs/terrains/*.png, outputs/terrains_overview_level*.png
+scripts/freeze_calibration.py synthetic probes → data/calibration_probes.npz (+ sha256, outputs/calibration_plan.md)
 ```
+
+`calibrate.py` / `freeze_calibration.py` are **not** part of the benchmark
+pipeline. They generate the separate probe terrains used to settle the
+`CALIBRATION_NEEDED` thresholds in `planner/config.py`, which `CLAUDE.md` §2
+forbids tuning against the benchmark. They import nothing upstream and use no
+RNG, so a probe cannot leak benchmark structure into a threshold. See
+`outputs/calibration_plan.md` for which probe settles which parameter.
 
 ## How the terrain object is faked (`stub.py`)
 
@@ -34,11 +42,64 @@ set_idx = set_terrain_benchmark(terrain, variation, difficulty)   # fills height
 `width, length, horizontal_scale, vertical_scale, height_field_raw, goals`.
 `difficulty = row / 9`, `variation = col / 20`, dispatcher index `= int(variation * 20)`.
 
-Not reproduced (on purpose – they are added *after* `set_terrain` in the sim):
+Not reproduced (on purpose – they are added *after* `set_terrain` in the sim);
+see [What the frozen archive does **not** contain](#what-the-frozen-archive-does-not-contain).
 
-* `random_uniform_terrain` roughness (±0.02–0.06 m noise; uses `scipy.interpolate.interp2d`,
-  removed in scipy ≥ 1.14 – it would not even run in this env),
-* the 0.1 m-wide, 0.5 m-high border pad `Terrain.__init__` writes around every cell.
+## What the frozen archive does **not** contain
+
+The freeze runs `set_terrain_benchmark.set_terrain` (plus the `fix_terrain` port)
+and nothing else. Two things the sim applies around that call are therefore
+missing, and one thing is stored twice.
+
+### 1. `random_uniform_terrain` roughness — not applied
+
+Upstream adds ±0.02–0.06 m of per-cell noise to every sub-terrain after
+`set_terrain` returns. It is not reproduced here because
+`terrain_utils.random_uniform_terrain` calls `scipy.interpolate.interp2d`, which
+was **removed in scipy ≥ 1.14** — the function cannot run in this environment at
+all, so reproducing it would mean re-implementing it and hoping the
+re-implementation matched. The frozen height fields are the clean generator
+output.
+
+Consequence: any *roughness* feature computed from the archive
+(`outputs/terrain_profile.csv`) measures the **designed** geometry, not what the
+robot's feet meet. Step, gap, slope and width features are unaffected — they are
+all far larger than the noise amplitude.
+
+### 2. The 0.5 m border pad — not applied
+
+`Terrain.__init__` writes a 0.1 m-wide, 0.5 m-high wall around every cell after
+the generators have run. The archive holds the bare 18 m × 4 m cell, so the
+lateral edges are open where the sim has a wall. Anything that reasons about
+*leaving the corridor sideways* has to add the pad itself; `profile.py` treats
+the terrain edge as a hard boundary for `min_width_m`, which is equivalent.
+
+### 3. `height_fields_before_fix` is the canonical array
+
+Both states are stored. **Use `height_fields_before_fix`.**
+
+At the frozen commit `Terrain.make_terrain` calls `fix_terrain` only on the
+`default` / custom terrain types; the `benchmark` branch returns straight from
+`set_terrain_benchmark`. So the array the simulator actually rasterises is the
+pre-fix one. `height_fields` (post-fix) is kept because it is what the *custom*
+pipeline would see and because the diff (`fix_descs`) is the cleanest available
+description of the int16 overflow artefacts — but it is not the evaluation
+terrain, and using it would quietly remove the stray blobs and the spawn-area
+junk that the policy under test really has to deal with.
+
+### Why none of this compromises the comparison
+
+All three points are properties of the **terrain the archive stores**, not of any
+experimental group. The E2E policy and the rule planner are evaluated on the same
+20 benchmark tasks in the same simulator, which applies the noise and the pad to
+both, identically. What the archive is used for is *deriving thresholds and
+features offline* — and a threshold derived from noise-free geometry is applied
+to both groups in exactly the same way.
+
+The one thing to keep honest: do not quote an archive-derived roughness figure as
+if it described the simulated surface, and do not "fix" the overflow artefacts in
+the archive. Per `CLAUDE.md` §2 the upstream bugs stay in, because both groups
+meet them.
 
 ## Frozen archive (`data/benchmark_frozen.npz`)
 
