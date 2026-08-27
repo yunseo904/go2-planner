@@ -234,6 +234,13 @@ def expected_from_meta(meta: dict, clip: str) -> dict:
 # Isaac Lab replay  (UNVERIFIED — see the module docstring)
 # --------------------------------------------------------------------------- #
 
+# SimulationApp.close() tears the process down, so anything after it never runs.
+# Both scripts originally closed inside the Isaac helper, before the metrics were
+# computed and returned -- the run exited 0 having produced no verdict and no CSV.
+# The app is held here and closed once, in main(), after the results are written.
+_SIM_APP = None
+
+
 def run_isaac(args, clip: dict, meta: dict) -> dict:
     """Play ``clip`` on a flat floor and return measured gait numbers.
 
@@ -243,8 +250,9 @@ def run_isaac(args, clip: dict, meta: dict) -> dict:
     """
     from isaaclab.app import AppLauncher                      # noqa: F401  (import order matters)
 
+    global _SIM_APP
     app_launcher = AppLauncher(args)
-    simulation_app = app_launcher.app
+    simulation_app = _SIM_APP = app_launcher.app
 
     import torch
     import isaaclab.sim as sim_utils
@@ -361,8 +369,6 @@ def run_isaac(args, clip: dict, meta: dict) -> dict:
         if robot.data.root_pos_w[0, 2].item() < args.fall_height_m and terminated_s is None:
             terminated_s = i * dt
             break
-
-    simulation_app.close()
 
     a = {k: np.asarray(v) for k, v in rec.items()}
     _, _, limits = ucfg.ordered(clip["leg_order"], clip["joint_order"])
@@ -516,7 +522,6 @@ def main() -> int:
     ap.add_argument("--settle-s", type=float, default=0.5)
     ap.add_argument("--contact-threshold-n", type=float, default=1.0)
     ap.add_argument("--fall-height-m", type=float, default=0.15)
-    ap.add_argument("--device", default="cpu")
     ap.add_argument("--self-test", action="store_true", help="no Isaac Lab needed")
     ap.add_argument("--explain", action="store_true", help="print gains + expectations, no sim")
     ap.add_argument("--convention", action="store_true",
@@ -526,8 +531,12 @@ def main() -> int:
     try:
         from isaaclab.app import AppLauncher
         AppLauncher.add_app_launcher_args(ap)
+        # AppLauncher owns --device on Isaac Lab 6.x and rejects a duplicate.
+        # Its default is cuda:0; day 1 runs the physics on CPU, so re-assert that.
+        ap.set_defaults(device="cpu")
     except Exception:
         ap.add_argument("--headless", action="store_true")
+        ap.add_argument("--device", default="cpu")
     args = ap.parse_args()
 
     if args.self_test:
@@ -563,23 +572,29 @@ def main() -> int:
         return 0
 
     rows = []
-    for name in names:
-        clip = load_clip(name, args.rate)
-        exp = expected_from_meta(meta, name)
-        print("=" * 78)
-        print(gain_comparison(meta, name))
-        print()
-        m = run_isaac(args, clip, meta)
-        ranked = D.best_mapping(m.pop("_q_measured"), m.pop("_q_commanded"))
-        offs = None
-        F = D.diagnose(m, exp, mapping=ranked, offsets=offs)
-        print(f"-- {name} [{args.rate}, mode={m['mode_used']}, hip={args.hip_sign}] --")
-        print(D.format_findings(F))
-        print(f"verdict: {D.verdict(F)}")
-        rows.append({"clip": name, "rate": args.rate, "verdict": D.verdict(F),
-                     "best_mapping": ranked[0].name, "best_mapping_r": ranked[0].score,
-                     **{k: v for k, v in m.items() if not k.startswith("_")}})
-    report(rows)
+    try:
+        # --all reuses one SimulationApp across clips; only the single-clip path day 1
+        # prescribes has been exercised on this machine.
+        for name in names:
+            clip = load_clip(name, args.rate)
+            exp = expected_from_meta(meta, name)
+            print("=" * 78)
+            print(gain_comparison(meta, name))
+            print()
+            m = run_isaac(args, clip, meta)
+            ranked = D.best_mapping(m.pop("_q_measured"), m.pop("_q_commanded"))
+            offs = None
+            F = D.diagnose(m, exp, mapping=ranked, offsets=offs)
+            print(f"-- {name} [{args.rate}, mode={m['mode_used']}, hip={args.hip_sign}] --")
+            print(D.format_findings(F))
+            print(f"verdict: {D.verdict(F)}")
+            rows.append({"clip": name, "rate": args.rate, "verdict": D.verdict(F),
+                         "best_mapping": ranked[0].name, "best_mapping_r": ranked[0].score,
+                         **{k: v for k, v in m.items() if not k.startswith("_")}})
+        report(rows)
+    finally:
+        if _SIM_APP is not None:
+            _SIM_APP.close()
     return 0 if all(r["verdict"] != "FAIL" for r in rows) else 1
 
 

@@ -112,11 +112,19 @@ def planned_runs(probes: dict, params: list, reps: int, max_probes: int | None) 
 # Isaac Lab  (UNVERIFIED — see the module docstring)
 # --------------------------------------------------------------------------- #
 
+# SimulationApp.close() tears the process down, so anything after it never runs.
+# Both scripts originally closed inside the Isaac helper, before the metrics were
+# computed and returned -- the run exited 0 having produced no verdict and no CSV.
+# The app is held here and closed once, in main(), after the results are written.
+_SIM_APP = None
+
+
 def run_isaac(args, probes: dict, runs: list) -> list:
     from isaaclab.app import AppLauncher
 
+    global _SIM_APP
     app_launcher = AppLauncher(args)
-    simulation_app = app_launcher.app
+    simulation_app = _SIM_APP = app_launcher.app
 
     import torch
     import isaaclab.sim as sim_utils
@@ -219,7 +227,6 @@ def run_isaac(args, probes: dict, runs: list) -> list:
             print(f"[cal] {param:22s} {skill:5s} {probes['names'][pi]:16s} rep {rep+1}/{args.reps} "
                   f"{'PASS' if reached else 'fail'} x={pos[0]:.2f} t={t_s:.1f}s")
 
-    simulation_app.close()
     return rows
 
 
@@ -351,7 +358,6 @@ def main() -> int:
     ap.add_argument("--goal-radius-m", type=float, default=GOAL_RADIUS_M)
     ap.add_argument("--fall-height-m", type=float, default=FALL_HEIGHT_M)
     ap.add_argument("--spawn-clearance-m", type=float, default=0.40)
-    ap.add_argument("--device", default="cpu")
     ap.add_argument("--plan", action="store_true", help="print the run plan and exit")
     ap.add_argument("--self-test", action="store_true", help="no Isaac Lab needed")
     ap.add_argument("--from-results", type=Path, default=None,
@@ -359,8 +365,12 @@ def main() -> int:
     try:
         from isaaclab.app import AppLauncher
         AppLauncher.add_app_launcher_args(ap)
+        # AppLauncher owns --device on Isaac Lab 6.x and rejects a duplicate.
+        # Its default is cuda:0; day 1 runs the physics on CPU, so re-assert that.
+        ap.set_defaults(device="cpu")
     except Exception:
         ap.add_argument("--headless", action="store_true")
+        ap.add_argument("--device", default="cpu")
     args = ap.parse_args()
 
     if args.self_test:
@@ -402,16 +412,20 @@ def main() -> int:
     if not SKILL_CLIPS_NPZ.is_file():
         raise SystemExit(f"no clip archive at {SKILL_CLIPS_NPZ}; run scripts/extract_skill_clips.py")
 
-    rows = run_isaac(args, probes, runs)
-    CALIBRATION_RESULTS_CSV.parent.mkdir(parents=True, exist_ok=True)
-    with open(CALIBRATION_RESULTS_CSV, "w", newline="") as fh:
-        w = csv.DictWriter(fh, fieldnames=list(rows[0]))
-        w.writeheader()
-        w.writerows(rows)
-    print(f"[cal] wrote {CALIBRATION_RESULTS_CSV}")
-    ths = thresholds_from_rows(rows)
-    write_report(ths, rows, args)
-    print(HF.config_block(ths))
+    try:
+        rows = run_isaac(args, probes, runs)
+        CALIBRATION_RESULTS_CSV.parent.mkdir(parents=True, exist_ok=True)
+        with open(CALIBRATION_RESULTS_CSV, "w", newline="") as fh:
+            w = csv.DictWriter(fh, fieldnames=list(rows[0]))
+            w.writeheader()
+            w.writerows(rows)
+        print(f"[cal] wrote {CALIBRATION_RESULTS_CSV}")
+        ths = thresholds_from_rows(rows)
+        write_report(ths, rows, args)
+        print(HF.config_block(ths))
+    finally:
+        if _SIM_APP is not None:
+            _SIM_APP.close()
     return 0
 
 

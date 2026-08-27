@@ -39,10 +39,12 @@ sys.path.insert(0, str(ROOT))
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--device", default="cpu")
     ap.add_argument("--out", type=Path, default=ROOT / "outputs" / "isaac_actuator_probe.json")
     from isaaclab.app import AppLauncher
     AppLauncher.add_app_launcher_args(ap)
+    # AppLauncher owns --device on Isaac Lab 6.x and rejects a duplicate.
+    # Its default is cuda:0; day 1 runs the physics on CPU, so re-assert that.
+    ap.set_defaults(device="cpu")
     args = ap.parse_args()
 
     app = AppLauncher(args).app
@@ -170,8 +172,9 @@ def main() -> int:
     for n, v in zip(robot.joint_names, sat):
         print(f"   {n:20s} {float(v):8.2f} Nm")
 
-    app.close()
-
+    # Everything below has to happen BEFORE app.close(): SimulationApp.close() tears the
+    # process down, so a write placed after it never runs -- the script exits 0 having
+    # produced nothing. Measured on Isaac Sim 6.0.1-rc.7.
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(R, indent=2, default=str) + "\n")
     print(f"\nwrote {args.out}")
@@ -187,6 +190,8 @@ def main() -> int:
     else:
         print("  Only POSITION is available. WALK and TROT are still faithful (kp 40 / kd 1 / tau_ff 0")
         print("  matches the config exactly); RUN and JUMP need the parameter-gait fallback (c).")
+
+    app.close()
     return 0
 
 
