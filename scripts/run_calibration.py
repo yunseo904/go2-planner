@@ -145,8 +145,23 @@ def run_isaac(args, probes: dict, runs: list) -> list:
     import json as _json
     meta = _json.loads(SKILL_CLIPS_META_JSON.read_text())
     clips = {name: load_clip(name, args.rate) for name in sorted({r[1] for r in runs})}
-    dt = 1.0 / next(iter(clips.values()))["fs"]
-    sim = SimulationContext(SimulationCfg(dt=dt, device=args.device))
+    # Same defect as verify_skill_replay.py: one sim.step() per clip sample runs PhysX
+    # at ~50 Hz instead of the config's 200 Hz and the robot collapses on flat ground.
+    # See that file for the measured A/B.
+    #
+    # A SimulationContext takes its dt once, but the clips do not share a rate (49.37 to
+    # 50.58 Hz -- each cyclic clip carries an integer number of samples per gait cycle,
+    # so its rate lands near 50 rather than on it). So the physics step is the config's
+    # sim_dt and the substep count is resolved PER CLIP against it. Residual control-rate
+    # error is under 1.3% per clip; it does not accumulate across episodes because each
+    # episode restarts, and it is far below the pass/fail granularity of a distance probe.
+    phys_dt = float(ucfg.sim_dt)
+    decim_for = {name: max(1, int(round((1.0 / c["fs"]) / phys_dt))) for name, c in clips.items()}
+    sim = SimulationContext(SimulationCfg(dt=phys_dt, device=args.device))
+    for name, c in clips.items():
+        d = decim_for[name]
+        print(f"[cal] {name}: clip {c['fs']:.2f} Hz -> {d} x {phys_dt:.4f} s "
+              f"= {1.0/(d*phys_dt):.2f} Hz control ({100*((d*phys_dt)*c['fs']-1):+.2f}% rate error)")
 
     sign = np.ones(12, dtype=np.float32)
     if args.hip_sign == "flip":
@@ -156,6 +171,8 @@ def run_isaac(args, probes: dict, runs: list) -> list:
     rows = []
     for (param, skill, family, pi, level) in runs:
         clip = clips[skill]
+        decim = decim_for[skill]
+        dt = decim * phys_dt                       # control period actually stepped
         hf = probes["hf"][pi]
         verts, faces = HF.to_trimesh(hf, probes["horizontal_scale"], probes["vertical_scale"])
         importer = TerrainImporter(TerrainImporterCfg(prim_path="/World/ground", terrain_type="plane"))
@@ -205,9 +222,10 @@ def run_isaac(args, probes: dict, runs: list) -> list:
                     eff = torch.zeros_like(tgt)
                     eff[:, idx_t] = torch.as_tensor(clip["tau_ff"][k] * sign, device=sim.device)
                     robot.set_joint_effort_target(eff)
-                robot.write_data_to_sim()
-                sim.step()
-                robot.update(dt)
+                for _ in range(decim):
+                    robot.write_data_to_sim()
+                    sim.step()
+                    robot.update(phys_dt)
                 pos = robot.data.root_pos_w[0].cpu().numpy()
                 saturated += int((np.abs(robot.data.applied_torque[0, idx_t].cpu().numpy()) >= lim - 1e-3).any())
                 reached = bool(np.hypot(pos[0] - goal[0], pos[1] - goal[1]) < args.goal_radius_m)

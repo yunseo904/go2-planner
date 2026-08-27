@@ -264,11 +264,35 @@ def run_isaac(args, clip: dict, meta: dict) -> dict:
     sys.path.insert(0, str(Path(ucfg.source).parents[3]))
     from legged_gym.envs.base.legged_robot_config import UNITREE_GO2_CFG
 
-    dt = 1.0 / clip["fs"]
+    # The clip sets the CONTROL period; the repo config sets the PHYSICS step.
+    #
+    # Stepping PhysX once per clip sample integrates contact at ~50 Hz, four times
+    # coarser than the legged_robot_config.py this whole comparison is measured
+    # against (sim_dt 0.005 x decimation 4 = 200 Hz physics, 50 Hz control). The
+    # robot then goes down on its belly regardless of clip, mode or joint sign.
+    # Measured on WALK, position mode, everything else held fixed:
+    #     1 step  per sample: base 0.169 m mean, falls at 1.40 s, 72/296 steps
+    #     4 steps per sample: base 0.316 m mean, no fall,        296/296 steps
+    # 0.32 m is nominal. Holding the command across the substeps is exactly what
+    # decimation means in the env.
+    #
+    # Both numbers are read from the config; neither is hard-coded here. The
+    # control period stays the clip's own, so a cyclic clip -- whose n_lo samples
+    # span exactly one gait cycle by construction -- loops with no phase drift.
+    ctrl_dt = 1.0 / clip["fs"]
+    decim = int(ucfg.decimation or 1)
+    phys_dt = ctrl_dt / decim
+    dt = ctrl_dt                       # everything measured per control step uses this
     if ucfg.control_hz and abs(clip["fs"] - ucfg.control_hz) > 1.0:
         print(f"[replay] NOTE clip rate {clip['fs']:.1f} Hz != the env's control rate "
               f"{ucfg.control_hz:.0f} Hz; stepping at the clip rate")
-    sim = SimulationContext(SimulationCfg(dt=dt, device=args.device))
+    print(f"[replay] control {1.0/ctrl_dt:.2f} Hz (clip) x decimation {decim} "
+          f"-> physics {1.0/phys_dt:.1f} Hz   [config: {ucfg.control_hz:.0f} Hz x "
+          f"{ucfg.decimation} -> {1.0/ucfg.sim_dt:.0f} Hz]")
+    if ucfg.sim_dt and abs(phys_dt - ucfg.sim_dt) / ucfg.sim_dt > 0.05:
+        print(f"[replay] WARNING physics dt {phys_dt:.5f} s is more than 5% off the "
+              f"config's {ucfg.sim_dt} s; the clip rate is far from the env's control rate")
+    sim = SimulationContext(SimulationCfg(dt=phys_dt, device=args.device))
     sim.set_camera_view([2.0, 2.0, 1.0], [0.0, 0.0, 0.3])
 
     sim_utils.GroundPlaneCfg().func("/World/ground", sim_utils.GroundPlaneCfg())
@@ -335,11 +359,12 @@ def run_isaac(args, clip: dict, meta: dict) -> dict:
     q0 = robot.data.default_joint_pos.clone()
     q0[:, idx_t] = q_cmd[0]
     robot.write_joint_state_to_sim(q0, torch.zeros_like(q0))
-    for _ in range(int(args.settle_s / dt)):
+    for _ in range(int(args.settle_s / ctrl_dt)):
         robot.set_joint_position_target(q0)
-        robot.write_data_to_sim()
-        sim.step()
-        robot.update(dt)
+        for _ in range(decim):
+            robot.write_data_to_sim()
+            sim.step()
+            robot.update(phys_dt)
 
     rec = {k: [] for k in ("q", "tau", "root_lin_vel_b", "root_ang_vel_b", "root_pos_w", "contact")}
     terminated_s, gain_writes, clipped = None, 0, 0
@@ -353,10 +378,11 @@ def run_isaac(args, clip: dict, meta: dict) -> dict:
             eff = torch.zeros_like(tgt)
             eff[:, idx_t] = tau_ff[i]
             robot.set_joint_effort_target(eff)
-        robot.write_data_to_sim()
-        sim.step()
-        robot.update(dt)
-        contacts.update(dt)
+        for _ in range(decim):
+            robot.write_data_to_sim()
+            sim.step()
+            robot.update(phys_dt)
+            contacts.update(phys_dt)
 
         tau_now = robot.data.applied_torque[0, idx_t]
         rec["tau"].append(tau_now.cpu().numpy())
@@ -384,6 +410,8 @@ def run_isaac(args, clip: dict, meta: dict) -> dict:
         "terminated_s": terminated_s,
         "n_steps": int(a["q"].shape[0]),
         "dt": dt,
+        "phys_dt": phys_dt,
+        "decimation": decim,
         "mode_requested": requested.value,
         "mode_used": mode.value,
         "gain_writes": gain_writes,
