@@ -117,6 +117,10 @@ occupied by another user's training (17 GB each, ~7.4 GB free).
 
 # Addendum — the convention question is reopened
 
+> **Superseded by the Day 2 section at the end of this file.** The measurements below were
+> taken through the aliasing defect (`harness_findings.md` §6) and are withdrawn. The
+> convention is `keep`; the friction proposal in this addendum was right but incomplete.
+
 Written at the end of day 1, after the forward-speed investigation. **It contradicts the
 step 2 conclusion above.** Do not act on `--hip-sign flip` until this is resolved.
 
@@ -220,3 +224,203 @@ any skill threshold measured there is a lower bound that holds across the whole 
 What is settled and should not be re-litigated: the physics rate (`harness_findings.md` §5),
 the contact threshold (30 N, from CLAUDE.md §6's measured 24-51 N), the actuator probe
 answers, and the archive hashes.
+
+
+---
+
+# Day 2 — the addendum's conflict resolved, and why it existed
+
+The addendum asked which of `keep` and `flip` was the joint-frame convention, and noted
+the evidence pointed both ways. It pointed both ways because **the evidence was fabricated
+by a recording defect**. That is the day's finding; the convention falls out of it.
+
+## The defect: base metrics were the final step, repeated
+
+`verify_skill_replay.py` appended `robot.data.root_pos_w[0].cpu().numpy()` each control
+step. `[0]` is basic indexing, so it returns a *view* into a buffer PhysX overwrites in
+place; on `--device cpu` `.cpu()` copies nothing. Every appended "sample" aliased one
+buffer. Measured on a 42-step TROT replay: `root_pos_w`, `root_quat_w`, `root_lin_vel_b`
+and `root_ang_vel_b` each had **1 distinct row out of 42**, while `q` and `tau` had 42/42
+— they were read with `[0, idx_t]`, which is advanced indexing and allocates.
+
+So `base_height_mean_m` was never a mean. It was the base height at the *final* step,
+which on a run that ends by falling is the height of a fallen robot **by construction**.
+Every clip reported "the robot is on its belly", whether or not it ever fell. `vx_mean`,
+`vy_mean` and `yaw_rate_deg_s` were likewise single instantaneous values.
+
+Full write-up in `harness_findings.md` §6. Fixed by copying out of the sim, plus a guard
+that refuses to report numbers when a base array is bit-identical across every step.
+**The defect is invisible on GPU** — `.cpu()` copies from CUDA. Every run so far was CPU.
+
+Both halves of the addendum's contradiction came from this channel, so both are withdrawn:
+the day-1 "hip sign is flipped" conclusion and the addendum's traction table alike.
+
+## The convention is `keep`
+
+Re-measured after the fix, at the corrected friction (below), 8 cycles:
+
+| | WALK `keep` | WALK `flip` | TROT `keep` | TROT `flip` |
+|---|---|---|---|---|
+| stride | **1.37 Hz vs 1.37 expected** | 1.39 Hz | 4.52 Hz (+191%) | 1.84 Hz (+19%) |
+| forward speed | **0.223 m/s vs log 0.187** | −0.017 m/s | 0.029 m/s | −0.021 m/s |
+| terminated | no | no | **0.84 s** | no |
+| verdict | WARN | WARN | FAIL | WARN |
+
+WALK under `keep` is the only configuration that reproduces the logged gait: stride exact
+to two decimals, forward speed within 20% of the log. Under `flip` the same clip does not
+travel at all. Independently, the offline mapping search over the clips' own `q` vs `q_des`
+— which needs no simulator and cannot be affected by any of this — ranks **identity first
+for all four clips**, with RUN's margin at +0.177.
+
+The one piece of evidence that had favoured `flip`, TROT's collapse under `keep`, is
+explained in the next section and is not about the hip sign.
+
+## Why TROT collapses under `keep`: the initial condition, not the clip
+
+TROT keep + friction 1.3 + 30 N still terminates, at 0.84 s. Per instruction, the data
+before the interpretation. State at the **first replay step** — i.e. what the settle handed
+over, before a single clip frame was played:
+
+| clip | \|v\| | \|w\| | contact FL / FR / RL / RR (N) | roll | outcome |
+|---|---|---|---|---|---|
+| WALK `keep` | 0.121 m/s | 6.2 °/s | 63 / 27 / 40 / 49 | −2.3° | survives |
+| TROT `keep` | **0.365 m/s** | **51.6 °/s** | 92 / **0** / 34 / 32 | −13.9° | collapses 0.84 s |
+| RUN position | 0.194 m/s | 12.6 °/s | **0** / 27 / 44 / 40 | +4.3° | collapses 1.11 s |
+
+TROT begins its first control step already travelling at 0.365 m/s and rotating at 52 °/s,
+with the front-right foot carrying nothing. Every clip that fails hands over with a foot
+unloaded and the base already tumbling; the one that survives does not.
+
+The collapse itself, step by step: roll runs −14° → −120° while RL holds 71% stance duty
+and never swings, FR and RR sit at 0 N from 0.26 s and 0.44 s onward. The robot tips onto
+its left side. It is not walking badly — it is falling over from the pose it was handed.
+
+**Cause.** The settle wrote the base to the env's spawn height of 0.42 m — a height chosen
+for the env's *default standing pose*, all four feet down — then overrode the joints to the
+clip's **first frame**, which for a trot is a mid-gait pose with a foot in swing, and let
+the robot fall into it. It held for a fixed 0.5 s of wall clock with no convergence check
+and handed over whatever state it was in. This ranks the clips exactly as their outcomes
+rank: WALK frame 0 has 3 feet down and settles quietly; TROT frame 0 has 3 feet down but
+does not settle; RUN's clip has **no frame at all with 4 feet down**.
+
+**A/B, `--settle-mode stand`** — settle on the default standing pose first, then drive to
+the clip pose with the PD while the robot is already up (same `settle_s` for each half, so
+no new tuned constant):
+
+| | handover \|v\| | handover \|w\| | terminated |
+|---|---|---|---|
+| TROT drop | 0.365 m/s | 51.6 °/s | 0.82 s |
+| TROT stand | **0.072 m/s** | **23.2 °/s** | 1.57 s |
+| RUN torque drop | 0.174 m/s | 9.7 °/s | 1.11 s |
+| RUN torque stand | 0.092 m/s | 60.5 °/s | **none** |
+
+It cuts the handover disturbance 3–5× and roughly doubles survival — **but no clip passes
+under it**, and it flips WALK's mapping verdict to a failure. So it is added but left
+**non-default**, and the question of what the right initial condition is stays open. What
+is now permanent is that handover speed, angular rate and loaded-foot count are printed and
+warned on for every run, so no verdict can be read without the state it started from.
+
+## Ground friction — 1.3 confirmed, but it is a product of two materials
+
+The value is confirmed as proposed: **1.3, the midpoint of the env's own
+`friction_range = [0.6, 2.0]`**, chosen because it is the least arbitrary fixed point
+inside the distribution the E2E policy trains and is evaluated on, so both arms of the
+comparison stand on the same ground; because a step-clearance threshold measured on a
+randomised floor would fold friction variance into a geometric answer; and because it comes
+from the env config rather than from anything measured here. It is read from the config at
+runtime (`Go2Config.ground_friction`), not hardcoded — so the commented-out alternative
+`friction_range = [0.2, 2.]` in that file cannot be picked up by accident.
+
+The §4 audit then found that setting it was not enough. The env's terrain material is
+static 1.0 / dynamic 1.0 / restitution 0.0 with **both combine modes set to `multiply`**
+(`legged_robot.py::_create_trimesh`); Isaac Lab's default is `average`. The env's
+randomisation writes its sampled coefficient to the **robot's** shapes, so the effective
+friction is a *product of two materials* and the harness was only ever setting one:
+
+| | ground | robot | combine | effective mu |
+|---|---|---|---|---|
+| before | 0.5 (Isaac default) | 0.50 (from `go2.usd`) | average | **0.5** |
+| first patch | 1.3 | 0.50 | average | **0.9** — still wrong |
+| now | 1.0 (env's terrain) | 1.3 (range midpoint) | multiply | **1.3** ✓ |
+
+`go2.usd` shipping 0.50 was measured at runtime, not assumed. Applied in
+`verify_skill_replay.py` and `run_calibration.py` through shared helpers
+(`sim/replay.py: ground_material_cfg`, `set_robot_friction`) so the two cannot drift.
+
+## §4 audit — the remaining settings
+
+`scripts/audit_sim_settings.py` (new) reads Isaac Lab's defaults from the live dataclasses
+and the env's values from the upstream AST, so neither side is a recollection. Full table
+in `outputs/sim_settings_audit.json`. Eight settings where the env departs from the Isaac
+default:
+
+| setting | env | Isaac default | status |
+|---|---|---|---|
+| `dt` | 0.005 | 0.0167 | fixed day 1 (§5) |
+| `static_friction` / `dynamic_friction` | 1.0 | 0.5 | **fixed today** |
+| `friction_combine_mode` | multiply | average | **fixed today** |
+| `restitution_combine_mode` | multiply | average | **fixed today** |
+| `max_position_iteration_count` | 4 | 255 | see below |
+| `max_velocity_iteration_count` | 0 | 255 | see below |
+| `render_interval` | 4 | 1 | no effect headless |
+
+The two iteration counts are a **global clamp**, not the solver setting itself. The
+per-articulation counts come from `UNITREE_GO2_CFG` (`solver_position_iteration_count=4`,
+`solver_velocity_iteration_count=0`), which the harness inherits by importing that config,
+and the clamp is not binding at either value. Recorded as a difference, not a defect — but
+it should be set explicitly if the harness ever builds its own `PhysxCfg`.
+`bounce_threshold_velocity`, `gravity`, `restitution` and `solver_type` already match.
+
+## Step 4 (RUN) — re-judged, FAIL in both modes
+
+Run at friction 1.3, 30 N, `--hip-sign keep`, both the torque mode and the `--mode position`
+negative control:
+
+| | `--mode torque` | `--mode position` (control) |
+|---|---|---|
+| terminated | 1.11 s | 1.11 s |
+| stride | 5.81 Hz vs 3.09 expected | 4.49 Hz vs 3.09 |
+| forward speed | −0.130 m/s vs log 0.514 | −0.157 m/s |
+| mapping | best under `diagonal_swapped` (r=0.078) | identity, margin 0.087 |
+
+Both fail, and they fail the same way at the same time — which is the negative control
+doing its job: it says the torque path is not what is breaking RUN. RUN also has the worst
+initial condition of the three clips (no frame with four feet down), and terminates 0.27 s
+after the handover disturbance. **Step 4 is blocked on the settle question, not on gains.**
+
+## Step 5 (calibration) — not run, and it could not have been
+
+The gate was "proceed if 1 and 2 pass". Neither passed, so the sweep was not run: a
+360-episode step-clearance sweep now would measure the settle, not the skills.
+
+The `--max-probes 3` smoke was still run as a code-path check on the files edited today,
+and it turned up something worth knowing before the gate ever opens: **the calibration loop
+cannot complete a second episode.** Three failures in sequence (`harness_findings.md` §8) —
+`TerrainImporter` missing `env_spacing`, so episode 1 never ran at all; then a prim-path
+collision on episode 2; then, once the stale prims are cleared,
+`Failed to create articulation at /World/Robot/base`, because Isaac Lab 3.0 keeps the old
+`Articulation` registered with the physics manager after its prim is deleted.
+
+The third is not a patch, it is a redesign: build terrain and robot once and per episode
+rewrite only the root state and the probe mesh, or run one process per probe. The first two
+are fixed; the script now prints the diagnosis and refuses to pretend a multi-episode sweep
+is under way. **Whichever way the settle question is decided, this has to be rebuilt before
+step 5 can produce a number.**
+
+## Where to pick up
+
+1. **The initial condition is the blocker.** `stand` improves it 3–5× without fixing
+   anything, so the question is what the right protocol *is* — and it must be decided
+   before calibration, because the E2E arm has to be evaluated from the same one. This is
+   a protocol choice with comparison consequences, so it is left for you rather than
+   settled here.
+2. **Then re-judge TROT and RUN** under whatever that protocol is.
+3. **Rebuild the calibration episode loop** (§8) — it has never run more than one episode.
+   Then step 5, smoke first, then the sweep. The earlier "~30 min on CPU" estimate came
+   from a loop that was never executing, so treat it as unmeasured.
+4. **Re-run everything base-derived on GPU at least once.** Defect §6 cannot occur there,
+   so a GPU run is an independent check on every number in this file.
+
+Settled, not to be re-litigated: the physics rate; the contact threshold (30 N); the
+actuator probe answers; the archive hashes; **the convention is `keep`**; **effective
+friction is 1.3, as a product of a 1.0 ground and 1.3 robot shapes under `multiply`**.

@@ -141,6 +141,133 @@ Day 1 was run with a read-only equivalent instead: rebuild twice in memory, comp
 
 ---
 
+## 6 · Every base-derived metric was the final step, repeated — **the one that invalidated day 1**
+
+`verify_skill_replay.py` recorded the base state like this:
+
+```python
+rec["root_pos_w"].append(robot.data.root_pos_w[0].cpu().numpy())
+```
+
+`robot.data.root_pos_w[0]` is **basic** indexing, so it returns a *view* into a buffer
+PhysX overwrites in place every step. On `--device cpu`, `.cpu()` is a no-op and
+`.numpy()` shares memory. So all N appended "samples" alias one buffer, and the array
+reads back as **the last control step repeated N times**.
+
+Measured on a 42-step TROT replay — distinct rows out of 42:
+
+| array | how it was indexed | distinct rows |
+|---|---|---|
+| `q` | `[0, idx_t]` — advanced | 42 / 42 |
+| `tau` | `[0, idx_t]` — advanced | 42 / 42 |
+| `contact` | `(f > thr)` — new tensor | 7 / 42 (correct) |
+| `root_pos_w` | `[0]` — **basic** | **1 / 42** |
+| `root_quat_w` | `[0]` — **basic** | **1 / 42** |
+| `root_lin_vel_b` | `[0]` — **basic** | **1 / 42** |
+| `root_ang_vel_b` | `[0]` — **basic** | **1 / 42** |
+
+Advanced indexing allocates, which is the only reason `q` and `tau` escaped — the
+distinction between `[0, idx]` and `[0]` decided which half of the harness was real.
+
+What this corrupted:
+
+* `base_height_mean_m` was not a mean. It was the height at the final step — which, on a
+  run that terminates by falling, is *by construction* the height of a fallen robot. Every
+  clip therefore reported "the robot is on its belly", including clips that never fell.
+* `vx_mean`, `vy_mean`, `yaw_rate_deg_s` were single instantaneous values.
+* The mapping ranking (identity vs hip-flipped vs diagonal-swapped) correlates commanded
+  against measured joint angles. `q` was fine — but the verdicts it fed were read next to
+  base metrics that were not.
+
+This is what produced the day-1 hip-sign conclusion and then the day-1 *contradiction* of
+that conclusion. Both readings were of the same corrupted channel. Fixed by copying out
+of the sim (`snap()`), plus a guard that refuses to report numbers when a base array is
+bit-identical across every step, because a robot whose base never moves by a micron over
+hundreds of steps is a recording bug, not a stiff robot.
+
+**This defect is invisible on GPU.** `.cpu()` copies when the source is CUDA. Every
+harness run so far has been `--device cpu`.
+
+---
+
+## 7 · The initial condition was never a measurement, and it decided the verdict
+
+Not a coding defect — a design one, found only because 6 made the base readable.
+
+The settle wrote the base to the env's spawn height (0.42 m), overrode the joints to the
+clip's **first frame** — a mid-gait pose with one or two feet in swing — and let the robot
+fall into it, holding for a fixed 0.5 s wall clock with no convergence check. State handed
+to the replay's first step:
+
+| clip | \|v\| at handover | \|w\| at handover | feet loaded | outcome |
+|---|---|---|---|---|
+| WALK | 0.121 m/s | 6.2 °/s | 4 / 4 | survives, stride exact |
+| TROT | 0.365 m/s | 51.6 °/s | **3 / 4** (FR at 0 N) | collapses at 0.82 s |
+| RUN  | 0.19 m/s | 12.6 °/s | **3 / 4** (FL at 0 N) | collapses at 1.11 s |
+
+Every clip that failed began its first control step with a foot already unloaded and the
+base already tumbling. The failure was in the initial condition, not in the clip.
+
+`--settle-mode stand` was added as an A/B: settle on the default standing pose the 0.42 m
+spawn height is actually designed for, then drive to the clip pose with the PD while the
+robot is already up. It cuts the handover disturbance 3–5× (TROT 0.365 → 0.072 m/s,
+51.6 → 23.2 °/s) and roughly doubles survival (TROT 0.82 → 1.57 s, RUN torque no longer
+terminates early) — **but it does not make any clip pass**, and it flips WALK's mapping
+verdict to a failure. It is left non-default and unresolved.
+
+The durable part is that handover speed, angular rate, and loaded-foot count are now
+reported on every run and warned on, so no future verdict can be read without seeing the
+state it started from.
+
+---
+
+## 8 · `run_calibration.py` cannot complete a second episode — the sweep never ran
+
+Found by the `--max-probes 3` smoke, which was the first time this script's Isaac path was
+executed at all. Three failures, in sequence, each hiding the next:
+
+1. `TerrainImporter(TerrainImporterCfg(prim_path=..., terrain_type="plane"))` raises
+   `ValueError: Environment spacing must be specified` — it configures grid-like env
+   origins in `__init__`. Needs `num_envs` and `env_spacing`. **Episode 1 never ran.**
+2. With that fixed, episode 1 completes (`STEP_WALK_MAX WALK step_up_0p02 fail x=0.74
+   t=1.7s`) and episode 2 dies: `A prim already exists at path: '/World/ground/terrain'`.
+   The loop rebuilds terrain and robot at fixed prim paths every episode.
+3. Clearing the stale prims from the USD stage gets past that and straight into
+   `RuntimeError: Failed to create articulation at: /World/Robot/base`. The previous
+   `Articulation` is still registered with the physics manager after its prim is gone, and
+   re-initialises against a dead path on the next `sim.reset()`.
+
+(3) is not a bug to patch — Isaac Lab 3.0 does not support building and tearing down a
+scene per episode inside one `SimulationContext`. The loop needs redesigning: either build
+terrain and robot once and per episode rewrite only the root state and the probe mesh, or
+run one process per probe from a shell loop.
+
+The script has been left failing fast with that diagnosis printed up front, because the
+alternative is a sweep that looks like it is working for hours. Note the interaction with
+defect 4: had `close()` still been swallowing the traceback, all three of these would have
+presented as *exit 0 with no CSV*.
+
+---
+
+## Self-inflicted recurrences, same session
+
+Three of the five original defects reappeared in code written *during* the diagnosis:
+
+* `contacts.find_bodies(".*_foot")` returns indices into the **sensor's** body list
+  (0..3), not the articulation's. Used against `robot.data.body_pos_w`, it silently
+  recorded the base and the hips as "feet" — caught because foot z was bit-identical to
+  base z.
+* `root_quat_w` was read as `(w,x,y,z)`; it is `(x,y,z,w)`. The wrong order turned a
+  near-identity attitude into a "robot facing backwards at −166° yaw" that would have been
+  a compelling and entirely fictional finding.
+* `audit_sim_settings.py` put `app.close()` in a bare `finally`, so an `ImportError`
+  exited 0 with no traceback — defect 2, verbatim, in a script written to catch defects.
+
+The lesson is not that these are avoidable with more care. It is that every one was caught
+by the same move: checking that the numbers were *possible* before interpreting them.
+
+---
+
 ## The pattern
 
 | # | defect | exit code | visible? |
@@ -150,10 +277,24 @@ Day 1 was run with a read-only equivalent instead: rebuild twice in memory, comp
 | 3 | `close()` before metrics | 0 | **silent** — no verdict, no CSV |
 | 4 | `close()` before `return rows` | 0 | **silent** — no report after a 2–3 h sweep |
 | 5 | physics at 50 Hz not 200 Hz | 0 | **worse than silent** — a confident wrong diagnosis |
+| 6 | base metrics aliased one buffer | 0 | **worse than silent** — every clip "on its belly", and a convention conclusion built on it |
+| 7 | settle handed over a tumbling robot | 0 | **worse than silent** — the initial condition read as a gait result |
+| 8 | calibration cannot run 2 episodes | 1 (after 4 was fixed) | loud only because 4 was fixed first |
 
 Offline code review found none of these, and could not have: every one is about the
 behaviour of an API at runtime, not the shape of the source. What found them was running
 the thing and asking whether the output that was supposed to appear had appeared.
+
+Defects 5, 6 and 7 share a shape the first four do not: they do not withhold an answer,
+they supply a wrong one that is internally consistent. 6 is the worst of them, because the
+number it corrupted — base height — is the one the harness uses to decide whether a run is
+worth interpreting at all. Two days of conclusions about a joint-sign convention were
+drawn from it, in both directions.
+
+The generalisation for the rest of this project: **an Isaac Lab buffer read is not a
+sample until it is copied**, and on CPU nothing in the type system says so. The check that
+costs nothing is asking whether a recorded array actually varies before believing what its
+mean says.
 
 Defect 5 also shows the cost asymmetry. 1–4 waste minutes. 5 hands you a plausible,
 specific, internally consistent explanation pointing at the wrong subsystem — and

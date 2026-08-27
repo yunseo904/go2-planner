@@ -1,0 +1,61 @@
+{
+  "upstream": "/workspace/eurekaverse-go2-parkour/extreme-parkour/legged_gym/legged_gym/envs/base/legged_robot_config.py",
+  "env": {
+    "action_scale": 0.25,
+    "max_angular_velocity": 1000.0,
+    "max_linear_velocity": 1000.0,
+    "friction_range": [
+      0.6,
+      2.0
+    ],
+    "decimation": 4,
+    "soft_joint_pos_limit_factor": 0.9,
+    "dt": 0.005,
+    "gravity": [
+      0.0,
+      0.0,
+      -9.81
+    ],
+    "render_interval": 4,
+    "solver_type": 1,
+    "max_position_iteration_count": 4,
+    "max_velocity_iteration_count": 0,
+    "bounce_threshold_velocity": 0.5,
+    "enabled_self_collisions": false,
+    "solver_position_iteration_count": 4,
+    "solver_velocity_iteration_count": 0,
+    "static_friction": 1.0,
+    "dynamic_friction": 1.0,
+    "restitution": 0.0,
+    "friction_combine_mode": "multiply",
+    "restitution_combine_mode": "multiply"
+  },
+  "isaac_default": {
+    "dt": 0.016666666666666666,
+    "gravity": [
+      0.0,
+      0.0,
+      -9.81
+    ],
+    "render_interval": 1,
+    "solver_type": 1,
+    "max_position_iteration_count": 255,
+    "max_velocity_iteration_count": 255,
+    "bounce_threshold_velocity": 0.5,
+    "static_friction": 0.5,
+    "dynamic_friction": 0.5,
+    "restitution": 0.0,
+    "friction_combine_mode": null,
+    "restitution_combine_mode": null
+  },
+  "differs": [
+    "dt",
+    "dynamic_friction",
+    "friction_combine_mode",
+    "max_position_iteration_count",
+    "max_velocity_iteration_count",
+    "render_interval",
+    "restitution_combine_mode",
+    "static_friction"
+  ]
+}
