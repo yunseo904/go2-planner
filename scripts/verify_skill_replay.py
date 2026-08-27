@@ -43,9 +43,9 @@ sys.path.insert(0, str(ROOT))
 
 from sim import diagnose as D
 from sim import isaac_cfg as IC
-from sim.replay import (Capabilities, ReplayMode, apply_gains, default_mode_for,
-                        ground_material_cfg, probe_capabilities, set_robot_friction,
-                        torque_headroom)
+from sim.replay import (Capabilities, ReplayMode, apply_gains, assert_not_aliased,
+                        default_mode_for, foot_body_ids, ground_material_cfg,
+                        probe_capabilities, set_robot_friction, snap, torque_headroom)
 from terrain_toolkit.paths import (
     REPLAY_REPORT_MD,
     REPLAY_RESULTS_CSV,
@@ -219,6 +219,102 @@ def load_clip(name: str, rate: str = "lo") -> dict:
     return d
 
 
+# Frame-indexed channels: a phase rotation has to move all of them together, or the
+# gains and the feed-forward torque stop lining up with the pose they belong to.
+_PER_FRAME = ("t", "q_des", "dq_des", "tau_ff", "q", "dq", "kp", "kd", "contact", "q_des_valid")
+
+
+def quiescent_start(clip: dict) -> tuple[int, dict]:
+    """Pick the phase of a cyclic clip to begin the replay at.
+
+    A cyclic clip is a loop: starting at frame 0 rather than frame k is an arbitrary
+    choice made by whoever cut the recording, not a property of the motion.  The
+    replay's settle drops the robot into whichever pose it starts on, so a start
+    frame with a foot in swing lands the robot on three legs and it tips.  This
+    picks the frame that is easiest to be dropped into -- most feet on the ground,
+    and among those the slowest-moving -- which is a choice about WHERE IN THE LOOP
+    to begin, not an edit to the recording.
+
+    Returns ``(index, info)``.  ``info["all_stance"]`` is False when the clip has no
+    four-foot frame at all: a running gait with a flight phase has none, and for
+    those this criterion cannot deliver a quiet initial condition at any phase.
+    """
+    c = clip["contact"].astype(int)
+    down = c.sum(1)
+    speed = np.linalg.norm(clip["dq"], axis=1)
+    best_down = int(down.max())
+    cand = np.flatnonzero(down == best_down)
+    idx = int(cand[np.argmin(speed[cand])])
+    return idx, {
+        "start_frame": idx,
+        "feet_down": best_down,
+        "all_stance": bool(best_down == 4),
+        "speed_at_start": float(speed[idx]),
+        "speed_at_frame0": float(speed[0]),
+        "feet_down_at_frame0": int(down[0]),
+        "n_all_stance_frames": int((down == 4).sum()),
+    }
+
+
+def level_start(clip: dict, robot, sim, idx_t, phys_dt) -> tuple[int, dict]:
+    """Pick the phase whose pose the robot can actually be stood on.
+
+    The clip's contact channel says which feet the REAL robot had on the ground.
+    That does not transfer: a clip stores joint angles and no base trajectory, so
+    where the feet end up in sim is decided by the joint angles alone.  Measured at
+    handover, the clip's labels and the sim's geometry disagree outright -- WALK's
+    frame 0 is labelled 3/4 down yet puts all four feet within 0.0 mm of a plane
+    (and is the one configuration that walks), while TROT's frame 3 is labelled 4/4
+    down and leaves a foot 44 mm in the air.
+
+    So the criterion is kinematic, not labelled: hold each candidate pose and keep
+    the one whose four feet are closest to coplanar.  Still a choice of WHERE IN THE
+    LOOP to start -- the recording is untouched.
+    """
+    import torch
+    foot_ids, _ = foot_body_ids(robot)
+    n = clip["q_des"].shape[0]
+    root = robot.data.default_root_state.clone()
+    speed = np.linalg.norm(clip["dq"], axis=1)
+    spreads = np.empty(n)
+    for k in range(n):
+        robot.write_root_state_to_sim(root)
+        q = robot.data.default_joint_pos.clone()
+        q[:, idx_t] = torch.as_tensor(clip["q_des"][k], device=q.device, dtype=q.dtype)
+        robot.write_joint_state_to_sim(q, torch.zeros_like(q))
+        robot.write_data_to_sim()
+        sim.step()
+        robot.update(phys_dt)
+        fz = robot.data.body_pos_w[0, foot_ids, 2]
+        spreads[k] = float((fz.max() - fz.min()).item())
+    # Ties on a flat clip are broken by joint speed: of two equally level poses,
+    # prefer the one the robot is moving through more slowly.
+    best = float(spreads.min())
+    cand = np.flatnonzero(spreads <= best + 1e-4)
+    idx = int(cand[np.argmin(speed[cand])])
+    return idx, {
+        "start_frame": idx,
+        "spread_at_start": float(spreads[idx]),
+        "spread_at_frame0": float(spreads[0]),
+        "spread_worst": float(spreads.max()),
+        "feet_down": int(clip["contact"][idx].sum()),
+        "all_stance": bool(clip["contact"][idx].sum() == 4),
+        "n_level_frames": int((spreads <= 0.01).sum()),
+    }
+
+
+def rotate_clip(clip: dict, k: int) -> dict:
+    """Start the loop at frame k. Same samples, same order, different entry point."""
+    if k % len(clip["q_des"]) == 0:
+        return clip
+    out = dict(clip)
+    for ch in _PER_FRAME:
+        out[ch] = np.roll(clip[ch], -k, axis=0)
+    # t is a timebase, not a signal: re-derive it so it stays monotone after the roll.
+    out["t"] = clip["t"][0] + np.arange(len(clip["t"])) / clip["fs"]
+    return out
+
+
 def expected_from_meta(meta: dict, clip: str) -> dict:
     c = meta["clips"][clip]
     sel = c.get("selection", {})
@@ -365,6 +461,36 @@ def run_isaac(args, clip: dict, meta: dict) -> dict:
         sign[0::3] = -1.0
         print("[replay] hip columns negated (--hip-sign flip)")
 
+    # Choose where in the loop to start, before anything is tiled.  Cyclic clips only:
+    # a one-shot clip has a beginning that means something.
+    if args.start_phase == "level" and clip["kind"] == "cyclic":
+        k, ph = level_start(clip, robot, sim, idx_t, phys_dt)
+        clip = rotate_clip(clip, k)
+        print(f"[replay] start phase: frame {ph['start_frame']}/{len(clip['q_des'])}, "
+              f"foot-height spread {ph['spread_at_start']*1000:.1f} mm "
+              f"(frame 0: {ph['spread_at_frame0']*1000:.1f} mm; "
+              f"worst in clip: {ph['spread_worst']*1000:.1f} mm)")
+        if ph["spread_at_start"] > 0.01:
+            print(f"[replay] WARNING no phase of this clip puts the four feet within "
+                  f"10 mm of a plane (best {ph['spread_at_start']*1000:.1f} mm). The clip "
+                  f"stores joint angles only -- it carries no base trajectory -- so a "
+                  f"gait with a flight phase has no pose that can be stood on.")
+    elif args.start_phase == "stance" and clip["kind"] == "cyclic":
+        k, ph = quiescent_start(clip)
+        clip = rotate_clip(clip, k)
+        print(f"[replay] start phase: frame {ph['start_frame']}/{len(clip['q_des'])} "
+              f"({ph['feet_down']}/4 feet down, |dq| {ph['speed_at_start']:.2f}) instead of "
+              f"frame 0 ({ph['feet_down_at_frame0']}/4 down, |dq| {ph['speed_at_frame0']:.2f})")
+        if not ph["all_stance"]:
+            print(f"[replay] WARNING this clip has NO frame with all four feet down "
+                  f"(max {ph['feet_down']}), so no phase gives a four-foot initial "
+                  f"condition. A flight-phase gait cannot be started from rest.")
+    elif clip["kind"] == "cyclic":
+        _, ph = quiescent_start(clip)
+    else:
+        ph = {"start_frame": 0, "feet_down": None, "all_stance": None}
+    ph.setdefault("spread_at_start", float("nan"))
+
     n = clip["q_des"].shape[0]
     reps = args.cycles if clip["kind"] == "cyclic" else 1
     total = n * reps
@@ -425,11 +551,7 @@ def run_isaac(args, clip: dict, meta: dict) -> dict:
 
     rec = {k: [] for k in ("q", "tau", "root_lin_vel_b", "root_ang_vel_b", "root_pos_w", "contact",
                            "root_quat_w", "contact_f", "foot_pos_w")}
-    # find_bodies() on the SENSOR returns indices into the sensor's own body list
-    # (0..3), which are not the articulation's body indices -- using them against
-    # robot.data.body_pos_w silently records the base and the hips instead of the
-    # feet.  Ask the articulation.
-    foot_ids = robot.find_bodies(".*_foot")[0]
+    foot_ids, _ = foot_body_ids(robot)      # articulation indices, not sensor indices
     terminated_s, gain_writes, clipped = None, 0, 0
     for i in range(total):
         if mode is ReplayMode.TORQUE:
@@ -447,15 +569,8 @@ def run_isaac(args, clip: dict, meta: dict) -> dict:
             robot.update(phys_dt)
             contacts.update(phys_dt)
 
-        # snap(): every one of these reads has to be COPIED out of the sim.
-        # `robot.data.root_pos_w[0]` is basic indexing -- a view into a buffer PhysX
-        # overwrites in place -- and on --device cpu `.cpu()` is a no-op, so appending
-        # it stores an alias, not a sample.  The whole recording then reads back as the
-        # LAST step repeated N times: a constant base height, a constant attitude, and
-        # a "mean" velocity that is really one instantaneous value.  `[0, idx_t]` is
-        # advanced indexing and does allocate, which is the only reason q and tau
-        # escaped.  See outputs/harness_findings.md 6.
-        snap = lambda t: t.detach().cpu().numpy().copy()
+        # snap() copies out of the sim -- see sim/replay.py for why that is not
+        # optional, and outputs/harness_findings.md 6 for what it cost.
         tau_now = robot.data.applied_torque[0, idx_t]
         rec["tau"].append(snap(tau_now))
         rec["q"].append(snap(robot.data.joint_pos[0, idx_t]))
@@ -474,16 +589,10 @@ def run_isaac(args, clip: dict, meta: dict) -> dict:
             break
 
     a = {k: np.asarray(v) for k, v in rec.items()}
-    # Regression guard for the aliasing defect above.  A base that never moves by even
-    # a micron across dozens of control steps is not a stiff robot, it is a recording
-    # that aliased one buffer -- and every mean computed from it is a single sample.
-    for _k in ("root_pos_w", "root_quat_w", "root_lin_vel_b"):
-        if a[_k].shape[0] > 5 and np.ptp(a[_k], axis=0).max() == 0.0:
-            raise SystemExit(
-                f"[replay] BUG {_k} is bit-identical across all {a[_k].shape[0]} control "
-                f"steps. The recording is aliasing a sim buffer instead of copying out of "
-                f"it; every metric derived from it would be the final step repeated. "
-                f"Refusing to report numbers.")
+    try:
+        assert_not_aliased({k: a[k] for k in ("root_pos_w", "root_quat_w", "root_lin_vel_b")})
+    except AssertionError as exc:
+        raise SystemExit(f"[replay] BUG {exc} Refusing to report numbers.")
     _, _, limits = ucfg.ordered(clip["leg_order"], clip["joint_order"])
     lim = np.asarray([l if l is not None else np.inf for l in limits], dtype=float)
     saturated = float((np.abs(a["tau"]) >= lim[None, :] - 1e-3).mean())
@@ -507,6 +616,10 @@ def run_isaac(args, clip: dict, meta: dict) -> dict:
         "cap_effort_target": cap.effort_target,
         "hip_sign": args.hip_sign,
         "settle_mode": args.settle_mode,
+        "start_phase": args.start_phase,
+        "start_frame": ph["start_frame"],
+        "start_foot_spread_m": ph["spread_at_start"],
+        "start_feet_down": ph["feet_down"],
         "handover_speed_mps": hand_v,
         "handover_ang_dps": hand_w,
         "handover_feet_loaded": hand_loaded,
@@ -648,6 +761,13 @@ def main() -> int:
     ap.add_argument("--hip-sign", choices=("keep", "flip"), default="keep",
                     help="negate the hip columns; see --convention for why this is a live question")
     ap.add_argument("--settle-s", type=float, default=0.5)
+    ap.add_argument("--start-phase", choices=("first", "stance", "level"), default="first",
+                    help="Where in the loop to begin. first: frame 0, as recorded. "
+                         "stance: the frame with the most feet down per the clip's contact "
+                         "channel. level: the frame whose joint angles put the four feet "
+                         "closest to a plane, measured from the robot's own kinematics. "
+                         "A cyclic clip is a loop, so this selects an entry point; it does "
+                         "not alter the recording. Ignored for one-shot clips.")
     ap.add_argument("--settle-mode", choices=("drop", "stand"), default="drop",
                     help="drop: fall into the clip's first pose from the spawn height "
                          "(original). stand: settle on the default standing pose first, "

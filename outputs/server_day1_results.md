@@ -424,3 +424,94 @@ step 5 can produce a number.**
 Settled, not to be re-litigated: the physics rate; the contact threshold (30 N); the
 actuator probe answers; the archive hashes; **the convention is `keep`**; **effective
 friction is 1.3, as a product of a 1.0 ground and 1.3 robot shapes under `multiply`**.
+
+
+---
+
+# Day 2b — start-phase selection: tried, insufficient, and it corrected a wrong idea
+
+Constraint respected throughout: **the clips are untouched.** A cyclic clip is a loop, so
+which frame the replay enters at is a choice made when the recording was cut, not a
+property of the motion. Nothing is synthesised and no ramp-in was used.
+
+## Attempt 1 — start where the clip says all four feet are down. It made things worse.
+
+| clip | chosen frame | clip label | handover \|v\| | feet loaded | terminated |
+|---|---|---|---|---|---|
+| WALK | 5 (was 0) | 4/4 down | 0.233 m/s *(was 0.121)* | **2/4** *(was 3/4)* | none |
+| TROT | 3 (was 0) | 4/4 down | 0.199 *(was 0.365)* | **1/4** *(was 3/4)* | 0.86 s |
+| RUN | 11 (was 0) | 2/4 down | **0.638** *(was 0.194)* | 3/4 | **0.51 s** *(was 1.11)* |
+
+Choosing frames the clip labels as full stance produced *fewer* feet on the ground in sim
+and, for RUN, a fivefold worse handover. The criterion was wrong, and the traces say why:
+
+**Foot height in sim is set by the joint angles alone.** A clip stores joint trajectories
+and carries no base trajectory, so where the feet end up is decided by the pose, not by
+what the real robot's body was doing when that pose was recorded. Measuring the four foot
+heights while the robot holds each candidate pose:
+
+| clip | frame 0 spread | best frame | best spread | worst in clip |
+|---|---|---|---|---|
+| WALK | 29.1 mm | 18 | 26.4 mm | 80.2 mm |
+| TROT | 46.0 mm | 16 | **14.3 mm** | 119.4 mm |
+| RUN | 47.1 mm | 5 | 20.7 mm | 113.8 mm |
+
+The clip's contact channel and the sim's geometry disagree outright — TROT's frame 3 is
+labelled 4/4 down and hangs a foot 44 mm in the air. So the selection statistic has to be
+kinematic (`--start-phase level`), not the recorded label (`--start-phase stance`). Both are
+kept; `first` remains the default.
+
+## Attempt 2 — start where the feet are closest to a plane. Better, still not enough.
+
+| | TROT terminated | TROT stride | TROT forward speed | handover |
+|---|---|---|---|---|
+| frame 0, drop settle | 0.84 s | 4.52 Hz *(+191%)* | 0.029 m/s | 0.365 m/s / 52 °/s |
+| `level` | 1.13 s | — | 0.019 m/s | 0.098 m/s / 9.5 °/s |
+| `level` + `stand` | **2.19 s** | **1.56 vs 1.56 Hz** | **0.306 vs log 0.444** | 0.068 m/s / 13 °/s |
+
+TROT now enters with an initial condition **as quiet as WALK's** (0.068 m/s / 13 °/s against
+WALK's 0.121 / 6.2, and WALK survives), reproduces the logged stride exactly, and travels at
+0.31 m/s. It still falls at 2.19 s — after four clean cycles, not during the first one.
+RUN improves the same way (1.11 s → 2.47 s, stride exact under `level` alone) and still fails.
+
+**This is the informative part.** The initial condition was a real defect and fixing it moved
+every number in the right direction, but TROT now fails from a starting state that WALK
+survives. So what remains is not the initial condition — it is a drift that accumulates over
+cycles (sideways 0.22 m/s, yaw). Hypothesis 1 does not close the gap on its own.
+
+## Recommendation on the startup segment (your item 2)
+
+**Move `curated/` to z4** rather than extracting on the laptop. Reasons, in order:
+
+1. **This will need iterating.** Where the startup window begins and ends is exactly the
+   parameter that will take several passes against sim feedback. On the laptop each pass is
+   extract → freeze → push → pull; here it is one command.
+2. **The judge is on this machine.** Whether a startup segment fixes the initial condition
+   can only be decided by replaying it in Isaac Lab, which exists only on z4. Keeping the
+   source material away from the only instrument that can evaluate it is the wrong split.
+3. **Disk is not the constraint** — 329 GB free. (Worth confirming `curated/` is not larger
+   than that; 36 teleop sessions should be far below it.)
+
+**Do this first, before changing anything:** re-run `extract_skill_clips.py` unchanged on z4
+and check the archive reproduces `content_sha256 = ae467d86…` bit for bit. If it does, the
+extraction is machine-independent and any re-cut clip is comparable to the current one. If it
+does not, we need to know that *before* changing clip definitions, not after — otherwise a
+new archive differs for two reasons at once and neither can be isolated.
+
+**This contradicts CLAUDE.md §1**, which records that `curated/` need not be on the server
+because the clips are already extracted. That premise held while the clips were final; item 2
+retires it. Flagging rather than editing, per §0 — say the word and I will update §1.
+
+## Regression tests (your item 4)
+
+`scripts/test_sim_contracts.py` — synthetic fakes, no simulator, no pytest, runs in a second.
+Covers the four traps: buffer aliasing on state recording, sensor-vs-articulation body
+indexing, quaternion order, and units (rad/deg, Hz/period, sim_dt/decimation), plus the
+friction combine rule.
+
+Every test asserts **two** things: that the fixed helper is correct, *and* that the original
+mistake would still be caught. A `FakeTensor` reproduces the two behaviours that caused
+defect §6 — `[i]` returns a view, `.cpu()` is a no-op — so the aliasing test fails against
+the old code rather than merely passing against the new. The contracts themselves now live in
+`sim/replay.py` (`snap`, `assert_not_aliased`, `foot_body_ids`, `quat_to_rpy_deg`,
+`effective_friction`) so they are stated once instead of re-derived per call site.

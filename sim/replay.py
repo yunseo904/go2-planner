@@ -275,3 +275,94 @@ def set_robot_friction(robot, mu: float):
               f"the effective coefficient is the ground's combined with whatever "
               f"go2.usd ships, which is not the env's")
         return None
+
+
+# --------------------------------------------------------------------------- #
+# Recording contracts
+#
+# Three of the day-1 defects, and three more introduced while diagnosing them,
+# were not logic errors -- they were reads that looked like samples and were not.
+# Each of these exists so the contract can be stated once and tested against
+# synthetic data (scripts/test_sim_contracts.py), instead of being re-derived at
+# every call site.
+# --------------------------------------------------------------------------- #
+
+def snap(t):
+    """Copy a tensor out of the simulator, by value.
+
+    ``robot.data.root_pos_w[0]`` is basic indexing, so it is a VIEW into a buffer
+    the physics engine overwrites in place.  ``.cpu()`` is a no-op when the source
+    is already on the CPU and ``.numpy()`` shares memory, so appending the result
+    stores an alias.  N "samples" then read back as the final step repeated N
+    times.  Advanced indexing (``[0, idx]``) allocates, which is the only reason
+    some channels escaped -- a distinction nothing in the type system surfaces.
+    """
+    return t.detach().cpu().numpy().copy()
+
+
+def assert_not_aliased(arrays: dict, min_steps: int = 5) -> None:
+    """Raise if any recorded array never changes across the whole episode.
+
+    A base that does not move by a single float across hundreds of control steps is
+    a recording that aliased a buffer, not a robot that stood perfectly still.
+    """
+    for name, a in arrays.items():
+        a = np.asarray(a)
+        if a.shape[0] > min_steps and np.ptp(a.reshape(a.shape[0], -1), axis=0).max() == 0.0:
+            raise AssertionError(
+                f"{name} is bit-identical across all {a.shape[0]} control steps. The "
+                f"recording is aliasing a simulator buffer instead of copying out of it; "
+                f"every metric derived from it would be the final step repeated.")
+
+
+def foot_body_ids(robot, pattern: str = ".*_foot"):
+    """Foot indices in the ARTICULATION's body ordering.
+
+    ``ContactSensor.find_bodies()`` returns indices into the sensor's own body list
+    -- 0..3 for a four-foot sensor -- which are not the articulation's indices.
+    Used against ``robot.data.body_pos_w`` they silently select the base and the
+    hips, and foot height comes back equal to base height.
+    """
+    ids, names = robot.find_bodies(pattern)
+    if not ids:
+        raise AssertionError(f"no bodies match {pattern!r} on this articulation")
+    return ids, names
+
+
+# Isaac Lab reports root orientation as (x, y, z, w): the SCALAR IS LAST.  Reading
+# it as (w, x, y, z) turns a robot standing level into one facing backwards, which
+# is a compelling and entirely fictional finding rather than an obvious error.
+QUAT_ORDER = "xyzw"
+
+
+def quat_to_rpy_deg(q, order: str = QUAT_ORDER):
+    """Roll/pitch/yaw in DEGREES from a quaternion array, scalar-last by default."""
+    q = np.asarray(q, dtype=float)
+    if order == "xyzw":
+        x, y, z, w = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
+    elif order == "wxyz":
+        w, x, y, z = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
+    else:
+        raise ValueError(f"unknown quaternion order {order!r}")
+    roll = np.arctan2(2 * (w * x + y * z), 1 - 2 * (x * x + y * y))
+    pitch = np.arcsin(np.clip(2 * (w * y - z * x), -1.0, 1.0))
+    yaw = np.arctan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+    return np.degrees(roll), np.degrees(pitch), np.degrees(yaw)
+
+
+def effective_friction(ground: float, robot: float, combine_mode: str) -> float:
+    """What PhysX actually uses when two materials touch.
+
+    The env sets ``multiply`` on the terrain; Isaac Lab's default is ``average``.
+    Overriding only the ground therefore does not set the coefficient the contact
+    sees -- the robot's own material is half of it.
+    """
+    if combine_mode == "multiply":
+        return ground * robot
+    if combine_mode in ("average", None):
+        return 0.5 * (ground + robot)
+    if combine_mode == "min":
+        return min(ground, robot)
+    if combine_mode == "max":
+        return max(ground, robot)
+    raise ValueError(f"unknown combine mode {combine_mode!r}")
