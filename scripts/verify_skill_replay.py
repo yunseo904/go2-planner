@@ -43,7 +43,9 @@ sys.path.insert(0, str(ROOT))
 
 from sim import diagnose as D
 from sim import isaac_cfg as IC
-from sim.replay import Capabilities, ReplayMode, apply_gains, default_mode_for, probe_capabilities, torque_headroom
+from sim.replay import (Capabilities, ReplayMode, apply_gains, default_mode_for,
+                        ground_material_cfg, probe_capabilities, set_robot_friction,
+                        torque_headroom)
 from terrain_toolkit.paths import (
     REPLAY_REPORT_MD,
     REPLAY_RESULTS_CSV,
@@ -295,7 +297,20 @@ def run_isaac(args, clip: dict, meta: dict) -> dict:
     sim = SimulationContext(SimulationCfg(dt=phys_dt, device=args.device))
     sim.set_camera_view([2.0, 2.0, 1.0], [0.0, 0.0, 0.3])
 
-    sim_utils.GroundPlaneCfg().func("/World/ground", sim_utils.GroundPlaneCfg())
+    # Isaac's default ground is static/dynamic friction 0.5, which is BELOW the
+    # whole range the env randomises over.  Stand on the range's midpoint instead,
+    # read from the env config -- see Go2Config.ground_friction.
+    mu = ucfg.ground_friction
+    if mu is None:
+        print("[replay] WARNING no friction_range in the env config; falling back to "
+              "Isaac's default ground (0.5), which the env never uses")
+        ground = sim_utils.GroundPlaneCfg()
+    else:
+        ground = sim_utils.GroundPlaneCfg(physics_material=ground_material_cfg(sim_utils))
+        print(f"[replay] ground 1.00/1.00 multiply (the env's terrain material); "
+              f"robot shapes -> {mu:.2f}, the midpoint of friction_range "
+              f"{ucfg.friction_range}; effective mu {mu:.2f}")
+    ground.func("/World/ground", ground)
     sim_utils.DomeLightCfg(intensity=2000.0).func("/World/light", sim_utils.DomeLightCfg(intensity=2000.0))
 
     robot_cfg = UNITREE_GO2_CFG.replace(prim_path="/World/Robot")
@@ -318,6 +333,10 @@ def run_isaac(args, clip: dict, meta: dict) -> dict:
 
     sim.reset()
 
+    if mu is not None:
+        ba = set_robot_friction(robot, mu)
+        if ba:
+            print(f"[replay] robot shape friction {ba[0]:.2f} (from go2.usd) -> {ba[1]:.2f}")
     cap = probe_capabilities(robot, ucfg.all_explicit)
     mode = cap.resolve(requested)
     if mode is not requested:
@@ -353,20 +372,64 @@ def run_isaac(args, clip: dict, meta: dict) -> dict:
     tau_ff = torch.as_tensor(np.tile(clip["tau_ff"] * sign, (reps, 1)), device=sim.device, dtype=torch.float32)
     kp_seq, kd_seq = np.tile(clip["kp"], (reps, 1)), np.tile(clip["kd"], (reps, 1))
 
-    # Settle on the clip's first pose before playing, so step 0 is not a jump.
+    # ------------------------------------------------------------------ settle
+    # The initial condition is not a formality here: it decides the verdict.  The
+    # env spawns the base at 0.42 m, a height chosen for its DEFAULT STANDING pose
+    # (all four feet down).  `drop` overrides the joints to the clip's first frame
+    # -- a mid-gait pose with one or two feet in swing -- and lets the robot fall
+    # into it from that same 0.42 m.  It lands on three legs and starts tipping, so
+    # the replay begins with the base already moving.  Measured at handover:
+    #   WALK 0.12 m/s /  6 deg/s -> survives
+    #   TROT 0.37 m/s / 52 deg/s -> collapses at 0.82 s
+    #   RUN  0.19 m/s / 13 deg/s, front-left unloaded -> collapses at 1.11 s
+    # `stand` instead settles on the default pose the spawn height is designed for,
+    # then drives the joints to the clip's first frame with the PD while the robot
+    # is already standing.  Same settle_s for each half, so no new tuned constant.
     root = robot.data.default_root_state.clone()
     robot.write_root_state_to_sim(root)
-    q0 = robot.data.default_joint_pos.clone()
-    q0[:, idx_t] = q_cmd[0]
-    robot.write_joint_state_to_sim(q0, torch.zeros_like(q0))
-    for _ in range(int(args.settle_s / ctrl_dt)):
-        robot.set_joint_position_target(q0)
-        for _ in range(decim):
-            robot.write_data_to_sim()
-            sim.step()
-            robot.update(phys_dt)
+    q_clip0 = robot.data.default_joint_pos.clone()
+    q_clip0[:, idx_t] = q_cmd[0]
 
-    rec = {k: [] for k in ("q", "tau", "root_lin_vel_b", "root_ang_vel_b", "root_pos_w", "contact")}
+    def _hold(target, n_ctrl):
+        for _ in range(n_ctrl):
+            robot.set_joint_position_target(target)
+            for _ in range(decim):
+                robot.write_data_to_sim()
+                sim.step()
+                robot.update(phys_dt)
+                # the sensor has to be stepped too, or the handover contact reading
+                # below is whatever was in the buffer before the settle ran
+                contacts.update(phys_dt)
+
+    n_settle = int(args.settle_s / ctrl_dt)
+    if args.settle_mode == "drop":
+        robot.write_joint_state_to_sim(q_clip0, torch.zeros_like(q_clip0))
+        _hold(q_clip0, n_settle)
+    else:
+        q_stand = robot.data.default_joint_pos.clone()
+        robot.write_joint_state_to_sim(q_stand, torch.zeros_like(q_stand))
+        _hold(q_stand, n_settle)
+        for k in range(1, n_settle + 1):
+            a = k / n_settle
+            _hold(q_stand * (1.0 - a) + q_clip0 * a, 1)
+
+    # The handover state is reported whatever the mode: a replay that begins with the
+    # base already moving is measuring the settle, not the clip.
+    hand_v = float(torch.linalg.norm(robot.data.root_lin_vel_b[0]).item())
+    hand_w = float(np.degrees(torch.linalg.norm(robot.data.root_ang_vel_b[0]).item()))
+    hand_f = contacts.data.net_forces_w[0].norm(dim=-1)
+    hand_loaded = int((hand_f > args.contact_threshold_n).sum().item())
+    print(f"[replay] handover after --settle-mode {args.settle_mode}: "
+          f"|v| {hand_v:.3f} m/s, |w| {hand_w:.1f} deg/s, {hand_loaded}/4 feet loaded, "
+          f"base {robot.data.root_pos_w[0, 2].item():.3f} m")
+
+    rec = {k: [] for k in ("q", "tau", "root_lin_vel_b", "root_ang_vel_b", "root_pos_w", "contact",
+                           "root_quat_w", "contact_f", "foot_pos_w")}
+    # find_bodies() on the SENSOR returns indices into the sensor's own body list
+    # (0..3), which are not the articulation's body indices -- using them against
+    # robot.data.body_pos_w silently records the base and the hips instead of the
+    # feet.  Ask the articulation.
+    foot_ids = robot.find_bodies(".*_foot")[0]
     terminated_s, gain_writes, clipped = None, 0, 0
     for i in range(total):
         if mode is ReplayMode.TORQUE:
@@ -384,19 +447,43 @@ def run_isaac(args, clip: dict, meta: dict) -> dict:
             robot.update(phys_dt)
             contacts.update(phys_dt)
 
+        # snap(): every one of these reads has to be COPIED out of the sim.
+        # `robot.data.root_pos_w[0]` is basic indexing -- a view into a buffer PhysX
+        # overwrites in place -- and on --device cpu `.cpu()` is a no-op, so appending
+        # it stores an alias, not a sample.  The whole recording then reads back as the
+        # LAST step repeated N times: a constant base height, a constant attitude, and
+        # a "mean" velocity that is really one instantaneous value.  `[0, idx_t]` is
+        # advanced indexing and does allocate, which is the only reason q and tau
+        # escaped.  See outputs/harness_findings.md 6.
+        snap = lambda t: t.detach().cpu().numpy().copy()
         tau_now = robot.data.applied_torque[0, idx_t]
-        rec["tau"].append(tau_now.cpu().numpy())
-        rec["q"].append(robot.data.joint_pos[0, idx_t].cpu().numpy())
-        rec["root_lin_vel_b"].append(robot.data.root_lin_vel_b[0].cpu().numpy())
-        rec["root_ang_vel_b"].append(robot.data.root_ang_vel_b[0].cpu().numpy())
-        rec["root_pos_w"].append(robot.data.root_pos_w[0].cpu().numpy())
+        rec["tau"].append(snap(tau_now))
+        rec["q"].append(snap(robot.data.joint_pos[0, idx_t]))
+        rec["root_lin_vel_b"].append(snap(robot.data.root_lin_vel_b[0]))
+        rec["root_ang_vel_b"].append(snap(robot.data.root_ang_vel_b[0]))
+        rec["root_pos_w"].append(snap(robot.data.root_pos_w[0]))
         f = contacts.data.net_forces_w[0].norm(dim=-1)
-        rec["contact"].append((f > args.contact_threshold_n).cpu().numpy())
+        rec["contact"].append(snap(f > args.contact_threshold_n))
+        # Kept alongside the boolean so a collapse can be read back without a rerun:
+        # which foot lost load first, and what the base was doing when it did.
+        rec["contact_f"].append(snap(f))
+        rec["root_quat_w"].append(snap(robot.data.root_quat_w[0]))
+        rec["foot_pos_w"].append(snap(robot.data.body_pos_w[0, foot_ids]))
         if robot.data.root_pos_w[0, 2].item() < args.fall_height_m and terminated_s is None:
             terminated_s = i * dt
             break
 
     a = {k: np.asarray(v) for k, v in rec.items()}
+    # Regression guard for the aliasing defect above.  A base that never moves by even
+    # a micron across dozens of control steps is not a stiff robot, it is a recording
+    # that aliased one buffer -- and every mean computed from it is a single sample.
+    for _k in ("root_pos_w", "root_quat_w", "root_lin_vel_b"):
+        if a[_k].shape[0] > 5 and np.ptp(a[_k], axis=0).max() == 0.0:
+            raise SystemExit(
+                f"[replay] BUG {_k} is bit-identical across all {a[_k].shape[0]} control "
+                f"steps. The recording is aliasing a sim buffer instead of copying out of "
+                f"it; every metric derived from it would be the final step repeated. "
+                f"Refusing to report numbers.")
     _, _, limits = ucfg.ordered(clip["leg_order"], clip["joint_order"])
     lim = np.asarray([l if l is not None else np.inf for l in limits], dtype=float)
     saturated = float((np.abs(a["tau"]) >= lim[None, :] - 1e-3).mean())
@@ -419,10 +506,23 @@ def run_isaac(args, clip: dict, meta: dict) -> dict:
         "cap_runtime_gains": cap.runtime_gain_write,
         "cap_effort_target": cap.effort_target,
         "hip_sign": args.hip_sign,
+        "settle_mode": args.settle_mode,
+        "handover_speed_mps": hand_v,
+        "handover_ang_dps": hand_w,
+        "handover_feet_loaded": hand_loaded,
     })
+    if hand_loaded < 4 or hand_v > 0.15:
+        print(f"[replay] WARNING the replay started from a base already moving at "
+              f"{hand_v:.3f} m/s with {hand_loaded}/4 feet loaded. Anything measured "
+              f"below is partly the settle, not the clip -- compare --settle-mode stand.")
     if saturated > 0.02:
         print(f"[replay] WARNING {saturated:.1%} of joint-samples hit the effort clip; "
               f"the sim robot is torque-limited on this clip (see --headroom)")
+    if args.trace_npz:
+        np.savez_compressed(args.trace_npz, dt=dt, phys_dt=phys_dt,
+                            terminated_s=(np.nan if terminated_s is None else terminated_s),
+                            **{k: v for k, v in a.items()})
+        print(f"[replay] trace -> {args.trace_npz}  ({a['q'].shape[0]} control steps)")
     m["_q_measured"] = a["q"]
     m["_q_commanded"] = np.tile(clip["q_des"] * sign, (reps, 1))[: a["q"].shape[0]]
     return m
@@ -548,8 +648,15 @@ def main() -> int:
     ap.add_argument("--hip-sign", choices=("keep", "flip"), default="keep",
                     help="negate the hip columns; see --convention for why this is a live question")
     ap.add_argument("--settle-s", type=float, default=0.5)
+    ap.add_argument("--settle-mode", choices=("drop", "stand"), default="drop",
+                    help="drop: fall into the clip's first pose from the spawn height "
+                         "(original). stand: settle on the default standing pose first, "
+                         "then drive to the clip pose with the PD.")
     ap.add_argument("--contact-threshold-n", type=float, default=1.0)
     ap.add_argument("--fall-height-m", type=float, default=0.15)
+    ap.add_argument("--trace-npz", default=None,
+                    help="dump the per-step record (base pose, per-foot force, foot "
+                         "positions) so a collapse can be read back without a rerun")
     ap.add_argument("--self-test", action="store_true", help="no Isaac Lab needed")
     ap.add_argument("--explain", action="store_true", help="print gains + expectations, no sim")
     ap.add_argument("--convention", action="store_true",

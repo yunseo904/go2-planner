@@ -58,6 +58,7 @@ class Go2Config:
     decimation: Optional[int] = None
     action_scale: Optional[float] = None
     init_pos_z: Optional[float] = None
+    friction_range: Optional[Tuple[float, float]] = None
     _raw: dict = field(default_factory=dict, repr=False)
 
     @property
@@ -65,6 +66,24 @@ class Go2Config:
         if self.sim_dt and self.decimation:
             return 1.0 / (self.sim_dt * self.decimation)
         return None
+
+    @property
+    def ground_friction(self) -> Optional[float]:
+        """The single ground friction the harness should stand on.
+
+        The env randomises friction per episode over ``friction_range``; a replay
+        or a calibration probe needs one fixed number, because a step-clearance
+        threshold measured on a randomised floor folds friction variance into a
+        geometric answer.  The midpoint is the least arbitrary fixed choice
+        inside the distribution the policy is trained and evaluated on, and it
+        comes from the env rather than from anything we measured -- CLAUDE.md 2
+        forbids picking it to suit a score.  Isaac's own default (0.5) is below
+        the whole range, so it is not a neutral fallback.
+        """
+        if not self.friction_range:
+            return None
+        lo, hi = self.friction_range
+        return 0.5 * (lo + hi)
 
     @property
     def all_explicit(self) -> bool:
@@ -144,11 +163,19 @@ def load(root: Path | None = None, robot: str = "UNITREE_GO2_CFG") -> Go2Config:
 
     # sim dt / decimation / action_scale live in class bodies elsewhere in the file
     scalars: Dict[str, float] = {}
+    ranges: Dict[str, Tuple[float, float]] = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
             name, val = node.targets[0].id, _const(node.value)
             if name in ("dt", "decimation", "action_scale") and isinstance(val, (int, float)):
                 scalars.setdefault(name, val)
+            # friction_range lives in a domain-randomisation class body.  Reading it
+            # from the AST means the commented-out alternatives in that file cannot
+            # be picked up by accident -- only the assignment that is actually live.
+            if name == "friction_range" and isinstance(node.value, (ast.List, ast.Tuple)):
+                vals = [_const(e) for e in node.value.elts]
+                if len(vals) == 2 and all(isinstance(v, (int, float)) for v in vals):
+                    ranges.setdefault(name, (float(vals[0]), float(vals[1])))
         if isinstance(node, ast.keyword) and node.arg == "dt":
             v = _const(node.value)
             if isinstance(v, (int, float)):
@@ -156,7 +183,8 @@ def load(root: Path | None = None, robot: str = "UNITREE_GO2_CFG") -> Go2Config:
 
     return Go2Config(src_path, joint_pos, groups, scalars.get("dt"),
                      int(scalars["decimation"]) if "decimation" in scalars else None,
-                     scalars.get("action_scale"), init_z)
+                     scalars.get("action_scale"), init_z,
+                     ranges.get("friction_range"))
 
 
 # --------------------------------------------------------------------------- #

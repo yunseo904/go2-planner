@@ -51,7 +51,8 @@ sys.path.insert(0, str(ROOT))
 
 from sim import heightfield as HF
 from sim import isaac_cfg as IC
-from sim.replay import ReplayMode, apply_gains, default_mode_for, probe_capabilities
+from sim.replay import (ReplayMode, apply_gains, default_mode_for, ground_material_cfg,
+                        probe_capabilities, set_robot_friction)
 from terrain_toolkit.calibrate import CALIBRATION_MAP, STEP_DOWN_NOTE
 from terrain_toolkit.paths import (
     CALIBRATION_NPZ,
@@ -168,6 +169,37 @@ def run_isaac(args, probes: dict, runs: list) -> list:
         sign[0::3] = -1.0
         print("[cal] hip columns negated (--hip-sign flip)")
 
+    # Same ground for every probe and for the replay harness: the env's own
+    # friction_range midpoint, not Isaac's 0.5 default.  A step-clearance
+    # threshold has to be measured on one fixed floor.
+    mu = ucfg.ground_friction
+    if mu is None:
+        print("[cal] WARNING no friction_range in the env config; falling back to "
+              "Isaac's default ground (0.5), which the env never uses")
+        ground_material = sim_utils.RigidBodyMaterialCfg()
+    else:
+        ground_material = ground_material_cfg(sim_utils)
+        print(f"[cal] ground 1.00/1.00 multiply (the env's terrain material); robot "
+              f"shapes -> {mu:.2f}, midpoint of friction_range {ucfg.friction_range}")
+
+    # ---------------------------------------------------------------- KNOWN BLOCKER
+    # This loop rebuilds the terrain AND the robot at fixed prim paths every episode.
+    # Isaac Lab 3.0 does not support that teardown inside one SimulationContext: the
+    # previous Articulation stays registered with the physics manager after its prim
+    # is removed, and the next sim.reset() dies with "Failed to create articulation at
+    # /World/Robot/base".  Episode 1 runs; episode 2 does not.  Fail loudly here rather
+    # than after however many hours the sweep would otherwise appear to be making.
+    #   Two workable designs, neither attempted yet:
+    #     (a) build terrain + robot ONCE and per episode only rewrite the robot's root
+    #         state and swap the probe mesh (needs the probes to share a prim layout);
+    #     (b) one process per probe, driven from a shell loop -- slower, but it matches
+    #         how the sim actually wants to be used.
+    if len(runs) * args.reps > 1:
+        print(f"[cal] WARNING {len(runs) * args.reps} episodes requested but this loop can "
+              f"only complete the first one (scene teardown is unsupported -- see the "
+              f"comment above). Re-run with --max-probes 1 --reps 1 --params <one>, or "
+              f"fix the scene lifecycle first.")
+
     rows = []
     for (param, skill, family, pi, level) in runs:
         clip = clips[skill]
@@ -175,7 +207,23 @@ def run_isaac(args, probes: dict, runs: list) -> list:
         dt = decim * phys_dt                       # control period actually stepped
         hf = probes["hf"][pi]
         verts, faces = HF.to_trimesh(hf, probes["horizontal_scale"], probes["vertical_scale"])
-        importer = TerrainImporter(TerrainImporterCfg(prim_path="/World/ground", terrain_type="plane"))
+        # Every probe builds a fresh terrain and a fresh robot at the SAME prim paths, so
+        # from the second episode on the spawners hit "a prim already exists at path" and
+        # the sweep dies -- this loop had never run past episode 1.  Clear the prims from
+        # the previous episode before rebuilding.  (The terrain mesh differs per probe, so
+        # it genuinely has to be rebuilt rather than reused.)
+        import omni.usd
+        _stage = omni.usd.get_context().get_stage()
+        for stale in ("/World/ground", "/World/Robot"):
+            if _stage.GetPrimAtPath(stale).IsValid():
+                _stage.RemovePrim(stale)
+        # num_envs/env_spacing are mandatory: TerrainImporter configures grid-like env
+        # origins in __init__ and raises without them. With a single env the spacing only
+        # places that one origin and has no physical effect on the probe.
+        importer = TerrainImporter(TerrainImporterCfg(
+            prim_path="/World/ground", terrain_type="plane",
+            num_envs=1, env_spacing=1.0,
+            physics_material=ground_material))
         try:
             import trimesh
             importer.import_mesh("probe", trimesh.Trimesh(vertices=verts, faces=faces))
@@ -191,6 +239,8 @@ def run_isaac(args, probes: dict, runs: list) -> list:
                 act.damping = float(np.median(clip["kd"]))
         robot = Articulation(robot_cfg)
         sim.reset()
+        if mu is not None:
+            set_robot_friction(robot, mu)
         cap = probe_capabilities(robot, ucfg.all_explicit)
         mode = cap.resolve(requested)
         want = [f"{leg}_{j}_joint" for leg in clip["leg_order"] for j in clip["joint_order"]]
@@ -226,7 +276,10 @@ def run_isaac(args, probes: dict, runs: list) -> list:
                     robot.write_data_to_sim()
                     sim.step()
                     robot.update(phys_dt)
-                pos = robot.data.root_pos_w[0].cpu().numpy()
+                # .copy() on purpose: this is a view into a buffer PhysX rewrites in
+                # place, and `pos` outlives the loop (x_final_m).  Only the final value
+                # is wanted here, but an alias makes that true by accident, not design.
+                pos = robot.data.root_pos_w[0].detach().cpu().numpy().copy()
                 saturated += int((np.abs(robot.data.applied_torque[0, idx_t].cpu().numpy()) >= lim - 1e-3).any())
                 reached = bool(np.hypot(pos[0] - goal[0], pos[1] - goal[1]) < args.goal_radius_m)
                 fell = bool(pos[2] < args.fall_height_m)
@@ -441,9 +494,19 @@ def main() -> int:
         ths = thresholds_from_rows(rows)
         write_report(ths, rows, args)
         print(HF.config_block(ths))
-    finally:
+    except BaseException:
+        # _SIM_APP.close() TERMINATES the process, so a bare `finally: close()`
+        # swallows the traceback and the run exits 0 looking like a clean no-op --
+        # after a sweep that can be hours long.  Print first, close second.
+        import traceback
+        traceback.print_exc()
+        sys.stdout.flush(); sys.stderr.flush()
         if _SIM_APP is not None:
             _SIM_APP.close()
+        return 1
+    sys.stdout.flush()
+    if _SIM_APP is not None:
+        _SIM_APP.close()
     return 0
 
 

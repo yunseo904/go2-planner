@@ -221,3 +221,57 @@ def torque_headroom(tau_logged: np.ndarray, effort_limits: Sequence[float],
         a = np.abs(tau_logged[:, m])
         out.append(Headroom(jn, float(a.max()), float(np.percentile(a, 99.9)), lim))
     return out
+
+
+# --------------------------------------------------------------------------- #
+# Ground contact -- reproducing the env's friction, which is a product of two
+# --------------------------------------------------------------------------- #
+
+def ground_material_cfg(sim_utils):
+    """The terrain material the env builds, verbatim.
+
+    ``legged_robot.py::_create_trimesh`` spawns the terrain with static 1.0 /
+    dynamic 1.0 / restitution 0.0 and -- the part that matters -- BOTH combine
+    modes set to ``multiply``.  Isaac Lab's default is ``average``, so a harness
+    that only overrides the ground's coefficient does not get that coefficient:
+    it gets the average of the ground and whatever material the robot's USD
+    happens to ship.  The effective friction is a product of two materials and
+    only one of them was ever being set.
+    """
+    return sim_utils.RigidBodyMaterialCfg(
+        static_friction=1.0, dynamic_friction=1.0, restitution=0.0,
+        friction_combine_mode="multiply", restitution_combine_mode="multiply")
+
+
+def set_robot_friction(robot, mu: float):
+    """Put ``mu`` on every one of the robot's collision shapes.
+
+    This is the half the env randomises: ``_process_rigid_shape_props`` samples one
+    coefficient per environment from ``friction_range`` and writes it to all of the
+    robot's shapes, which then combines multiplicatively with the terrain's 1.0.
+    Replaying a clip needs one fixed floor rather than a per-episode sample, so the
+    sampled draw is replaced by a fixed ``mu`` -- but it has to be written in the
+    same place, or the terrain override alone does nothing.
+
+    Returns ``(before, after)`` mean static friction so the caller can report what
+    the USD was actually shipping, or ``None`` if this build exposes no way to
+    write shape materials.
+    """
+    try:
+        import warp as wp
+        import torch
+        view = robot.root_view
+        mats = wp.to_torch(view.get_material_properties())      # (envs, shapes, 3)
+        before = float(mats[..., 0].mean().item())
+        mats[..., 0] = mu          # static
+        mats[..., 1] = mu          # dynamic
+        ids = torch.arange(mats.shape[0], dtype=torch.int32)
+        view.set_material_properties(wp.from_torch(mats.contiguous(), dtype=wp.float32),
+                                     wp.from_torch(ids, dtype=wp.int32))
+        after = float(wp.to_torch(view.get_material_properties())[..., 0].mean().item())
+        return before, after
+    except Exception as exc:                                    # pragma: no cover
+        print(f"[replay] WARNING could not write the robot's shape friction ({exc}); "
+              f"the effective coefficient is the ground's combined with whatever "
+              f"go2.usd ships, which is not the env's")
+        return None
