@@ -484,6 +484,30 @@ def run_isaac(args, clip: dict, meta: dict) -> dict:
     contact_cfg = ContactSensorCfg(prim_path="/World/Robot/.*_foot", history_length=1, track_air_time=True)
     contacts = ContactSensor(contact_cfg)
 
+    # Optional side-view recording.  The failure mode is a roll, so the camera sits
+    # abeam the robot and tracks its x only: lateral drift then reads as a change in
+    # apparent size rather than being cancelled out by the camera follow, and roll is
+    # seen square on.
+    #
+    # This must not change what is being measured.  The camera is a passive sensor;
+    # frames are pulled at CONTROL-step boundaries with an explicit sim.render(), and
+    # the physics substep loop below is not touched -- same phys_dt, same decimation,
+    # same order of writes.  The check that this held is the run's own termination
+    # time against the un-recorded run (see --video in the docstring).
+    video = None
+    if args.video:
+        from isaaclab.sensors import Camera, CameraCfg
+        cam_cfg = CameraCfg(
+            prim_path="/World/side_cam",
+            update_period=0.0,                     # on demand only; never self-schedules
+            height=args.video_height, width=args.video_width,
+            data_types=["rgb"],
+            spawn=sim_utils.PinholeCameraCfg(focal_length=24.0, clipping_range=(0.05, 60.0)),
+        )
+        video = {"cam": Camera(cam_cfg), "frames": 0}
+        print(f"[replay] video: side view {args.video_width}x{args.video_height}, "
+              f"every {args.video_stride} control step(s) -> {args.video}")
+
     sim.reset()
 
     if mu is not None:
@@ -606,6 +630,31 @@ def run_isaac(args, clip: dict, meta: dict) -> dict:
           f"|v| {hand_v:.3f} m/s, |w| {hand_w:.1f} deg/s, {hand_loaded}/4 feet loaded, "
           f"base {robot.data.root_pos_w[0, 2].item():.3f} m")
 
+    if video is not None:
+        import imageio.v2 as imageio
+        fps = args.video_fps if args.video_fps else max(1.0, (1.0 / dt) / args.video_stride)
+        Path(args.video).parent.mkdir(parents=True, exist_ok=True)
+        video["writer"] = imageio.get_writer(args.video, fps=fps, macro_block_size=None,
+                                             codec="libx264", quality=8)
+        video["fps"] = fps
+        print(f"[replay] video: writing {fps:.1f} fps ({'real time' if not args.video_fps else 'forced'})")
+
+    def grab_frame():
+        """Pull one RGB frame. Renders only; never steps physics."""
+        cam = video["cam"]
+        bx = float(robot.data.root_pos_w[0, 0].item())
+        bz = float(robot.data.root_pos_w[0, 2].item())
+        eye = torch.tensor([[bx, args.video_side_m, max(0.35, bz + 0.12)]],
+                           device=sim.device, dtype=torch.float32)
+        tgt = torch.tensor([[bx, 0.0, 0.28]], device=sim.device, dtype=torch.float32)
+        cam.set_world_poses_from_view(eye, tgt)
+        sim.render()
+        cam.update(dt, force_recompute=True)
+        rgb = cam.data.output["rgb"][0]
+        rgb = rgb.detach().cpu().numpy()
+        video["writer"].append_data(np.ascontiguousarray(rgb[..., :3]).astype(np.uint8))
+        video["frames"] += 1
+
     rec = {k: [] for k in ("q", "tau", "root_lin_vel_b", "root_ang_vel_b", "root_pos_w", "contact",
                            "root_quat_w", "contact_f", "foot_pos_w")}
     foot_ids, foot_names = foot_body_ids(robot)   # articulation indices, not sensor indices
@@ -641,9 +690,23 @@ def run_isaac(args, clip: dict, meta: dict) -> dict:
         rec["contact_f"].append(snap(f))
         rec["root_quat_w"].append(snap(robot.data.root_quat_w[0]))
         rec["foot_pos_w"].append(snap(robot.data.body_pos_w[0, foot_ids]))
+        if video is not None and i % args.video_stride == 0:
+            grab_frame()
         if robot.data.root_pos_w[0, 2].item() < args.fall_height_m and terminated_s is None:
             terminated_s = i * dt
+            if video is not None:
+                # a beat of the collapse, so the last frame is not the trigger frame
+                for _ in range(int(round(0.4 / dt / args.video_stride))):
+                    for _ in range(decim * args.video_stride):
+                        robot.write_data_to_sim(); sim.step()
+                        robot.update(phys_dt); contacts.update(phys_dt)
+                    grab_frame()
             break
+
+    if video is not None:
+        video["writer"].close()
+        print(f"[replay] video: wrote {video['frames']} frames "
+              f"({video['frames'] / video['fps']:.2f} s at {video['fps']:.1f} fps) -> {args.video}")
 
     a = {k: np.asarray(v) for k, v in rec.items()}
     try:
@@ -859,6 +922,18 @@ def main() -> int:
                          "the clip or in the robot. symmetrize: average the clip with its own "
                          "mirror half a cycle later, removing the asymmetric component. "
                          "Neither adds feedback; both stay open loop.")
+    ap.add_argument("--video", default=None,
+                    help="record a side view to this .mp4 (needs --enable_cameras and a GPU). "
+                         "Physics and control rates are unchanged; the recorded run's "
+                         "termination time must match the un-recorded one.")
+    ap.add_argument("--video-width", type=int, default=960)
+    ap.add_argument("--video-height", type=int, default=540)
+    ap.add_argument("--video-stride", type=int, default=1,
+                    help="capture every Nth control step (1 = every step, real time)")
+    ap.add_argument("--video-fps", type=float, default=None,
+                    help="force a frame rate; default is real time for the stride")
+    ap.add_argument("--video-side-m", type=float, default=2.4,
+                    help="camera distance abeam the robot, metres (+y side)")
     ap.add_argument("--trace-npz", default=None,
                     help="dump the per-step record (base pose, per-foot force, foot "
                          "positions) so a collapse can be read back without a rerun")
