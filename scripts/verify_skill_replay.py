@@ -396,6 +396,9 @@ def expected_from_meta(meta: dict, clip: str) -> dict:
 # The app is held here and closed once, in main(), after the results are written.
 _SIM_APP = None
 
+#: One timestamp per process, so every row of a run carries the same one.
+_RUN_UTC = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
 
 def run_isaac(args, clip: dict, meta: dict) -> dict:
     """Play ``clip`` on a flat floor and return measured gait numbers.
@@ -576,7 +579,43 @@ def run_isaac(args, clip: dict, meta: dict) -> dict:
     n = clip["q_des"].shape[0]
     reps = args.cycles if clip["kind"] == "cyclic" else 1
     total = n * reps
-    q_cmd = torch.as_tensor(np.tile(clip["q_des"] * sign, (reps, 1)), device=sim.device, dtype=torch.float32)
+
+    # ------------------------------------------------------- plant compensation
+    # NOT a balance controller and not a clip edit: the archive on disk is never
+    # touched, and this adds no feedback -- it is a constant, precomputed offset,
+    # so the run stays an open-loop joint trajectory.
+    #
+    # What it corrects.  The sport controller's standing stance is about 0.17 rad
+    # narrower at the hip than this fork's init_state.joint_pos, so replayed as
+    # recorded the robot walks with its feet 25-30 mm closer to the midline than
+    # the env's own default, and its geometric tipping angle drops from ~27 deg to
+    # ~23 deg. That is a posture mismatch between two nominal stances, of the same
+    # kind as the ground friction being left at Isaac's 0.5 instead of the env's
+    # 1.3 -- see outputs/... the hip-sign pairs. It is settled on FLAT GROUND from
+    # the two stances alone; no terrain, no depth, no benchmark score enters it.
+    #
+    # The offset moves only the hip DC level. The hip's motion within the cycle,
+    # and thigh and calf entirely, are the recording's.  alpha 0 is the null
+    # control and must reproduce --plant-comp off exactly.
+    q_des_signed = clip["q_des"] * sign
+    comp_offset = np.zeros(12, dtype=np.float64)
+    if args.plant_comp == "stance":
+        _, env_pose, _ = ucfg.ordered(clip["leg_order"], clip["joint_order"])
+        hip_default = np.asarray(env_pose, dtype=float)[0::3]
+        hip_mean = q_des_signed[:, 0::3].mean(axis=0)
+        comp_offset[0::3] = args.plant_comp_alpha * (hip_default - hip_mean)
+        q_des_signed = q_des_signed + comp_offset
+        print("[replay] *** PLANT COMPENSATION --plant-comp stance "
+              f"--plant-comp-alpha {args.plant_comp_alpha:g}: the hip DC level is shifted "
+              f"toward the env's default stance. This is NOT the recording as played "
+              f"elsewhere and every number below is stamped with it. The archive on disk "
+              f"is unchanged. ***")
+        for k, leg in enumerate(clip["leg_order"]):
+            print(f"[replay]   {leg}_hip: clip mean {hip_mean[k]:+.4f} -> "
+                  f"{hip_mean[k] + comp_offset[3*k]:+.4f} rad "
+                  f"(env default {hip_default[k]:+.4f}, offset {comp_offset[3*k]:+.4f})")
+
+    q_cmd = torch.as_tensor(np.tile(q_des_signed, (reps, 1)), device=sim.device, dtype=torch.float32)
     tau_ff = torch.as_tensor(np.tile(clip["tau_ff"] * sign, (reps, 1)), device=sim.device, dtype=torch.float32)
     kp_seq, kd_seq = np.tile(clip["kp"], (reps, 1)), np.tile(clip["kd"], (reps, 1))
 
@@ -771,6 +810,16 @@ def run_isaac(args, clip: dict, meta: dict) -> dict:
         "cap_runtime_gains": cap.runtime_gain_write,
         "cap_effort_target": cap.effort_target,
         "hip_sign": args.hip_sign,
+        # Every setting that decides the outcome, so a row can be reproduced from
+        # the file alone.  These were the ones missing.
+        "contact_threshold_n": args.contact_threshold_n,
+        "fall_height_m": args.fall_height_m,
+        "ground_friction_mu": mu,
+        "plant_comp": args.plant_comp,
+        "plant_comp_alpha": args.plant_comp_alpha if args.plant_comp != "off" else 0.0,
+        "hip_offset_rad_max": float(np.abs(comp_offset).max()),
+        "run_utc": _RUN_UTC,
+        "argv": " ".join(sys.argv[1:]),
         "settle_mode": args.settle_mode,
         "start_phase": args.start_phase,
         "ablation": args.ablate,
@@ -806,7 +855,7 @@ def run_isaac(args, clip: dict, meta: dict) -> dict:
                             **{k: v for k, v in a.items()})
         print(f"[replay] trace -> {args.trace_npz}  ({a['q'].shape[0]} control steps)")
     m["_q_measured"] = a["q"]
-    m["_q_commanded"] = np.tile(clip["q_des"] * sign, (reps, 1))[: a["q"].shape[0]]
+    m["_q_commanded"] = np.tile(q_des_signed, (reps, 1))[: a["q"].shape[0]]
     return m
 
 
@@ -907,16 +956,50 @@ def self_test() -> int:
 # --------------------------------------------------------------------------- #
 
 def report(rows: list, out=None) -> None:
+    """APPEND the rows, under an exclusive lock, merging the header if it grew.
+
+    This used to open the file in "w".  Two people replaying at once then deleted
+    each other's results, and a row could not be reproduced from the file anyway
+    because the settings that decide the outcome -- contact threshold, fall
+    height, ground friction -- were never columns.  Both are fixed here.
+
+    The lock matters as much as the append: without it two appends racing on the
+    same file interleave inside a line.  flock is advisory, so it only works
+    because every writer goes through this function.
+    """
     import csv
+    import fcntl
     out = Path(out) if out else REPLAY_RESULTS_CSV
     out.parent.mkdir(parents=True, exist_ok=True)
-    keys = sorted({k for r in rows for k in r if not k.startswith("_")})
-    with open(out, "w", newline="") as fh:
-        w = csv.DictWriter(fh, fieldnames=keys)
-        w.writeheader()
-        for r in rows:
-            w.writerow({k: r.get(k) for k in keys})
-    print(f"[replay] wrote {out}")
+    new_keys = {k for r in rows for k in r if not k.startswith("_")}
+
+    with open(out, "a+", newline="") as fh:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        try:
+            fh.seek(0)
+            existing = list(csv.DictReader(fh))
+            old_keys = set(existing[0]) if existing else set()
+            keys = sorted(old_keys | new_keys)
+            if existing and old_keys != set(keys):
+                # The schema grew.  Rewrite in place so the old rows keep their
+                # values and gain empty cells, rather than being orphaned under a
+                # header that no longer describes them.
+                fh.seek(0)
+                fh.truncate()
+                w = csv.DictWriter(fh, fieldnames=keys)
+                w.writeheader()
+                for r in existing:
+                    w.writerow({k: r.get(k, "") for k in keys})
+            elif not existing:
+                w = csv.DictWriter(fh, fieldnames=keys)
+                w.writeheader()
+            w = csv.DictWriter(fh, fieldnames=keys)
+            for r in rows:
+                w.writerow({k: r.get(k, "") for k in keys})
+            fh.flush()
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    print(f"[replay] appended {len(rows)} row(s) to {out}")
 
 
 def main() -> int:
@@ -970,6 +1053,15 @@ def main() -> int:
                     help="force a frame rate; default is real time for the stride")
     ap.add_argument("--video-side-m", type=float, default=2.4,
                     help="camera distance abeam the robot, metres (+y side)")
+    ap.add_argument("--plant-comp", choices=("off", "stance"), default="off",
+                    help="off (default): play the recording as stored. stance: shift the hip "
+                         "DC level toward the env's init_state.joint_pos, correcting the "
+                         "~0.17 rad stance-width difference between the sport controller's "
+                         "stand and this fork's default. Constant offset, no feedback, archive "
+                         "untouched; banner printed and stamped into the results row.")
+    ap.add_argument("--plant-comp-alpha", type=float, default=1.0,
+                    help="how much of the stance difference to take out: 0 = none (the null "
+                         "control, must equal --plant-comp off), 0.5 = half, 1 = all of it")
     ap.add_argument("--hold-s", type=float, default=0.0,
                     help="render the scene, without advancing physics, for this many "
                          "seconds before playback starts and again after it ends. For "

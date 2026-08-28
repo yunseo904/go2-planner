@@ -170,7 +170,9 @@ def diagnose(measured: dict, expected: dict, mapping: Optional[List[MappingResul
     """
     t = {"stride_rel": 0.15, "duty_abs": 0.10, "speed_rel": 0.40, "roll_deg": 15.0,
          "pitch_deg": 20.0, "height_frac": 0.6, "lateral_m_per_s": 0.10,
-         "yaw_deg_per_s": 15.0, "mapping_margin": 0.05, "offset_rad": 0.15}
+         "yaw_deg_per_s": 15.0, "mapping_margin": 0.05, "offset_rad": 0.15,
+         # the gait-reproduction gate (see the finding below)
+         "repro_stride_rel": 0.10, "repro_speed_ratio": 3.0, "inplace_speed_mps": 0.05}
     t.update(tol or {})
     F: List[Finding] = []
 
@@ -305,6 +307,54 @@ def diagnose(measured: dict, expected: dict, mapping: Optional[List[MappingResul
             "front/rear legs swapped, or the whole trajectory time-reversed",
             "front_rear_swapped in the ranking distinguishes the two",
         ))
+    # -- did it reproduce the GAIT, or merely stay upright? ----------------
+    # A replay that fails to produce the gait cannot fall over from the gait, so
+    # "terminated_s is empty" scores it as a success.  That is how --hip-sign flip
+    # came to look like the answer for TROT: it survived 60 cycles at 2.62 Hz
+    # against the clip's 1.56 and 0.059 m/s against the log's 0.444 -- standing,
+    # not trotting.  Staying up is necessary and is not sufficient, so it is
+    # asserted here as its own finding rather than left implied by the absence of
+    # others.
+    ms, es = measured.get("stride_hz", np.nan), expected.get("stride_hz", np.nan)
+    mv, ev = measured.get("vx_mean", np.nan), expected.get("vx_mean", np.nan)
+    if not (np.isfinite(es) and es > 0) or not np.isfinite(ev):
+        F.append(Finding(
+            "warn",
+            "cannot check whether the gait was reproduced: the clip carries no expected "
+            f"stride ({es}) or speed ({ev})",
+            "a one-shot or whole-session clip has no cycle_hz, so the gait gate has nothing "
+            "to compare against",
+            "judge it on the trace, not on this verdict; a PASS here would mean 'not checked', "
+            "which is exactly the reading that has to be impossible",
+        ))
+    else:
+        s_ok = np.isfinite(ms) and abs(ms - es) / es <= t["repro_stride_rel"]
+        if abs(ev) >= t["inplace_speed_mps"]:
+            r = abs(mv) / abs(ev) if np.isfinite(mv) and abs(mv) > 0 else 0.0
+            v_ok = bool(np.isfinite(mv) and np.sign(mv) == np.sign(ev)
+                        and 1.0 / t["repro_speed_ratio"] <= r <= t["repro_speed_ratio"])
+            vtxt = f"speed {mv:.3f} vs {ev:.3f} m/s"
+        else:
+            # An in-place clip (a turn) has no forward speed to match; requiring one
+            # would pass a robot that walked away from the spot it should have
+            # turned on.  The test becomes "it also did not travel".
+            v_ok = bool(np.isfinite(mv) and abs(mv) <= t["inplace_speed_mps"])
+            vtxt = f"speed {mv:.3f} m/s, in-place clip (expected |v| < {t['inplace_speed_mps']})"
+        stxt = f"stride {ms:.2f} vs {es:.2f} Hz ({abs(ms-es)/es:+.0%})"
+        if s_ok and v_ok:
+            F.append(Finding("ok", f"gait reproduced: {stxt}, {vtxt}", "-", "-"))
+        else:
+            bad = " and ".join(x for x, ok in ((stxt, s_ok), (vtxt, v_ok)) if not ok)
+            F.append(Finding(
+                "fail",
+                f"gait NOT reproduced: {bad}",
+                "the robot is doing something other than the recorded gait -- staying upright "
+                "while doing it is not evidence for the replay",
+                f"stride must be within {t['repro_stride_rel']:.0%} and the speed within a "
+                f"factor of {t['repro_speed_ratio']:.0f} of the log, both, before any survival "
+                "time means anything",
+            ))
+
     return F
 
 
