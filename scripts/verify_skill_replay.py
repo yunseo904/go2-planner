@@ -46,7 +46,8 @@ from sim import diagnose as D
 from sim import isaac_cfg as IC
 from sim.replay import (Capabilities, ReplayMode, apply_gains, assert_not_aliased,
                         default_mode_for, foot_body_ids, ground_material_cfg,
-                        probe_capabilities, set_robot_friction, snap, torque_headroom)
+                        probe_capabilities, quat_to_rpy_deg, set_robot_friction, snap,
+                        torque_headroom)
 from terrain_toolkit.paths import (
     REPLAY_REPORT_MD,
     REPLAY_RESULTS_CSV,
@@ -774,7 +775,38 @@ def run_isaac(args, clip: dict, meta: dict, then_clip: dict | None = None,
     rec = {k: [] for k in ("q", "tau", "root_lin_vel_b", "root_ang_vel_b", "root_pos_w", "contact",
                            "root_quat_w", "contact_f", "foot_pos_w")}
     foot_ids, foot_names = foot_body_ids(robot)   # articulation indices, not sensor indices
-    terminated_s, gain_writes, clipped = None, 0, 0
+    terminated_s, term_reason, gain_writes, clipped = None, "", 0, 0
+    # ------------------------------------------------------- balance compensation
+    # This one DOES close a loop.  Everything else in this file is an open-loop
+    # replay; --balance-comp reads the base attitude the clip never carried and
+    # feeds it back, so a run made with it is not "the recording played back" and
+    # cannot be compared with one that is except as a pair.
+    #
+    # Stage 1, deliberately the cheap version: a PD on base roll added to the hip
+    # (abduction) targets, and on base pitch added to the thigh targets -- the two
+    # axes that actually have authority over those rotations.  Roll goes to ALL
+    # FOUR hips with the same sign, which slides the whole stance laterally: the
+    # zero-action pose is +0.1/-0.1/+0.1/-0.1, so outboard is +hip on the left legs
+    # and -hip on the right, and a uniform offset therefore moves both sides the
+    # same way in y rather than widening the stance. Widening is what --plant-comp
+    # does and it kills forward speed; this has to be the other thing.
+    #
+    # No terrain, no depth, no benchmark score: the only inputs are the base's own
+    # roll and pitch and their rates.
+    bc_kp_roll, bc_kd_roll = args.balance_kp_roll, args.balance_kd_roll
+    bc_kp_pitch, bc_kd_pitch = args.balance_kp_pitch, args.balance_kd_pitch
+    if args.balance_comp != "off":
+        print(f"[replay] *** BALANCE COMPENSATION --balance-comp {args.balance_comp}: "
+              f"roll PD ({bc_kp_roll:g}, {bc_kd_roll:g}) -> hip, "
+              f"pitch PD ({bc_kp_pitch:g}, {bc_kd_pitch:g}) -> thigh. THIS CLOSES A LOOP "
+              f"on base attitude. The run below is NOT an open-loop replay and no result "
+              f"from it may be reported as one. The archive on disk is unchanged. ***")
+    bc_hip = np.zeros(12, dtype=bool); bc_hip[0::3] = True
+    bc_thigh = np.zeros(12, dtype=bool); bc_thigh[1::3] = True
+    bc_hip_t = torch.as_tensor(bc_hip.astype(np.float32), device=sim.device)
+    bc_thigh_t = torch.as_tensor(bc_thigh.astype(np.float32), device=sim.device)
+    bc_max = 0.0
+
     wall_per_step = dt * args.slowdown if args.slowdown > 1.0 else 0.0
     if wall_per_step:
         print(f"[replay] pacing playback at 1/{args.slowdown:g} real time "
@@ -789,7 +821,25 @@ def run_isaac(args, clip: dict, meta: dict, then_clip: dict | None = None,
         if mode is ReplayMode.TORQUE:
             gain_writes += int(apply_gains(robot, idx_t, kp_seq[i], kd_seq[i], cap))
         tgt = robot.data.default_joint_pos.clone()
-        tgt[:, idx_t] = q_cmd[i]
+        cmd_i = q_cmd[i]
+        if args.balance_comp != "off":
+            r_now, p_now, _ = quat_to_rpy_deg(snap(robot.data.root_quat_w[0])[None, :])
+            w_b = robot.data.root_ang_vel_b[0]
+            roll_e = float(np.radians(r_now[0]))
+            pitch_e = float(np.radians(p_now[0]))
+            droll = float(w_b[0].item())
+            dpitch = float(w_b[1].item())
+            # Sign settled by measurement, not by reasoning about the joint frame:
+            # on TROT at |kp| 0.5 the two directions gave 5.52 s and 14.04 s against
+            # 1.95 s uncompensated, so the stabilising direction is the one written
+            # here and positive gains are the useful ones.
+            u_hip = bc_kp_roll * roll_e + bc_kd_roll * droll
+            u_thigh = bc_kp_pitch * pitch_e + bc_kd_pitch * dpitch
+            u_hip = float(np.clip(u_hip, -args.balance_clip_rad, args.balance_clip_rad))
+            u_thigh = float(np.clip(u_thigh, -args.balance_clip_rad, args.balance_clip_rad))
+            bc_max = max(bc_max, abs(u_hip), abs(u_thigh))
+            cmd_i = cmd_i + bc_hip_t * u_hip + bc_thigh_t * u_thigh
+        tgt[:, idx_t] = cmd_i
         robot.set_joint_position_target(tgt)
         if mode.needs_effort:
             eff = torch.zeros_like(tgt)
@@ -818,8 +868,26 @@ def run_isaac(args, clip: dict, meta: dict, then_clip: dict | None = None,
         rec["foot_pos_w"].append(snap(robot.data.body_pos_w[0, foot_ids]))
         if video is not None and i % args.video_stride == 0:
             grab_frame()
-        if robot.data.root_pos_w[0, 2].item() < args.fall_height_m and terminated_s is None:
-            terminated_s = i * dt
+        # Height alone does not detect a fall.  A Go2 lying on its side keeps its
+        # base above 0.15 m, so TROT handed over after two cycles ended at +90 deg
+        # of roll and was recorded as "no fall".  Attitude is checked too.
+        #
+        # 60 deg is a stated bound, not a fitted one: it is roughly twice the
+        # largest geometric tipping angle any of these runs has (26.9-30.9 deg,
+        # atan(half stance width / base height)), so it cannot fire on a robot that
+        # is merely leaning, and a base past it is not coming back.
+        _r, _p, _ = quat_to_rpy_deg(snap(robot.data.root_quat_w[0])[None, :])
+        if terminated_s is None:
+            why = ("height" if robot.data.root_pos_w[0, 2].item() < args.fall_height_m
+                   else "roll" if abs(float(_r[0])) > args.fall_attitude_deg
+                   else "pitch" if abs(float(_p[0])) > args.fall_attitude_deg else None)
+        else:
+            why = None
+        if why is not None:
+            terminated_s, term_reason = i * dt, why
+            print(f"[replay] terminated at {terminated_s:.2f} s on {why}: "
+                  f"base {robot.data.root_pos_w[0, 2].item():.3f} m, "
+                  f"roll {float(_r[0]):+.1f} deg, pitch {float(_p[0]):+.1f} deg")
             if video is not None:
                 # a beat of the collapse, so the last frame is not the trigger frame
                 for _ in range(int(round(0.4 / dt / args.video_stride))):
@@ -858,6 +926,7 @@ def run_isaac(args, clip: dict, meta: dict, then_clip: dict | None = None,
         "yaw_rate_deg_s": float(np.degrees(a["root_ang_vel_b"][:, 2].mean())),
         "base_height_mean_m": float(a["root_pos_w"][:, 2].mean()),
         "terminated_s": terminated_s,
+        "term_reason": term_reason,
         "n_steps": int(a["q"].shape[0]),
         "dt": dt,
         "phys_dt": phys_dt,
@@ -881,6 +950,12 @@ def run_isaac(args, clip: dict, meta: dict, then_clip: dict | None = None,
         "fall_height_m": args.fall_height_m,
         "ground_friction_mu": mu,
         "plant_comp": args.plant_comp,
+        "balance_comp": args.balance_comp,
+        "balance_kp_roll": bc_kp_roll if args.balance_comp != "off" else 0.0,
+        "balance_kd_roll": bc_kd_roll if args.balance_comp != "off" else 0.0,
+        "balance_kp_pitch": bc_kp_pitch if args.balance_comp != "off" else 0.0,
+        "balance_kd_pitch": bc_kd_pitch if args.balance_comp != "off" else 0.0,
+        "balance_max_rad": bc_max,
         "plant_comp_alpha": args.plant_comp_alpha if args.plant_comp != "off" else 0.0,
         "hip_offset_rad_max": float(np.abs(comp_offset).max()),
         "run_utc": _RUN_UTC,
@@ -921,6 +996,22 @@ def run_isaac(args, clip: dict, meta: dict, then_clip: dict | None = None,
                             q_cmd=q_cmd.detach().cpu().numpy()[: a["q"].shape[0]].copy(),
                             **{k: v for k, v in a.items()})
         print(f"[replay] trace -> {args.trace_npz}  ({a['q'].shape[0]} control steps)")
+    # Per-segment gait numbers, so a sequence is judged against the clip that was
+    # actually playing rather than against whichever one started the run.
+    segs, off = [], 0
+    for role, nm, qs, *_rest in seq:
+        lo, hi_ = off, min(off + len(qs), a["q"].shape[0])
+        off += len(qs)
+        if hi_ - lo < 4:
+            continue
+        g = D.gait_from_force(a["contact_f"][lo:hi_], dt)
+        segs.append({"role": role, "clip": nm, "t0_s": lo * dt, "t1_s": hi_ * dt,
+                     "stride_hz": g.get("stride_hz", np.nan), "duty": g.get("duty", np.nan),
+                     "vx_mean": float(a["root_lin_vel_b"][lo:hi_, 0].mean()),
+                     "vy_mean": float(a["root_lin_vel_b"][lo:hi_, 1].mean()),
+                     "yaw_rate_deg_s": float(np.degrees(a["root_ang_vel_b"][lo:hi_, 2].mean()))})
+    m["_segments"] = segs
+
     m["_q_measured"] = a["q"]
     m["_q_commanded"] = np.tile(q_des_signed, (reps, 1))[: a["q"].shape[0]]
     return m
@@ -1094,6 +1185,10 @@ def main() -> int:
                          "then drive to the clip pose with the PD.")
     ap.add_argument("--contact-threshold-n", type=float, default=1.0)
     ap.add_argument("--fall-height-m", type=float, default=0.15)
+    ap.add_argument("--fall-attitude-deg", type=float, default=60.0,
+                    help="also terminate when |roll| or |pitch| exceeds this. Height alone "
+                         "misses a robot lying on its side. 60 deg is about twice the largest "
+                         "geometric tipping angle in these runs, so it cannot fire on a lean.")
     ap.add_argument("--clip-archive", default=None,
                     help="play clips from another archive built the same way, e.g. the "
                          "per-cycle one from scripts/extract_raw_cycles.py. Its "
@@ -1133,6 +1228,18 @@ def main() -> int:
     ap.add_argument("--via-s", type=float, default=0.21,
                     help="how long to hold --via-clip; default is the measured median settle "
                          "time after a skill change (CLAUDE.md 3)")
+    ap.add_argument("--balance-comp", choices=("off", "pd"), default="off",
+                    help="off (default): open-loop replay. pd: close a loop on base attitude "
+                         "-- a PD on roll added to the hip targets and on pitch added to the "
+                         "thigh targets. A run with this on is NOT an open-loop replay; it is "
+                         "banner-printed and stamped, and must be reported paired with off.")
+    ap.add_argument("--balance-kp-roll", type=float, default=0.0)
+    ap.add_argument("--balance-kd-roll", type=float, default=0.0)
+    ap.add_argument("--balance-kp-pitch", type=float, default=0.0)
+    ap.add_argument("--balance-kd-pitch", type=float, default=0.0)
+    ap.add_argument("--balance-clip-rad", type=float, default=0.30,
+                    help="hard limit on the correction, so a diverging loop cannot be reported "
+                         "as a gait; the hip range is +-1.047 rad")
     ap.add_argument("--plant-comp", choices=("off", "stance"), default="off",
                     help="off (default): play the recording as stored. stance: shift the hip "
                          "DC level toward the env's init_state.joint_pos, correcting the "
@@ -1232,6 +1339,15 @@ def main() -> int:
             ranked = D.best_mapping(m.pop("_q_measured"), m.pop("_q_commanded"))
             offs = None
             F = D.diagnose(m, exp, mapping=ranked, offsets=offs)
+            segs = m.pop("_segments", [])
+            if len(segs) > 1:
+                print(f"-- {name} sequence, per segment --")
+                for sg in segs:
+                    e = expected_from_meta(meta, sg["clip"]) if sg["clip"] in meta["clips"] else {}
+                    for f in D.gait_reproduced(sg, e):
+                        print(f"  [{sg['role']}] {sg['clip']:8s} "
+                              f"{sg['t0_s']:6.2f}-{sg['t1_s']:6.2f}s  "
+                              f"{f.severity.upper():4s} {f.symptom}")
             print(f"-- {name} [{args.rate}, mode={m['mode_used']}, hip={args.hip_sign}] --")
             print(D.format_findings(F))
             print(f"verdict: {D.verdict(F)}")

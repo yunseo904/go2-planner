@@ -199,7 +199,6 @@ def diagnose(measured: dict, expected: dict, mapping: Optional[List[MappingResul
     t = {"stride_rel": 0.15, "duty_abs": 0.10, "speed_rel": 0.40, "roll_deg": 15.0,
          "pitch_deg": 20.0, "height_frac": 0.6, "lateral_m_per_s": 0.10,
          "yaw_deg_per_s": 15.0, "mapping_margin": 0.05, "offset_rad": 0.15,
-         # the gait-reproduction gate (see the finding below)
          "repro_stride_rel": 0.10, "repro_speed_ratio": 3.0, "inplace_speed_mps": 0.05}
     t.update(tol or {})
     F: List[Finding] = []
@@ -335,6 +334,21 @@ def diagnose(measured: dict, expected: dict, mapping: Optional[List[MappingResul
             "front/rear legs swapped, or the whole trajectory time-reversed",
             "front_rear_swapped in the ranking distinguishes the two",
         ))
+    F.extend(gait_reproduced(measured, expected, t))
+    return F
+
+
+def gait_reproduced(measured: dict, expected: dict, tol: dict = None) -> List[Finding]:
+    """Did this stretch of the run produce the gait it was commanded?
+
+    Separated from :func:`diagnose` so that a run which plays more than one clip
+    can be judged SEGMENT BY SEGMENT.  Scoring a whole sequence against the first
+    clip's expected stride is how every TROT->WALK handover came out FAIL while the
+    robot was walking correctly for 39 of its 40 cycles.
+    """
+    t = {"repro_stride_rel": 0.10, "repro_speed_ratio": 3.0, "inplace_speed_mps": 0.05}
+    t.update(tol or {})
+    F: List[Finding] = []
     # -- did it reproduce the GAIT, or merely stay upright? ----------------
     # A replay that fails to produce the gait cannot fall over from the gait, so
     # "terminated_s is empty" scores it as a success.  That is how --hip-sign flip
@@ -382,7 +396,6 @@ def diagnose(measured: dict, expected: dict, mapping: Optional[List[MappingResul
                 f"factor of {t['repro_speed_ratio']:.0f} of the log, both, before any survival "
                 "time means anything",
             ))
-
     return F
 
 
