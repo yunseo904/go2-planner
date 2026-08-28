@@ -150,6 +150,53 @@ python scripts/analyze_drift.py --trace outputs/traces/WALK_long.npz
 
 ---
 
+## 라이브로 보기 (Isaac Sim WebRTC)
+
+SSH 너머에서 재생을 눈으로 보는 방법입니다. **X11 forwarding은 안 됩니다** — Kit은 Vulkan을
+요구하는데 X11 forwarding이 주는 것은 indirect GLX입니다. z4의 `:0`은 gdm 로그인 화면 소유이고,
+`x11vnc` / `vncserver` / `turbovnc`는 설치되어 있지 않습니다 (`Xvfb`만 있음). 남는 것은 WebRTC이고,
+컨테이너 이미지에 `omni.kit.livestream.webrtc`가 들어 있습니다.
+
+**GPU가 필요합니다.** 물리는 `--device cpu`라 0이지만, 보는 방법은 전부 — 영상 녹화 포함 —
+RTX 렌더러를 올려야 하고 그건 GPU의 VRAM과 SM을 씁니다. 두 장 다 학습에 쓰이고 있으면
+먼저 조율하세요 (`nvidia-smi --query-compute-apps=pid,used_memory --format=csv`).
+
+```bash
+LIVE=1 GPU=0 scripts/isaac_docker_run.sh scripts/verify_skill_replay.py \
+    --clip-archive data/full_sessions.npz --clip TROT_FULL --rate lo \
+    --livestream 2 --device cpu \
+    --hip-sign keep --contact-threshold-n 30 --start-phase first --settle-mode stand \
+    --hold-s 60 --slowdown 4 \
+    --results-csv outputs/full_session_replay_TROT_live.csv \
+    --trace-npz outputs/traces/TROT_FULL_live.npz
+```
+
+- **`--headless`를 주지 마세요.** Isaac Lab 3.0에서 이 플래그는 deprecated이고, 주면
+  "takes precedence and disables all visualizers"라며 스트리밍 화면까지 꺼 버립니다.
+- `--hold-s 60`: 정착(settle) 직후 60초간 화면만 렌더합니다. 클라이언트 접속에 걸리는 시간이
+  런 길이보다 길기 때문에 필요합니다. 이 동안 **물리는 전진하지 않습니다** (`sim.render()`만 호출).
+- `--slowdown 4`: 1/4 배속. TROT 전복은 1.01초라 등속으로는 놓칩니다.
+- `LIVE=1`: 컨테이너를 host 네트워크에 올립니다. 포트 공개만으로는 안 됩니다 — WebRTC는 자신이
+  닿을 수 있는 주소를 ICE 후보로 광고하는데, 브리지 네트워크에서 아는 주소는 `172.17.x.x`뿐이고
+  박스 밖에서는 라우팅되지 않습니다.
+- **끝나면 전복 시각이 6.50 s인지 확인하세요.** `--hold-s`/`--slowdown`/스트리밍이 런을 교란하지
+  않았다는 검증이고, `--video`에 적용하는 기준과 같습니다.
+
+### 클라이언트 접속
+
+1. NVIDIA에서 **Isaac Sim WebRTC Streaming Client**를 받습니다 (별도 데스크톱 앱, Windows/Linux.
+   이 이미지에는 브라우저용 클라이언트가 들어 있지 않습니다 — Kit 110에서 빠졌습니다).
+2. 서버 주소 `10.206.178.94`, 포트 `49100`으로 접속합니다.
+3. 노트북에서 **TCP 49100**(시그널링)과 **UDP 47998**(미디어)이 z4까지 닿아야 합니다.
+
+`ssh -L`로는 UDP를 못 넘깁니다. UDP가 막혀 있으면 두 가지 대안이 있습니다:
+
+- **`--video`로 mp4를 녹화해 받기.** 새 패키지가 필요 없고, 렌더링 GPU 요구량은 스트리밍과 같습니다.
+- **VNC.** 순수 TCP라 `ssh -L` 터널로 확실히 뚫리지만 `sudo apt install x11vnc`가 필요합니다
+  (z4의 sudo는 비밀번호를 요구합니다).
+
+---
+
 ## GitHub에 없는 것
 
 리포를 클론해도 아래는 따라오지 않습니다. 필요하면 별도로 전달받으세요.
