@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -630,6 +631,29 @@ def run_isaac(args, clip: dict, meta: dict) -> dict:
           f"|v| {hand_v:.3f} m/s, |w| {hand_w:.1f} deg/s, {hand_loaded}/4 feet loaded, "
           f"base {robot.data.root_pos_w[0, 2].item():.3f} m")
 
+    # ------------------------------------------------------- watching it live
+    # A run is 6-20 s long and a livestream client needs longer than that just to
+    # connect, so there has to be a way to stop the interesting second happening
+    # before anyone is looking at it.
+    #
+    # Neither of these may perturb the run.  `_hold_open` calls sim.render() and
+    # nothing else: no write_data_to_sim, no sim.step, no robot.update, so the
+    # physics clock does not advance while it holds.  `--slowdown` sleeps between
+    # control steps; sleeping changes when a step is integrated, never how.  The
+    # check that this held is the same one --video is held to: the run's own
+    # termination time against the un-watched run.
+    def _hold_open(seconds: float, why: str) -> None:
+        if seconds <= 0:
+            return
+        print(f"[replay] holding {seconds:.0f} s -- {why}. Physics is NOT advancing; "
+              f"the scene is frozen at this frame.", flush=True)
+        t_end = time.time() + seconds
+        while time.time() < t_end:
+            sim.render()
+        print("[replay] hold over", flush=True)
+
+    _hold_open(args.hold_s, "connect the viewer now; playback starts when this ends")
+
     if video is not None:
         import imageio.v2 as imageio
         fps = args.video_fps if args.video_fps else max(1.0, (1.0 / dt) / args.video_stride)
@@ -659,7 +683,17 @@ def run_isaac(args, clip: dict, meta: dict) -> dict:
                            "root_quat_w", "contact_f", "foot_pos_w")}
     foot_ids, foot_names = foot_body_ids(robot)   # articulation indices, not sensor indices
     terminated_s, gain_writes, clipped = None, 0, 0
+    wall_per_step = dt * args.slowdown if args.slowdown > 1.0 else 0.0
+    if wall_per_step:
+        print(f"[replay] pacing playback at 1/{args.slowdown:g} real time "
+              f"({wall_per_step*1000:.0f} ms of wall clock per control step). This "
+              f"sleeps between steps; it does not change the integration.")
+    t_wall = time.time()
     for i in range(total):
+        if wall_per_step:
+            lag = t_wall + i * wall_per_step - time.time()
+            if lag > 0:
+                time.sleep(lag)
         if mode is ReplayMode.TORQUE:
             gain_writes += int(apply_gains(robot, idx_t, kp_seq[i], kd_seq[i], cap))
         tgt = robot.data.default_joint_pos.clone()
@@ -707,6 +741,8 @@ def run_isaac(args, clip: dict, meta: dict) -> dict:
         video["writer"].close()
         print(f"[replay] video: wrote {video['frames']} frames "
               f"({video['frames'] / video['fps']:.2f} s at {video['fps']:.1f} fps) -> {args.video}")
+
+    _hold_open(args.hold_s, "the run is over -- last frame held so it can be looked at")
 
     a = {k: np.asarray(v) for k, v in rec.items()}
     try:
@@ -934,6 +970,14 @@ def main() -> int:
                     help="force a frame rate; default is real time for the stride")
     ap.add_argument("--video-side-m", type=float, default=2.4,
                     help="camera distance abeam the robot, metres (+y side)")
+    ap.add_argument("--hold-s", type=float, default=0.0,
+                    help="render the scene, without advancing physics, for this many "
+                         "seconds before playback starts and again after it ends. For "
+                         "livestreaming: it takes longer to connect a client than the run "
+                         "lasts. Does not perturb the run -- verify by the termination time.")
+    ap.add_argument("--slowdown", type=float, default=1.0,
+                    help="play back at 1/N real time by sleeping between control steps "
+                         "(4 = quarter speed). Sleeping does not change the integration.")
     ap.add_argument("--trace-npz", default=None,
                     help="dump the per-step record (base pose, per-foot force, foot "
                          "positions) so a collapse can be read back without a rerun")
