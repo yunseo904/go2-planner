@@ -1,0 +1,432 @@
+{
+  "npz_sha256": "49e1c47ce436dd42b06c4548afdfbcea65d0ed143fcca5d225c05ea7ce8663ab",
+  "n_clips": 6,
+  "leg_order_native": [
+    "FR",
+    "FL",
+    "RR",
+    "RL"
+  ],
+  "leg_order_stored": [
+    "FL",
+    "FR",
+    "RL",
+    "RR"
+  ],
+  "joint_order": [
+    "hip",
+    "thigh",
+    "calf"
+  ],
+  "target_fs_hz": 50.0,
+  "lowpass_frac_of_target": 0.4,
+  "channels": [
+    "t",
+    "q_des",
+    "dq_des",
+    "tau_ff",
+    "q",
+    "dq",
+    "tau",
+    "kp",
+    "kd",
+    "contact",
+    "q_des_valid"
+  ],
+  "convention_verified": false,
+  "convention_note": "Same convention as data/skill_clips.npz; unverified in the same way.",
+  "gain_note": "Same per-sample kp/kd/tau_ff as the frozen archive.",
+  "purpose": "A/B on the EXTRACTION method only. '<CLIP>_med' is the median over every clean cycle (what the frozen archive stores); '<CLIP>_cNN' is cycle NN alone, unaveraged. Same session, same cycle detection, same phase grid, same low-pass.",
+  "built_from": {
+    "session": "run_06_20260824_225352",
+    "clip": "TROT",
+    "n_cycles_kept": 5,
+    "cycle_s_median": 0.6429062889999386,
+    "cycle_s_spread": 0.03694756630834709
+  },
+  "clips": {
+    "TROT_med": {
+      "kind": "cyclic",
+      "session": "run_06_20260824_225352",
+      "group": "03_slow_walk",
+      "fs_hi_hz": 416.85702035499236,
+      "fs_lo_hz": 49.773972579700576,
+      "n_hi": 268,
+      "n_lo": 32,
+      "cycle_s": 0.6429062889999386,
+      "cycle_hz": 1.555436643115643,
+      "cycle_s_spread": 0.03694756630834709,
+      "n_cycles_kept": 5,
+      "n_cycles_seen": 5,
+      "n_cycles_used": 5,
+      "cycle_indices": [
+        0,
+        1,
+        2,
+        3,
+        4
+      ],
+      "averaged": true,
+      "ref_leg": "FR",
+      "duty_clip": 0.5774253731343284,
+      "loop_seam_rad": 0.018727779388427734,
+      "loop_seam_over_max_step": 0.1503963429462067,
+      "loop_seam_over_p2p": 0.028389048874702196,
+      "q_des_update_hz": 42.740244876743745,
+      "alias_energy_frac_above_25hz": 0.004268638832488319,
+      "lowpass_cutoff_hz": 20.0,
+      "lowpass_method": "Fourier harmonic truncation (periodic, zero-phase)",
+      "q_des_spread_rad_max": 0.20300960439479737,
+      "q_des_invalid_frac": 0.0,
+      "note": "trot, duty ~0.52, no flight phase",
+      "gains": {
+        "kp": [
+          40.0,
+          40.0,
+          40.0
+        ],
+        "kd": [
+          1.0,
+          1.0,
+          1.0
+        ],
+        "tau_ff_rms": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "joint_order": [
+          "hip",
+          "thigh",
+          "calf"
+        ],
+        "position_controlled": true
+      },
+      "selection": {
+        "session": "run_06_20260824_225352",
+        "group": "03_slow_walk",
+        "why": "lowest stride_cv (steadiest cycle) among 4 candidates",
+        "duty_mean": 0.570404984423676,
+        "stride_hz": 1.5442217135226264,
+        "vx_steady_mean": 0.443721311481766,
+        "flight_frac": 0.0
+      }
+    },
+    "TROT_c00": {
+      "kind": "cyclic",
+      "session": "run_06_20260824_225352",
+      "group": "03_slow_walk",
+      "fs_hi_hz": 416.9927436454582,
+      "fs_lo_hz": 49.64199329112598,
+      "n_hi": 294,
+      "n_lo": 35,
+      "cycle_s": 0.7050482399999964,
+      "cycle_hz": 1.418342665460742,
+      "cycle_s_spread": 0.0,
+      "n_cycles_kept": 5,
+      "n_cycles_seen": 5,
+      "n_cycles_used": 1,
+      "cycle_indices": [
+        0
+      ],
+      "averaged": false,
+      "ref_leg": "FR",
+      "duty_clip": 0.5739795918367347,
+      "loop_seam_rad": 0.06201385706663132,
+      "loop_seam_over_max_step": 0.33724833275311134,
+      "loop_seam_over_p2p": 0.08827100811345577,
+      "q_des_update_hz": 42.740244876743745,
+      "alias_energy_frac_above_25hz": 0.006799697632896601,
+      "lowpass_cutoff_hz": 20.0,
+      "lowpass_method": "Fourier harmonic truncation (periodic, zero-phase)",
+      "q_des_spread_rad_max": 0.0,
+      "q_des_invalid_frac": 0.0,
+      "note": "trot, duty ~0.52, no flight phase",
+      "gains": {
+        "kp": [
+          40.0,
+          40.0,
+          40.0
+        ],
+        "kd": [
+          1.0,
+          1.0,
+          1.0
+        ],
+        "tau_ff_rms": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "joint_order": [
+          "hip",
+          "thigh",
+          "calf"
+        ],
+        "position_controlled": true
+      },
+      "selection": {
+        "session": "run_06_20260824_225352",
+        "group": "03_slow_walk",
+        "why": "lowest stride_cv (steadiest cycle) among 4 candidates",
+        "duty_mean": 0.570404984423676,
+        "stride_hz": 1.5442217135226264,
+        "vx_steady_mean": 0.443721311481766,
+        "flight_frac": 0.0
+      }
+    },
+    "TROT_c01": {
+      "kind": "cyclic",
+      "session": "run_06_20260824_225352",
+      "group": "03_slow_walk",
+      "fs_hi_hz": 416.85702035499236,
+      "fs_lo_hz": 49.773972579700576,
+      "n_hi": 268,
+      "n_lo": 32,
+      "cycle_s": 0.6429062889999386,
+      "cycle_hz": 1.555436643115643,
+      "cycle_s_spread": 0.0,
+      "n_cycles_kept": 5,
+      "n_cycles_seen": 5,
+      "n_cycles_used": 1,
+      "cycle_indices": [
+        1
+      ],
+      "averaged": false,
+      "ref_leg": "FR",
+      "duty_clip": 0.5597014925373134,
+      "loop_seam_rad": 0.1384669542312622,
+      "loop_seam_over_max_step": 0.7589742893354405,
+      "loop_seam_over_p2p": 0.2053640097382793,
+      "q_des_update_hz": 42.740244876743745,
+      "alias_energy_frac_above_25hz": 0.00713688909250128,
+      "lowpass_cutoff_hz": 20.0,
+      "lowpass_method": "Fourier harmonic truncation (periodic, zero-phase)",
+      "q_des_spread_rad_max": 0.0,
+      "q_des_invalid_frac": 0.0,
+      "note": "trot, duty ~0.52, no flight phase",
+      "gains": {
+        "kp": [
+          40.0,
+          40.0,
+          40.0
+        ],
+        "kd": [
+          1.0,
+          1.0,
+          1.0
+        ],
+        "tau_ff_rms": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "joint_order": [
+          "hip",
+          "thigh",
+          "calf"
+        ],
+        "position_controlled": true
+      },
+      "selection": {
+        "session": "run_06_20260824_225352",
+        "group": "03_slow_walk",
+        "why": "lowest stride_cv (steadiest cycle) among 4 candidates",
+        "duty_mean": 0.570404984423676,
+        "stride_hz": 1.5442217135226264,
+        "vx_steady_mean": 0.443721311481766,
+        "flight_frac": 0.0
+      }
+    },
+    "TROT_c02": {
+      "kind": "cyclic",
+      "session": "run_06_20260824_225352",
+      "group": "03_slow_walk",
+      "fs_hi_hz": 417.28398616369464,
+      "fs_lo_hz": 50.07407833964336,
+      "n_hi": 250,
+      "n_lo": 30,
+      "cycle_s": 0.5991123750000042,
+      "cycle_hz": 1.6691359446547784,
+      "cycle_s_spread": 0.0,
+      "n_cycles_kept": 5,
+      "n_cycles_seen": 5,
+      "n_cycles_used": 1,
+      "cycle_indices": [
+        2
+      ],
+      "averaged": false,
+      "ref_leg": "FR",
+      "duty_clip": 0.523,
+      "loop_seam_rad": 0.061944007873535156,
+      "loop_seam_over_max_step": 0.15869430730328776,
+      "loop_seam_over_p2p": 0.09292076938992178,
+      "q_des_update_hz": 42.740244876743745,
+      "alias_energy_frac_above_25hz": 0.010437613360239429,
+      "lowpass_cutoff_hz": 20.0,
+      "lowpass_method": "Fourier harmonic truncation (periodic, zero-phase)",
+      "q_des_spread_rad_max": 0.0,
+      "q_des_invalid_frac": 0.0,
+      "note": "trot, duty ~0.52, no flight phase",
+      "gains": {
+        "kp": [
+          40.0,
+          40.0,
+          40.0
+        ],
+        "kd": [
+          1.0,
+          1.0,
+          1.0
+        ],
+        "tau_ff_rms": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "joint_order": [
+          "hip",
+          "thigh",
+          "calf"
+        ],
+        "position_controlled": true
+      },
+      "selection": {
+        "session": "run_06_20260824_225352",
+        "group": "03_slow_walk",
+        "why": "lowest stride_cv (steadiest cycle) among 4 candidates",
+        "duty_mean": 0.570404984423676,
+        "stride_hz": 1.5442217135226264,
+        "vx_steady_mean": 0.443721311481766,
+        "flight_frac": 0.0
+      }
+    },
+    "TROT_c03": {
+      "kind": "cyclic",
+      "session": "run_06_20260824_225352",
+      "group": "03_slow_walk",
+      "fs_hi_hz": 416.5598552863972,
+      "fs_lo_hz": 49.80606965380836,
+      "n_hi": 276,
+      "n_lo": 33,
+      "cycle_s": 0.6625698479999755,
+      "cycle_hz": 1.5092748379941927,
+      "cycle_s_spread": 0.0,
+      "n_cycles_kept": 5,
+      "n_cycles_seen": 5,
+      "n_cycles_used": 1,
+      "cycle_indices": [
+        3
+      ],
+      "averaged": false,
+      "ref_leg": "FR",
+      "duty_clip": 0.5797101449275363,
+      "loop_seam_rad": 0.032933831214904785,
+      "loop_seam_over_max_step": 0.1314664715955255,
+      "loop_seam_over_p2p": 0.048725533527739985,
+      "q_des_update_hz": 42.740244876743745,
+      "alias_energy_frac_above_25hz": 0.007160820925953842,
+      "lowpass_cutoff_hz": 20.0,
+      "lowpass_method": "Fourier harmonic truncation (periodic, zero-phase)",
+      "q_des_spread_rad_max": 0.0,
+      "q_des_invalid_frac": 0.0,
+      "note": "trot, duty ~0.52, no flight phase",
+      "gains": {
+        "kp": [
+          40.0,
+          40.0,
+          40.0
+        ],
+        "kd": [
+          1.0,
+          1.0,
+          1.0
+        ],
+        "tau_ff_rms": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "joint_order": [
+          "hip",
+          "thigh",
+          "calf"
+        ],
+        "position_controlled": true
+      },
+      "selection": {
+        "session": "run_06_20260824_225352",
+        "group": "03_slow_walk",
+        "why": "lowest stride_cv (steadiest cycle) among 4 candidates",
+        "duty_mean": 0.570404984423676,
+        "stride_hz": 1.5442217135226264,
+        "vx_steady_mean": 0.443721311481766,
+        "flight_frac": 0.0
+      }
+    },
+    "TROT_c04": {
+      "kind": "cyclic",
+      "session": "run_06_20260824_225352",
+      "group": "03_slow_walk",
+      "fs_hi_hz": 416.7405246006345,
+      "fs_lo_hz": 50.26831230591311,
+      "n_hi": 257,
+      "n_lo": 31,
+      "cycle_s": 0.6166906860000836,
+      "cycle_hz": 1.621558461481068,
+      "cycle_s_spread": 0.0,
+      "n_cycles_kept": 5,
+      "n_cycles_seen": 5,
+      "n_cycles_used": 1,
+      "cycle_indices": [
+        4
+      ],
+      "averaged": false,
+      "ref_leg": "FR",
+      "duty_clip": 0.5826848249027238,
+      "loop_seam_rad": 0.24691295623779297,
+      "loop_seam_over_max_step": 1.0464199508002314,
+      "loop_seam_over_p2p": 0.37119915124003006,
+      "q_des_update_hz": 42.740244876743745,
+      "alias_energy_frac_above_25hz": 0.011638230010610975,
+      "lowpass_cutoff_hz": 20.0,
+      "lowpass_method": "Fourier harmonic truncation (periodic, zero-phase)",
+      "q_des_spread_rad_max": 0.0,
+      "q_des_invalid_frac": 0.0,
+      "note": "trot, duty ~0.52, no flight phase",
+      "gains": {
+        "kp": [
+          40.0,
+          40.0,
+          40.0
+        ],
+        "kd": [
+          1.0,
+          1.0,
+          1.0
+        ],
+        "tau_ff_rms": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "joint_order": [
+          "hip",
+          "thigh",
+          "calf"
+        ],
+        "position_controlled": true
+      },
+      "selection": {
+        "session": "run_06_20260824_225352",
+        "group": "03_slow_walk",
+        "why": "lowest stride_cv (steadiest cycle) among 4 candidates",
+        "duty_mean": 0.570404984423676,
+        "stride_hz": 1.5442217135226264,
+        "vx_steady_mean": 0.443721311481766,
+        "flight_frac": 0.0
+      }
+    }
+  },
+  "source": "motion_toolkit/clips.py build_cyclic_clip(cycle_subset=...)"
+}
