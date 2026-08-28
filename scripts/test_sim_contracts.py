@@ -23,7 +23,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from sim.replay import (assert_not_aliased, effective_friction, foot_body_ids,
-                        quat_to_rpy_deg, snap)
+                        quat_rotate_inv, quat_to_rpy_deg, snap)
 
 FAILURES: list[str] = []
 
@@ -227,6 +227,70 @@ def test_friction_combination() -> None:
           np.isclose(0.5 * (0.6 + 2.0), 1.3))
 
 
+def test_body_frame_rotation() -> None:
+    """World-frame foot positions answer a different question once the base yaws."""
+    print("\n== body frame: asking where a foot is, of the base and not of the world ==")
+    # base yawed 90 deg left; a foot one metre ahead of the base IN THE WORLD is
+    # one metre to the base's RIGHT.
+    q = np.array([0.0, 0.0, np.sin(np.pi / 4), np.cos(np.pi / 4)])     # scalar last
+    v = np.array([1.0, 0.0, 0.0])
+    b = quat_rotate_inv(q, v)
+    check("a world-forward offset under 90 deg yaw is body-right",
+          np.allclose(b, [0.0, -1.0, 0.0], atol=1e-9), f"got {b}")
+    check("the raw world vector would have called it body-FORWARD",
+          not np.allclose(v, [0.0, -1.0, 0.0]),
+          "this is the mistake the helper exists to prevent")
+    check("identity rotation is the identity",
+          np.allclose(quat_rotate_inv(np.array([0.0, 0, 0, 1.0]), v), v))
+    # reading the same quaternion scalar-first turns the 90 deg yaw into something else
+    check("scalar-first misreading of the same quaternion gives a different answer",
+          not np.allclose(quat_rotate_inv(q, v, order="wxyz"), b),
+          "quaternion order matters here exactly as it does in quat_to_rpy_deg")
+    # a lateral centre-of-pressure offset must not depend on where the robot is
+    for yaw in (0.0, 0.7, -2.1, 3.0):
+        qq = np.array([0.0, 0.0, np.sin(yaw / 2), np.cos(yaw / 2)])
+        world = np.array([np.cos(yaw), np.sin(yaw), 0.0]) * 0.2      # 0.2 m ahead of base
+        check(f"body-frame offset is yaw-invariant (yaw={yaw:+.1f} rad)",
+              np.allclose(quat_rotate_inv(qq, world), [0.2, 0.0, 0.0], atol=1e-9))
+    check("rotating by the inverse and back is a round trip",
+          np.allclose(quat_rotate_inv(np.array([0.0, 0, 0, 1.0]),
+                                      quat_rotate_inv(q, v)), quat_rotate_inv(q, v)))
+
+
+def test_mirror_ablation() -> None:
+    """The mirror probe must reverse abduction and must NOT reverse gains."""
+    print("\n== ablation: mirroring a gait is not negating every column ==")
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "_vsr", Path(__file__).resolve().parent / "verify_skill_replay.py")
+    V = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(V)                      # top level imports no Isaac Lab
+
+    legs, n = ["FL", "FR", "RL", "RR"], 8
+    clip = {"leg_order": legs, "kind": "cyclic", "fs": 50.0,
+            "t": np.arange(n) / 50.0,
+            "q_des": np.arange(n * 12, dtype=np.float32).reshape(n, 12),
+            "dq_des": np.zeros((n, 12), np.float32), "tau_ff": np.zeros((n, 12), np.float32),
+            "q": np.zeros((n, 12), np.float32), "dq": np.zeros((n, 12), np.float32),
+            "kp": np.full((n, 12), 40.0, np.float32), "kd": np.full((n, 12), 1.0, np.float32),
+            "contact": np.array([[1, 0, 0, 1]] * n, np.uint8),
+            "q_des_valid": np.ones((n, 12), np.uint8)}
+    m = V.mirror_clip(clip, "mirror")
+    check("the mirrored FL block is the original FR block with the hip negated",
+          np.allclose(m["q_des"][:, 3:6] * np.array([-1, 1, 1]), clip["q_des"][:, 0:3]))
+    check("contact labels swap sides too", list(m["contact"][0]) == [0, 1, 1, 0])
+    check("gains are NOT negated by the mirror", float(m["kp"].min()) == 40.0,
+          "a negated kp is not a mirrored robot, it is an unstable one")
+    check("validity flags are NOT negated by the mirror", float(m["q_des_valid"].min()) == 1.0)
+    sy = V.mirror_clip(clip, "symmetrize")
+    half = np.roll(V._mirror_rows(sy["q_des"].astype(float), legs, per_leg=False, signed=True),
+                   -(n // 2), axis=0)
+    check("the symmetrised clip really is its own mirror half a cycle later",
+          np.allclose(half, sy["q_des"], atol=1e-4),
+          "otherwise the ablation does not remove what it claims to remove")
+    check("--ablate none is the identity", V.mirror_clip(clip, "none") is clip)
+
+
 def main() -> int:
     print("sim contract tests -- synthetic data, no simulator")
     test_buffer_aliasing()
@@ -234,6 +298,8 @@ def main() -> int:
     test_quaternion_order()
     test_units()
     test_friction_combination()
+    test_body_frame_rotation()
+    test_mirror_ablation()
     print(f"\n{'FAILED: ' + ', '.join(FAILURES) if FAILURES else 'all contracts hold'}")
     return 1 if FAILURES else 0
 

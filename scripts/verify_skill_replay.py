@@ -303,6 +303,63 @@ def level_start(clip: dict, robot, sim, idx_t, phys_dt) -> tuple[int, dict]:
     }
 
 
+# --------------------------------------------------------------------------- #
+# Diagnostic ablations.  These CHANGE THE CLIP and are for attribution only --
+# never for a reported skill, and the frozen archive is never touched.  Their
+# purpose is to answer "is the drift caused by the recording's own left-right
+# asymmetry?", which cannot be answered by looking at the recording alone.
+#
+#   mirror     : play the gait mirrored about the sagittal plane.  If the robot
+#                then falls the other way, the bias lives in the clip; if it
+#                falls the same way, the bias lives in the robot or the sim.
+#   symmetrize : average the clip with its own mirror half a cycle later, which
+#                removes the asymmetric component and keeps the symmetric one.
+#                If the collapse survives that, asymmetry was not the cause.
+#
+# Neither is a stabiliser: both are open-loop joint trajectories with no feedback
+# on base state, exactly like the recording.
+# --------------------------------------------------------------------------- #
+
+_MIRROR_LEG = {"FL": "FR", "FR": "FL", "RL": "RR", "RR": "RL"}
+
+
+# Channels that carry a signed quantity about the abduction axis, and so change
+# sign under the mirror.  Gains, validity flags and contact booleans do not: a
+# negated kp is not a mirrored robot, it is an unstable one.
+_SIGNED = ("q_des", "dq_des", "tau_ff", "q", "dq")
+
+
+def _mirror_rows(a, leg_order, per_leg: bool, signed: bool):
+    """Swap left for right in a (n, 4) or (n, 12) per-leg array."""
+    out = np.empty_like(a)
+    w = 1 if per_leg else 3
+    for i, leg in enumerate(leg_order):
+        j = leg_order.index(_MIRROR_LEG[leg])
+        out[:, j * w:(j + 1) * w] = a[:, i * w:(i + 1) * w]
+    if not per_leg and signed:
+        out[:, 0::3] *= -1.0          # abduction axis reverses under the mirror
+    return out
+
+
+def mirror_clip(clip: dict, mode: str) -> dict:
+    """``mode`` in {none, mirror, symmetrize}.  Returns a new clip dict."""
+    if mode == "none":
+        return clip
+    legs = list(clip["leg_order"])
+    n = len(clip["q_des"])
+    out = dict(clip)
+    for ch in _PER_FRAME:
+        if ch == "t":
+            continue
+        a = np.asarray(clip[ch], dtype=np.float64)
+        m = _mirror_rows(a, legs, per_leg=(a.shape[1] == 4), signed=(ch in _SIGNED))
+        if mode == "mirror":
+            out[ch] = m.astype(clip[ch].dtype)
+        else:                          # symmetrize: mirror is half a cycle away
+            half = np.roll(m, -(n // 2), axis=0)
+            out[ch] = (0.5 * (a + half)).astype(clip[ch].dtype)
+    return out
+
 def rotate_clip(clip: dict, k: int) -> dict:
     """Start the loop at frame k. Same samples, same order, different entry point."""
     if k % len(clip["q_des"]) == 0:
@@ -551,7 +608,7 @@ def run_isaac(args, clip: dict, meta: dict) -> dict:
 
     rec = {k: [] for k in ("q", "tau", "root_lin_vel_b", "root_ang_vel_b", "root_pos_w", "contact",
                            "root_quat_w", "contact_f", "foot_pos_w")}
-    foot_ids, _ = foot_body_ids(robot)      # articulation indices, not sensor indices
+    foot_ids, foot_names = foot_body_ids(robot)   # articulation indices, not sensor indices
     terminated_s, gain_writes, clipped = None, 0, 0
     for i in range(total):
         if mode is ReplayMode.TORQUE:
@@ -617,6 +674,7 @@ def run_isaac(args, clip: dict, meta: dict) -> dict:
         "hip_sign": args.hip_sign,
         "settle_mode": args.settle_mode,
         "start_phase": args.start_phase,
+        "ablation": args.ablate,
         "start_frame": ph["start_frame"],
         "start_foot_spread_m": ph["spread_at_start"],
         "start_feet_down": ph["feet_down"],
@@ -632,8 +690,19 @@ def run_isaac(args, clip: dict, meta: dict) -> dict:
         print(f"[replay] WARNING {saturated:.1%} of joint-samples hit the effort clip; "
               f"the sim robot is torque-limited on this clip (see --headroom)")
     if args.trace_npz:
+        # The two foot orderings are NOT the same list and must travel with the
+        # trace: foot_pos_w is in the articulation's body order, contact/contact_f
+        # in the contact sensor's own.  Attributing a force to a leg by position
+        # is the same class of mistake as harness_findings.md 5.
         np.savez_compressed(args.trace_npz, dt=dt, phys_dt=phys_dt,
                             terminated_s=(np.nan if terminated_s is None else terminated_s),
+                            clip_name=clip["name"], start_frame=int(ph["start_frame"]),
+                            clip_n=int(n), cycles=int(reps),
+                            leg_order=np.array(clip["leg_order"]),
+                            joint_order=np.array(clip["joint_order"]),
+                            foot_names=np.array(foot_names),
+                            contact_names=np.array(getattr(contacts, "body_names", [""] * 4)),
+                            q_cmd=q_cmd.detach().cpu().numpy()[: a["q"].shape[0]].copy(),
                             **{k: v for k, v in a.items()})
         print(f"[replay] trace -> {args.trace_npz}  ({a['q'].shape[0]} control steps)")
     m["_q_measured"] = a["q"]
@@ -774,6 +843,12 @@ def main() -> int:
                          "then drive to the clip pose with the PD.")
     ap.add_argument("--contact-threshold-n", type=float, default=1.0)
     ap.add_argument("--fall-height-m", type=float, default=0.15)
+    ap.add_argument("--ablate", choices=("none", "mirror", "symmetrize"), default="none",
+                    help="DIAGNOSTIC ONLY, never a reported skill. mirror: play the gait "
+                         "left-right mirrored, to find out whether a lateral bias lives in "
+                         "the clip or in the robot. symmetrize: average the clip with its own "
+                         "mirror half a cycle later, removing the asymmetric component. "
+                         "Neither adds feedback; both stay open loop.")
     ap.add_argument("--trace-npz", default=None,
                     help="dump the per-step record (base pose, per-foot force, foot "
                          "positions) so a collapse can be read back without a rerun")
@@ -832,6 +907,13 @@ def main() -> int:
         # prescribes has been exercised on this machine.
         for name in names:
             clip = load_clip(name, args.rate)
+            if args.ablate != "none":
+                if clip["kind"] != "cyclic":
+                    raise SystemExit(f"--ablate {args.ablate} is defined for cyclic clips only")
+                clip = mirror_clip(clip, args.ablate)
+                print(f"[replay] *** DIAGNOSTIC ABLATION --ablate {args.ablate}: this run does "
+                      f"NOT play the recording. It is an attribution probe; the archive on "
+                      f"disk is untouched and no skill may be reported from it. ***")
             exp = expected_from_meta(meta, name)
             print("=" * 78)
             print(gain_comparison(meta, name))

@@ -350,6 +350,26 @@ def quat_to_rpy_deg(q, order: str = QUAT_ORDER):
     return np.degrees(roll), np.degrees(pitch), np.degrees(yaw)
 
 
+def quat_rotate_inv(q, v, order: str = QUAT_ORDER):
+    """Rotate world-frame vectors ``v`` into the body frame given body quat ``q``.
+
+    Foot positions come out of Isaac in WORLD coordinates.  Asking which foot is
+    forward or outboard of the base is a body-frame question, and once the base has
+    yawed, the world-frame answer is a different question with a plausible number.
+    """
+    q = np.asarray(q, dtype=float)
+    v = np.asarray(v, dtype=float)
+    if order == "xyzw":
+        u, w = q[..., :3], q[..., 3:4]
+    elif order == "wxyz":
+        u, w = q[..., 1:], q[..., :1]
+    else:
+        raise ValueError(f"unknown quaternion order {order!r}")
+    # inverse rotation: v' = v*(2w^2-1) - 2w*(u x v) + 2u*(u.v)
+    uv = np.cross(np.broadcast_to(u, v.shape), v)
+    ud = np.sum(np.broadcast_to(u, v.shape) * v, axis=-1, keepdims=True)
+    return v * (2.0 * w * w - 1.0) - 2.0 * w * uv + 2.0 * np.broadcast_to(u, v.shape) * ud
+
 def effective_friction(ground: float, robot: float, combine_mode: str) -> float:
     """What PhysX actually uses when two materials touch.
 

@@ -493,7 +493,7 @@ cycles (sideways 0.22 m/s, yaw). Hypothesis 1 does not close the gap on its own.
    than that; 36 teleop sessions should be far below it.)
 
 **Do this first, before changing anything:** re-run `extract_skill_clips.py` unchanged on z4
-and check the archive reproduces `content_sha256 = ae467d86…` bit for bit. If it does, the
+and check the archive reproduces `npz_sha256 = aab85a03…` bit for bit. If it does, the
 extraction is machine-independent and any re-cut clip is comparable to the current one. If it
 does not, we need to know that *before* changing clip definitions, not after — otherwise a
 new archive differs for two reasons at once and neither can be isolated.
@@ -515,3 +515,36 @@ defect §6 — `[i]` returns a view, `.cpu()` is a no-op — so the aliasing tes
 the old code rather than merely passing against the new. The contracts themselves now live in
 `sim/replay.py` (`snap`, `assert_not_aliased`, `foot_body_ids`, `quat_to_rpy_deg`,
 `effective_friction`) so they are stated once instead of re-derived per call site.
+
+
+---
+
+# Day 2c — the drift, attributed
+
+Correction to the recommendation above: the hash to check is the clips' own
+`npz_sha256 = aab85a03…` from `data/skill_clips.meta.json`. `ae467d86…` is the
+calibration probes' `content_sha256`, a different archive. The gate is sound —
+`np.savez_compressed` writes zeroed zip timestamps, so identical content gives an
+identical file hash (verified on this machine). CLAUDE.md §1 has been updated to put
+`curated/` on both machines and to record the re-extraction gate.
+
+**The full analysis is in [`open_loop_replay_limit.md`](open_loop_replay_limit.md).**
+In one line: the failure is a roll that grows ×3–5 per cycle, the open-loop limit cycle
+is attracting for WALK and repelling for TROT/RUN, and the clip's asymmetry causes WALK's
+curving but not TROT's collapse. WALK survived 60 cycles / 43.9 s / 10.7 m without falling,
+so "WALK just accumulates more slowly" is refuted — it does not accumulate.
+
+New in this round:
+
+- `scripts/analyze_drift.py` — clip symmetry offline (`--clips`), and per-cycle roll,
+  centre of pressure, per-leg stance/impulse and foot placement in the base frame from a
+  replay trace (`--trace`).
+- `verify_skill_replay.py --ablate {mirror,symmetrize}` — attribution probes. They change
+  the clip, print a banner saying so, stamp `ablation` into the result row, and may never
+  be reported as a skill. The frozen archive is untouched and neither adds feedback.
+- The trace now carries both body-name orderings (`foot_names` from the articulation,
+  `contact_names` from the sensor — they are different lists), the commanded joints, and
+  the start frame, so leg attribution in analysis is by name and never by position.
+- `sim/replay.py` gained `quat_rotate_inv`, because "which foot is outboard of the base"
+  is a body-frame question and the world-frame answer is a different question with a
+  plausible number.
