@@ -178,6 +178,15 @@ CLIP_SPECS: List[ClipSpec] = [
              note="trot, duty ~0.52, no flight phase"),
     ClipSpec("RUN", "cyclic", duty_lo=0.00, duty_hi=0.40, require_flight=True,
              note="running trot, duty ~0.31, flight phase present"),
+    # 제자리 선회. 개루프 WALK 는 11.8 도/m 로 휘어 보정 없이는 8 goal 중 0 개이고
+    # (outputs/open_loop_replay_limit.md 5절), 헤딩을 고칠 유일한 수단이 이것입니다.
+    # 이름이 아니라 측정으로 고릅니다: motion_type=yaw 인 네 세션 중 듀티 0.60 이상이고
+    # 비행상이 없는 것은 turn_right_20260824_223951 하나뿐이며, stride_cv 도 0.094 로
+    # 가장 고릅니다(다음이 0.555). 지금까지의 순서 -- 듀티가 높을수록 개루프에 유리 --
+    # 에서도 WALK(0.64)보다 위입니다.
+    ClipSpec("TURN", "cyclic", motion_type="yaw", duty_lo=0.60, duty_hi=1.00,
+             forbid_flight=True,
+             note="in-place yaw, duty ~0.72, no flight phase"),
     ClipSpec("JUMP", "oneshot", motion_type=None, primary_skill="front_jump",
              note="front_jump: vertical hop, ~0.45 s flight, ~26 mm horizontal"),
 ]
@@ -652,6 +661,61 @@ def build_full_session_clip(sess: Session, spec: ClipSpec) -> Clip:
         "q_des_invalid_frac": float(1.0 - hi["q_des_valid"].mean()),
         "loopable": False,
         "skill_sequence": sess.skill_sequence(),
+        "note": spec.note,
+    }
+    return Clip(spec.name, "oneshot", sess.path.name, sess.group, fs, TARGET_FS,
+                _permute(hi), _permute(lo), meta)
+
+
+def build_hold_clip(sess: Session, spec: ClipSpec, t0: float, t1: float) -> Clip:
+    """A held posture -- ``[t0, t1)`` seconds of the session, as recorded.
+
+    Not a gait and not an event: a stretch of quiet standing, kept so that a
+    planner's *transition between* skills can be replayed rather than assumed.
+    ``balance_stand`` is the one the real robot actually used -- it precedes
+    ``front_jump`` in 8 of 8 recordings (CLAUDE.md 3) -- so a replay that goes
+    TROT -> balance_stand -> WALK is following the machine's own procedure, not
+    inventing an interlude.
+
+    Same channels, same downsample and same step-channel handling as every other
+    clip; the window is a time slice and nothing else is done to it.
+    """
+    channels, valid = raw_channels(sess)
+    t, fs = sess.t, sess.fs
+    a = int(np.searchsorted(t - t[0], t0))
+    b = int(np.searchsorted(t - t[0], t1))
+    if b - a < 4:
+        raise ValueError(f"hold window {t0}-{t1}s is only {b-a} samples")
+    win = detect_motion(sess)
+    cr = detect_contact(sess.foot_force(), win.mask if win.ok else np.ones(sess.n, bool), fs)
+    hi = {k: v[a:b] for k, v in channels.items()}
+    hi["contact"] = cr.contact[a:b]
+    hi["q_des_valid"] = valid[a:b]
+    t_seg = t[a:b] - t[a]
+    hi["t"] = t_seg
+
+    dur = float(t_seg[-1])
+    n_lo = max(int(round(dur * TARGET_FS)) + 1, 4)
+    grid = np.linspace(0.0, dur, n_lo)
+    cutoff = LOWPASS_FRAC * TARGET_FS
+    lo: Dict[str, np.ndarray] = {}
+    for name, arr in hi.items():
+        if name == "t":
+            continue
+        if name in STEP_CHANNELS:
+            idx = np.clip(np.searchsorted(t_seg, grid, side="right") - 1, 0, len(t_seg) - 1)
+            lo[name] = arr[idx]
+        else:
+            lo[name] = lowpass_resample(t_seg, arr, fs, grid, cutoff)
+    lo["t"] = grid
+    meta = {
+        "duration_s": dur,
+        "window_s": [t0, t1],
+        "kind_note": "held posture, not a gait",
+        "q_des_range_rad": float(np.ptp(hi["q_des"], axis=0).max()),
+        "mean_abs_dq": float(np.abs(hi["dq"]).mean()),
+        "q_des_invalid_frac": float(1.0 - hi["q_des_valid"].mean()),
+        "loopable": False,
         "note": spec.note,
     }
     return Clip(spec.name, "oneshot", sess.path.name, sess.group, fs, TARGET_FS,

@@ -400,7 +400,8 @@ _SIM_APP = None
 _RUN_UTC = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
-def run_isaac(args, clip: dict, meta: dict) -> dict:
+def run_isaac(args, clip: dict, meta: dict, then_clip: dict | None = None,
+              via_clip: dict | None = None) -> dict:
     """Play ``clip`` on a flat floor and return measured gait numbers.
 
     The replay mode is *requested*, then resolved against what the installed
@@ -615,9 +616,61 @@ def run_isaac(args, clip: dict, meta: dict) -> dict:
                   f"{hip_mean[k] + comp_offset[3*k]:+.4f} rad "
                   f"(env default {hip_default[k]:+.4f}, offset {comp_offset[3*k]:+.4f})")
 
-    q_cmd = torch.as_tensor(np.tile(q_des_signed, (reps, 1)), device=sim.device, dtype=torch.float32)
-    tau_ff = torch.as_tensor(np.tile(clip["tau_ff"] * sign, (reps, 1)), device=sim.device, dtype=torch.float32)
-    kp_seq, kd_seq = np.tile(clip["kp"], (reps, 1)), np.tile(clip["kd"], (reps, 1))
+    # ------------------------------------------------------------ skill change
+    # A sequence of clips played back to back, with the seam recorded.  Nothing is
+    # blended and nothing is inserted: at the switch step the commanded pose jumps
+    # from one recording to the other, exactly as it would when a planner issues a
+    # new skill.  The size of that jump is measured and reported rather than
+    # smoothed away, because a discontinuity the PD cannot follow is a real cost of
+    # switching and hiding it would flatter the result.
+    seq = [("A", clip["name"], np.tile(q_des_signed, (reps, 1)),
+            np.tile(clip["tau_ff"] * sign, (reps, 1)),
+            np.tile(clip["kp"], (reps, 1)), np.tile(clip["kd"], (reps, 1)))]
+    seams = []
+    if args.then_clip:
+        seq[0] = ("A", clip["name"],
+                  np.tile(q_des_signed, (args.switch_after_cycles, 1)),
+                  np.tile(clip["tau_ff"] * sign, (args.switch_after_cycles, 1)),
+                  np.tile(clip["kp"], (args.switch_after_cycles, 1)),
+                  np.tile(clip["kd"], (args.switch_after_cycles, 1)))
+        for role, extra, ncyc, hold_s in (("VIA", via_clip, None, args.via_s),
+                                          ("B", then_clip, args.then_cycles, None)):
+            if extra is None:
+                continue
+            e = extra
+            if e["kind"] == "cyclic" and args.start_phase == "level":
+                k, ph = level_start(e, robot, sim, idx_t, phys_dt)
+                e = rotate_clip(e, k)
+                print(f"[replay] {role} clip {e['name']}: start phase frame {ph['start_frame']}, "
+                      f"foot spread {ph['spread_at_start']*1000:.1f} mm")
+            m = (int(np.ceil(hold_s * e["fs"] / len(e["q_des"]))) if hold_s is not None
+                 else ncyc) if e["kind"] == "cyclic" or hold_s is not None else 1
+            m = max(int(m), 1)
+            qs = np.tile(e["q_des"] * sign, (m, 1))
+            if hold_s is not None:
+                qs = qs[: max(int(round(hold_s * e["fs"])), 1)]
+            n_keep = len(qs)
+            seq.append((role, e["name"], qs,
+                        np.tile(e["tau_ff"] * sign, (m, 1))[:n_keep],
+                        np.tile(e["kp"], (m, 1))[:n_keep],
+                        np.tile(e["kd"], (m, 1))[:n_keep]))
+        off = 0
+        for i, (role, nm, qs, *_rest) in enumerate(seq):
+            if i:
+                jump = float(np.abs(seq[i][2][0] - seq[i - 1][2][-1]).max())
+                seams.append({"step": off, "t_s": off * ctrl_dt, "from": seq[i - 1][1],
+                              "to": nm, "cmd_jump_rad": jump})
+                print(f"[replay] switch at step {off} ({off*ctrl_dt:.2f} s): "
+                      f"{seq[i-1][1]} -> {nm}, commanded pose jumps {jump:.3f} rad "
+                      f"on its largest joint")
+            off += len(qs)
+
+    q_des_signed = np.concatenate([x[2] for x in seq])
+    total = len(q_des_signed)
+    q_cmd = torch.as_tensor(q_des_signed, device=sim.device, dtype=torch.float32)
+    tau_ff = torch.as_tensor(np.concatenate([x[3] for x in seq]), device=sim.device, dtype=torch.float32)
+    kp_seq = np.concatenate([x[4] for x in seq])
+    kd_seq = np.concatenate([x[5] for x in seq])
 
     # ------------------------------------------------------------------ settle
     # The initial condition is not a formality here: it decides the verdict.  The
@@ -816,6 +869,12 @@ def run_isaac(args, clip: dict, meta: dict) -> dict:
         "cap_runtime_gains": cap.runtime_gain_write,
         "cap_effort_target": cap.effort_target,
         "hip_sign": args.hip_sign,
+        "then_clip": args.then_clip or "",
+        "via_clip": args.via_clip or "",
+        "switch_after_cycles": args.switch_after_cycles if args.then_clip else "",
+        "switch_step": seams[0]["step"] if seams else "",
+        "switch_t_s": seams[0]["t_s"] if seams else "",
+        "cmd_jump_rad": max((x["cmd_jump_rad"] for x in seams), default=""),
         # Every setting that decides the outcome, so a row can be reproduced from
         # the file alone.  These were the ones missing.
         "contact_threshold_n": args.contact_threshold_n,
@@ -853,6 +912,8 @@ def run_isaac(args, clip: dict, meta: dict) -> dict:
                             terminated_s=(np.nan if terminated_s is None else terminated_s),
                             clip_name=clip["name"], start_frame=int(ph["start_frame"]),
                             clip_n=int(n), cycles=int(reps),
+                            seam_steps=np.array([x["step"] for x in seams], dtype=int),
+                            seam_names=np.array([f"{x['from']}->{x['to']}" for x in seams]),
                             leg_order=np.array(clip["leg_order"]),
                             joint_order=np.array(clip["joint_order"]),
                             foot_names=np.array(foot_names),
@@ -1059,6 +1120,19 @@ def main() -> int:
                     help="force a frame rate; default is real time for the stride")
     ap.add_argument("--video-side-m", type=float, default=2.4,
                     help="camera distance abeam the robot, metres (+y side)")
+    ap.add_argument("--then-clip", default=None,
+                    help="after --switch-after-cycles cycles of --clip, switch to this clip and "
+                         "keep playing. Tests whether a skill that diverges can be handed over "
+                         "to one that does not, which is a planner action rather than a fix.")
+    ap.add_argument("--switch-after-cycles", type=int, default=1)
+    ap.add_argument("--then-cycles", type=int, default=40)
+    ap.add_argument("--via-clip", default=None,
+                    help="hold this clip between the two (e.g. BALANCE). The real robot put "
+                         "balance_stand in front of front_jump in 8 of 8 recordings, so routing "
+                         "a change through it is the machine's own procedure.")
+    ap.add_argument("--via-s", type=float, default=0.21,
+                    help="how long to hold --via-clip; default is the measured median settle "
+                         "time after a skill change (CLAUDE.md 3)")
     ap.add_argument("--plant-comp", choices=("off", "stance"), default="off",
                     help="off (default): play the recording as stored. stance: shift the hip "
                          "DC level toward the env's init_state.joint_pos, correcting the "
@@ -1152,7 +1226,9 @@ def main() -> int:
             print("=" * 78)
             print(gain_comparison(meta, name))
             print()
-            m = run_isaac(args, clip, meta)
+            tc = load_clip(args.then_clip, args.rate, archive) if args.then_clip else None
+            vc = load_clip(args.via_clip, args.rate, archive) if args.via_clip else None
+            m = run_isaac(args, clip, meta, tc, vc)
             ranked = D.best_mapping(m.pop("_q_measured"), m.pop("_q_commanded"))
             offs = None
             F = D.diagnose(m, exp, mapping=ranked, offsets=offs)
