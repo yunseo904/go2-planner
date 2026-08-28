@@ -1,0 +1,229 @@
+{
+  "npz_sha256": "fc17a8f40f8a1365c7cbaf88a4c4d32868194eeb4a9d855ede2b1b06f50b14d7",
+  "n_clips": 3,
+  "leg_order_native": [
+    "FR",
+    "FL",
+    "RR",
+    "RL"
+  ],
+  "leg_order_stored": [
+    "FL",
+    "FR",
+    "RL",
+    "RR"
+  ],
+  "joint_order": [
+    "hip",
+    "thigh",
+    "calf"
+  ],
+  "target_fs_hz": 50.0,
+  "lowpass_frac_of_target": 0.4,
+  "channels": [
+    "t",
+    "q_des",
+    "dq_des",
+    "tau_ff",
+    "q",
+    "dq",
+    "tau",
+    "kp",
+    "kd",
+    "contact",
+    "q_des_valid"
+  ],
+  "convention_verified": false,
+  "convention_note": "Same convention as data/skill_clips.npz; unverified in the same way.",
+  "gain_note": "Same per-sample kp/kd/tau_ff as the frozen archive, for the whole session.",
+  "purpose": "Whole sessions, uncut: no cycle cutting, no phase averaging, no start-phase choice, no tiling. Start-up (balance_stand -> spin-up -> steady gait) included, so the replay starts from the standing pose the recording starts in. The only processing is the 50 Hz anti-aliased downsample in the 'lo' copy.",
+  "clips": {
+    "WALK_FULL": {
+      "kind": "oneshot",
+      "session": "gait_classic_walk_20260824_224559",
+      "group": "03_slow_walk",
+      "fs_hi_hz": 418.05714214542934,
+      "fs_lo_hz": 50.0,
+      "n_hi": 8401,
+      "n_lo": 1020,
+      "duration_s": 20.37614476500005,
+      "n_samples_session": 8401,
+      "cut": "none -- whole session",
+      "startup_s": 11.516486965000013,
+      "motion_window_s": [
+        11.516486965000013,
+        16.959888445000047
+      ],
+      "q_des_update_hz": 43.19923802169436,
+      "flight_frac": 0.0,
+      "flight_s": 0.0,
+      "alias_energy_frac_above_25hz": 0.003098838860749587,
+      "lowpass_cutoff_hz": 20.0,
+      "lowpass_method": "4th-order zero-phase Butterworth (filtfilt) then linear resample",
+      "q_des_invalid_frac": 0.0029758362099749913,
+      "loopable": false,
+      "skill_sequence": [
+        "classic_walk",
+        "move"
+      ],
+      "note": "slow walk, duty ~0.64, no flight phase",
+      "gains": {
+        "kp": [
+          40.0,
+          40.0,
+          40.0
+        ],
+        "kd": [
+          1.0,
+          1.0,
+          1.0
+        ],
+        "tau_ff_rms": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "joint_order": [
+          "hip",
+          "thigh",
+          "calf"
+        ],
+        "position_controlled": true
+      },
+      "selection": {
+        "session": "gait_classic_walk_20260824_224559",
+        "group": "03_slow_walk",
+        "why": "lowest stride_cv (steadiest cycle) among 3 candidates",
+        "duty_mean": 0.6379545454545454,
+        "stride_hz": 1.3807119426568644,
+        "vx_steady_mean": 0.18746616149213685,
+        "flight_frac": 0.0
+      }
+    },
+    "TROT_FULL": {
+      "kind": "oneshot",
+      "session": "run_06_20260824_225352",
+      "group": "03_slow_walk",
+      "fs_hi_hz": 416.51082221712494,
+      "fs_lo_hz": 50.0,
+      "n_hi": 5546,
+      "n_lo": 673,
+      "duration_s": 13.435779060999948,
+      "n_samples_session": 5546,
+      "cut": "none -- whole session",
+      "startup_s": 5.489636323000013,
+      "motion_window_s": [
+        5.489636323000013,
+        9.371332208000013
+      ],
+      "q_des_update_hz": 42.740244876743745,
+      "flight_frac": 0.0,
+      "flight_s": 0.0,
+      "alias_energy_frac_above_25hz": 0.006608024136061229,
+      "lowpass_cutoff_hz": 20.0,
+      "lowpass_method": "4th-order zero-phase Butterworth (filtfilt) then linear resample",
+      "q_des_invalid_frac": 0.005228993869455412,
+      "loopable": false,
+      "skill_sequence": [
+        "move"
+      ],
+      "note": "trot, duty ~0.52, no flight phase",
+      "gains": {
+        "kp": [
+          40.0,
+          40.0,
+          40.0
+        ],
+        "kd": [
+          1.0,
+          1.0,
+          1.0
+        ],
+        "tau_ff_rms": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "joint_order": [
+          "hip",
+          "thigh",
+          "calf"
+        ],
+        "position_controlled": true
+      },
+      "selection": {
+        "session": "run_06_20260824_225352",
+        "group": "03_slow_walk",
+        "why": "lowest stride_cv (steadiest cycle) among 4 candidates",
+        "duty_mean": 0.570404984423676,
+        "stride_hz": 1.5442217135226264,
+        "vx_steady_mean": 0.443721311481766,
+        "flight_frac": 0.0
+      }
+    },
+    "RUN_FULL": {
+      "kind": "oneshot",
+      "session": "run_trot_20_lvl0_20260824_232530",
+      "group": "01_running_trot_flight",
+      "fs_hi_hz": 426.2620019348322,
+      "fs_lo_hz": 50.0,
+      "n_hi": 9989,
+      "n_lo": 1195,
+      "duration_s": 23.887614042000223,
+      "n_samples_session": 9989,
+      "cut": "none -- whole session",
+      "startup_s": 15.329818160000286,
+      "motion_window_s": [
+        15.329818160000286,
+        19.83675178500016
+      ],
+      "q_des_update_hz": 165.07623382898788,
+      "flight_frac": 0.05225748323155471,
+      "flight_s": 1.2245989500133874,
+      "alias_energy_frac_above_25hz": 0.006902846561396445,
+      "lowpass_cutoff_hz": 20.0,
+      "lowpass_method": "4th-order zero-phase Butterworth (filtfilt) then linear resample",
+      "q_des_invalid_frac": 0.0030033036339973673,
+      "loopable": false,
+      "skill_sequence": [
+        "speed_level",
+        "trot_run",
+        "move"
+      ],
+      "note": "running trot, duty ~0.31, flight phase present",
+      "gains": {
+        "kp": [
+          13.0,
+          3.0,
+          2.0
+        ],
+        "kd": [
+          1.7999999523162842,
+          2.0,
+          1.5
+        ],
+        "tau_ff_rms": [
+          3.666915150551025,
+          2.591491276949296,
+          11.788148791667984
+        ],
+        "joint_order": [
+          "hip",
+          "thigh",
+          "calf"
+        ],
+        "position_controlled": false
+      },
+      "selection": {
+        "session": "run_trot_20_lvl0_20260824_232530",
+        "group": "01_running_trot_flight",
+        "why": "lowest stride_cv (steadiest cycle) among 11 candidates",
+        "duty_mean": 0.2998659517426273,
+        "stride_hz": 2.9288002222602523,
+        "vx_steady_mean": 0.5138499244208923,
+        "flight_frac": 0.27989276139410185
+      }
+    }
+  },
+  "source": "motion_toolkit/clips.py build_full_session_clip"
+}

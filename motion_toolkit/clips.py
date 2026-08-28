@@ -572,6 +572,92 @@ def build_oneshot_clip(sess: Session, spec: ClipSpec) -> Clip:
                 _permute(hi), _permute(lo), meta)
 
 
+def build_full_session_clip(sess: Session, spec: ClipSpec) -> Clip:
+    """The recording end to end: every sample, from the first to the last.
+
+    The other two builders both remove something.  ``build_cyclic_clip`` cuts on
+    touchdown and takes a median over cycles, so the seam, the phase grid and the
+    averaging are all in play; ``build_oneshot_clip`` trims to the detected motion
+    window (+``ONESHOT_PAD_S``), so the start-up is gone and the first frame is a
+    moving pose.  This one cuts nothing, averages nothing and loops nothing: the
+    start-up the session begins with (``balance_stand`` -> the skill spinning up
+    -> steady gait) is played as it was recorded, and the replay's first frame is
+    the standing pose the robot was actually in.
+
+    That is the point of it.  A replay of a cut clip can always be blamed on the
+    cut -- the seam, the median, the chosen start phase.  None of those exist
+    here, so a collapse cannot be attributed to any of them.
+
+    The only thing done to the samples is the downsample, and only in the ``lo``
+    copy: ``hi`` is the recording at the session's own rate.  The ``lo`` copy uses
+    the same anti-aliasing as ``build_oneshot_clip`` (zero-phase Butterworth, then
+    linear resampling) because plain decimation folds the out-of-band energy back
+    into the gait band.  ``kp``/``kd``/``contact``/``q_des_valid`` are held, never
+    filtered, for the reason in the module docstring: a filtered gain is a gain
+    that was never commanded.
+
+    Contact thresholds are still derived inside the motion window (they are
+    per-session, per-leg, and calibrating them on the standing start-up would put
+    the p5-p95 span on the wrong range), but the channel is kept for the whole
+    session.  Nothing about the window is used to cut.
+    """
+    win = detect_motion(sess)
+    if not win.ok:
+        raise ValueError("no motion window")
+    cr = detect_contact(sess.foot_force(), win.mask, sess.fs)
+    t, fs = sess.t, sess.fs
+
+    channels, valid = raw_channels(sess)
+    hi = dict(channels)
+    hi["contact"] = cr.contact
+    hi["q_des_valid"] = valid
+    t_seg = t - t[0]
+    hi["t"] = t_seg
+    for k, v in hi.items():
+        if len(v) != sess.n:
+            raise ValueError(f"channel {k} is {len(v)} samples, session is {sess.n}")
+
+    nyq_lo = TARGET_FS / 2.0
+    alias = _alias_energy_frac(hi["q_des"], fs, nyq_lo)
+
+    dur = float(t_seg[-1])
+    n_lo = max(int(round(dur * TARGET_FS)) + 1, 4)
+    grid = np.linspace(0.0, dur, n_lo)
+    cutoff = LOWPASS_FRAC * TARGET_FS
+    lo: Dict[str, np.ndarray] = {}
+    for name, arr in hi.items():
+        if name == "t":
+            continue
+        if name in STEP_CHANNELS:
+            idx = np.clip(np.searchsorted(t_seg, grid, side="right") - 1, 0, len(t_seg) - 1)
+            lo[name] = arr[idx]
+        else:
+            lo[name] = lowpass_resample(t_seg, arr, fs, grid, cutoff)
+    lo["t"] = grid
+
+    s0, s1 = win.start_stop()
+    airborne = (~hi["contact"]).all(axis=1)
+    meta = {
+        "duration_s": dur,
+        "n_samples_session": int(sess.n),
+        "cut": "none -- whole session",
+        "startup_s": float(t_seg[s0]),
+        "motion_window_s": [float(t_seg[s0]), float(t_seg[min(s1, sess.n - 1)])],
+        "q_des_update_hz": _update_rate_hz(hi["q_des"], fs),
+        "flight_frac": float(airborne.mean()),
+        "flight_s": float(airborne.sum() / fs),
+        "alias_energy_frac_above_25hz": alias,
+        "lowpass_cutoff_hz": cutoff,
+        "lowpass_method": "4th-order zero-phase Butterworth (filtfilt) then linear resample",
+        "q_des_invalid_frac": float(1.0 - hi["q_des_valid"].mean()),
+        "loopable": False,
+        "skill_sequence": sess.skill_sequence(),
+        "note": spec.note,
+    }
+    return Clip(spec.name, "oneshot", sess.path.name, sess.group, fs, TARGET_FS,
+                _permute(hi), _permute(lo), meta)
+
+
 def build_clip(sess: Session, spec: ClipSpec, *, cycle_subset=None) -> Clip:
     if spec.kind != "cyclic":
         if cycle_subset is not None:
