@@ -28,17 +28,10 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from sim.replay import quat_rotate_inv, quat_to_rpy_deg
 from terrain_toolkit.paths import DATA_DIR
 
 CANON = ("FL", "FR", "RL", "RR")
-
-
-def quat_to_rpy_deg(q):
-    w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
-    roll = np.arctan2(2 * (w * x + y * z), 1 - 2 * (x * x + y * y))
-    pitch = np.arcsin(np.clip(2 * (w * y - z * x), -1, 1))
-    yaw = np.arctan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
-    return np.degrees(roll), np.degrees(pitch), np.degrees(yaw)
 
 
 def order(names):
@@ -142,7 +135,7 @@ def report(trace: Path, archive: Path, meta: dict) -> None:
     # --- tipping angle from this run's own first gait cycle ----------------
     if len(td) >= 2 and td[1] < steps:
         c0 = slice(int(td[0]), int(min(td[1], steps)))
-        fb = feet[c0] - pos[c0][:, None, :]
+        fb = quat_rotate_inv(quat[c0][:, None, :], feet[c0] - pos[c0][:, None, :])
         half_w = float(np.abs(fb[:, :, 1]).mean())
         h = float(pos[c0, 2].mean())
         tip = float(np.degrees(np.arctan2(half_w, h)))
