@@ -1,6 +1,6 @@
 {
-  "npz_sha256": "fc17a8f40f8a1365c7cbaf88a4c4d32868194eeb4a9d855ede2b1b06f50b14d7",
-  "n_clips": 3,
+  "npz_sha256": "262c976108af979100a3c4847caf910ad3d4ee119e93934d6e924ed4aee204d5",
+  "n_clips": 4,
   "leg_order_native": [
     "FR",
     "FL",
@@ -222,6 +222,67 @@
         "stride_hz": 2.9288002222602523,
         "vx_steady_mean": 0.5138499244208923,
         "flight_frac": 0.27989276139410185
+      }
+    },
+    "TURN_FULL": {
+      "kind": "oneshot",
+      "session": "turn_right_20260824_223951",
+      "group": "04_turn",
+      "fs_hi_hz": 419.1611997599747,
+      "fs_lo_hz": 50.0,
+      "n_hi": 5647,
+      "n_lo": 679,
+      "duration_s": 13.55384260599999,
+      "n_samples_session": 5647,
+      "cut": "none -- whole session",
+      "startup_s": 5.5779152549999935,
+      "motion_window_s": [
+        5.5779152549999935,
+        9.945990908999988
+      ],
+      "q_des_update_hz": 43.13366224947667,
+      "flight_frac": 0.0,
+      "flight_s": 0.0,
+      "alias_energy_frac_above_25hz": 0.003662971988325176,
+      "lowpass_cutoff_hz": 20.0,
+      "lowpass_method": "4th-order zero-phase Butterworth (filtfilt) then linear resample",
+      "q_des_invalid_frac": 0.005312555339118119,
+      "loopable": false,
+      "skill_sequence": [
+        "move"
+      ],
+      "note": "in-place yaw, duty ~0.72, no flight phase",
+      "gains": {
+        "kp": [
+          40.0,
+          40.0,
+          40.0
+        ],
+        "kd": [
+          1.0,
+          1.0,
+          1.0
+        ],
+        "tau_ff_rms": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "joint_order": [
+          "hip",
+          "thigh",
+          "calf"
+        ],
+        "position_controlled": true
+      },
+      "selection": {
+        "session": "turn_right_20260824_223951",
+        "group": "04_turn",
+        "why": "lowest stride_cv (steadiest cycle) among 1 candidates",
+        "duty_mean": 0.7154226125137212,
+        "stride_hz": 1.0404413248291124,
+        "vx_steady_mean": 0.007509986553621348,
+        "flight_frac": 0.0
       }
     }
   },
