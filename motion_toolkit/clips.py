@@ -450,13 +450,29 @@ def _update_rate_hz(x: np.ndarray, fs: float) -> float:
     return float(changed.mean() * fs)
 
 
-def build_cyclic_clip(sess: Session, spec: ClipSpec) -> Clip:
+def build_cyclic_clip(sess: Session, spec: ClipSpec, *, cycle_subset=None) -> Clip:
+    """One cycle of ``sess``, cut on contact and phase-averaged.
+
+    ``cycle_subset`` selects which of the clean cycles feed the median, by index
+    into the kept list.  ``None`` (the default) uses all of them and is what the
+    frozen archive is built from -- this argument must never change that path's
+    output.  A single-element subset makes the median a no-op, which is how a raw
+    unaveraged cycle is obtained: same contact detection, same phase grid, same
+    low-pass, same seam and alias bookkeeping, so an A/B against the default
+    differs in the averaging and in nothing else.
+    """
     cycles, info = _cycle_bounds(sess)
+    sel = cycles if cycle_subset is None else [cycles[i] for i in cycle_subset]
+    if not sel:
+        raise ValueError("cycle_subset selected no cycles")
     channels, valid = raw_channels(sess)
     fs = sess.fs
-    cycle_s = info["cycle_s"]
+    # The cycle's OWN duration, not the session median: a raw cycle that is 6%
+    # long is 6% long, and normalising it to the median would be a second kind of
+    # averaging.  With sel == cycles this is exactly info["cycle_s"].
+    cycle_s = float(np.median([b - a for a, b in sel]))
     n_hi = max(int(round(cycle_s * fs)), 8)
-    hi, spread = _phase_average(sess, channels, valid, info["contact"], cycles, n_hi)
+    hi, spread = _phase_average(sess, channels, valid, info["contact"], sel, n_hi)
 
     nyq_lo = TARGET_FS / 2.0
     alias = _alias_energy_frac(hi["q_des"], n_hi / cycle_s, nyq_lo)
@@ -479,9 +495,12 @@ def build_cyclic_clip(sess: Session, spec: ClipSpec) -> Clip:
     meta = {
         "cycle_s": cycle_s,
         "cycle_hz": 1.0 / cycle_s,
-        "cycle_s_spread": info["cycle_s_spread"],
+        "cycle_s_spread": float(np.std([b - a for a, b in sel])),
         "n_cycles_kept": info["n_cycles_kept"],
         "n_cycles_seen": info["n_cycles_seen"],
+        "n_cycles_used": int(len(sel)),
+        "cycle_indices": list(range(len(cycles))) if cycle_subset is None else list(cycle_subset),
+        "averaged": cycle_subset is None or len(sel) > 1,
         "ref_leg": info["ref_leg"],
         "duty_clip": duty,
         **_loop_seam(hi["q_des"]),
@@ -553,8 +572,12 @@ def build_oneshot_clip(sess: Session, spec: ClipSpec) -> Clip:
                 _permute(hi), _permute(lo), meta)
 
 
-def build_clip(sess: Session, spec: ClipSpec) -> Clip:
-    return build_cyclic_clip(sess, spec) if spec.kind == "cyclic" else build_oneshot_clip(sess, spec)
+def build_clip(sess: Session, spec: ClipSpec, *, cycle_subset=None) -> Clip:
+    if spec.kind != "cyclic":
+        if cycle_subset is not None:
+            raise ValueError("cycle_subset is meaningless for a one-shot clip")
+        return build_oneshot_clip(sess, spec)
+    return build_cyclic_clip(sess, spec, cycle_subset=cycle_subset)
 
 
 def gain_summary(sess: Session) -> dict:

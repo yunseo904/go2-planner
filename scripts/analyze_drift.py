@@ -242,14 +242,67 @@ def trace_report(path: Path, cycle_table: bool = True) -> int:
     return 0
 
 
+def ab_report(d: Path) -> int:
+    """Survival-time distribution over the per-cycle runs in ``d``."""
+    rows = []
+    for f in sorted(d.glob("*.csv")):
+        for r in csv.DictReader(f.open()):
+            rows.append(r)
+    if not rows:
+        raise SystemExit(f"no result CSVs in {d}")
+
+    def num(r, k):
+        v = r.get(k, "")
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return float("nan")
+
+    med = [r for r in rows if r["clip"].endswith("_med")]
+    raw = [r for r in rows if not r["clip"].endswith("_med")]
+
+    print(f"Extraction A/B over {len(rows)} runs in {d}")
+    print("A run with no terminated_s did not fall within the requested cycles.\n")
+    print(f"  {'clip':12s} {'survived s':>10s} {'stride Hz':>10s} {'vx m/s':>8s} "
+          f"{'handover':>9s} {'start':>6s} {'verdict':>8s}")
+    for r in med + raw:
+        t = num(r, "terminated_s")
+        print(f"  {r['clip']:12s} {('%10.2f' % t) if np.isfinite(t) else '   no fall'} "
+              f"{num(r,'stride_hz'):10.2f} {num(r,'vx_mean'):8.3f} "
+              f"{num(r,'handover_speed_mps'):9.3f} {int(num(r,'start_frame')):6d} "
+              f"{r.get('verdict',''):>8s}")
+
+    surv = np.array([num(r, "terminated_s") for r in raw])
+    fell = surv[np.isfinite(surv)]
+    print(f"\n  raw cycles: {len(fell)}/{len(raw)} fell")
+    if len(fell):
+        print(f"    survival  min {fell.min():.2f}  median {np.median(fell):.2f}  "
+              f"max {fell.max():.2f}  mean {fell.mean():.2f} +- {fell.std():.2f} s")
+    if med:
+        m = num(med[0], "terminated_s")
+        ms = f"{m:.2f} s" if np.isfinite(m) else "no fall"
+        print(f"    median clip (the control): {ms}")
+        if len(fell) and np.isfinite(m):
+            better = int((fell > m).sum())
+            print(f"    raw cycles that outlasted the median clip: {better}/{len(fell)}")
+            print("    -> the averaging is not what is killing the trot"
+                  if better <= len(fell) / 2 else
+                  "    -> raw cycles do better; the averaging removed something that mattered")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--clips", action="store_true", help="clip symmetry, no simulator")
     ap.add_argument("--rate", choices=("hi", "lo"), default="hi")
     ap.add_argument("--trace", nargs="*", default=None, help="trace npz files to report")
+    ap.add_argument("--ab", default=None,
+                    help="directory of per-cycle result CSVs from run_raw_cycle_ab.sh")
     a = ap.parse_args()
     rc = 0
+    if a.ab:
+        return ab_report(Path(a.ab))
     if a.clips or a.trace is None:
         rc |= clip_symmetry(a.rate)
     for p in a.trace or []:

@@ -203,8 +203,8 @@ def headroom_report(meta: dict, name: str) -> str:
 # Clip loading
 # --------------------------------------------------------------------------- #
 
-def load_clip(name: str, rate: str = "lo") -> dict:
-    z = np.load(SKILL_CLIPS_NPZ, allow_pickle=False)
+def load_clip(name: str, rate: str = "lo", archive: Path | None = None) -> dict:
+    z = np.load(archive or SKILL_CLIPS_NPZ, allow_pickle=False)
     names = [str(x) for x in z["clip_names"]]
     if name not in names:
         raise SystemExit(f"clip {name!r} not in archive; have {names}")
@@ -675,6 +675,7 @@ def run_isaac(args, clip: dict, meta: dict) -> dict:
         "settle_mode": args.settle_mode,
         "start_phase": args.start_phase,
         "ablation": args.ablate,
+        "clip_archive": (Path(args.clip_archive).name if args.clip_archive else "skill_clips.npz"),
         "start_frame": ph["start_frame"],
         "start_foot_spread_m": ph["spread_at_start"],
         "start_feet_down": ph["feet_down"],
@@ -806,16 +807,17 @@ def self_test() -> int:
 
 # --------------------------------------------------------------------------- #
 
-def report(rows: list) -> None:
+def report(rows: list, out=None) -> None:
     import csv
-    REPLAY_RESULTS_CSV.parent.mkdir(parents=True, exist_ok=True)
+    out = Path(out) if out else REPLAY_RESULTS_CSV
+    out.parent.mkdir(parents=True, exist_ok=True)
     keys = sorted({k for r in rows for k in r if not k.startswith("_")})
-    with open(REPLAY_RESULTS_CSV, "w", newline="") as fh:
+    with open(out, "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=keys)
         w.writeheader()
         for r in rows:
             w.writerow({k: r.get(k) for k in keys})
-    print(f"[replay] wrote {REPLAY_RESULTS_CSV}")
+    print(f"[replay] wrote {out}")
 
 
 def main() -> int:
@@ -843,6 +845,14 @@ def main() -> int:
                          "then drive to the clip pose with the PD.")
     ap.add_argument("--contact-threshold-n", type=float, default=1.0)
     ap.add_argument("--fall-height-m", type=float, default=0.15)
+    ap.add_argument("--clip-archive", default=None,
+                    help="play clips from another archive built the same way, e.g. the "
+                         "per-cycle one from scripts/extract_raw_cycles.py. Its "
+                         "<name>.meta.json must sit beside it. Default: the frozen "
+                         "data/skill_clips.npz.")
+    ap.add_argument("--results-csv", default=None,
+                    help="where to write the result row (default outputs/replay_verify.csv); "
+                         "give a separate file when sweeping so runs do not overwrite each other")
     ap.add_argument("--ablate", choices=("none", "mirror", "symmetrize"), default="none",
                     help="DIAGNOSTIC ONLY, never a reported skill. mirror: play the gait "
                          "left-right mirrored, to find out whether a lateral bias lives in "
@@ -872,9 +882,16 @@ def main() -> int:
     if args.self_test:
         return self_test()
 
-    if not SKILL_CLIPS_NPZ.is_file():
-        raise SystemExit(f"no clip archive at {SKILL_CLIPS_NPZ}; run scripts/extract_skill_clips.py")
-    meta = json.loads(SKILL_CLIPS_META_JSON.read_text())
+    archive = Path(args.clip_archive) if args.clip_archive else SKILL_CLIPS_NPZ
+    meta_json = (archive.with_suffix("").with_suffix(".meta.json")
+                 if args.clip_archive else SKILL_CLIPS_META_JSON)
+    if not archive.is_file():
+        raise SystemExit(f"no clip archive at {archive}; run scripts/extract_skill_clips.py")
+    if not meta_json.is_file():
+        raise SystemExit(f"no meta beside the archive at {meta_json}")
+    if args.clip_archive:
+        print(f"[replay] clip archive {archive} (not the frozen one)")
+    meta = json.loads(meta_json.read_text())
     names = list(meta["clips"]) if args.all else [args.clip]
 
     if args.convention:
@@ -906,7 +923,7 @@ def main() -> int:
         # --all reuses one SimulationApp across clips; only the single-clip path day 1
         # prescribes has been exercised on this machine.
         for name in names:
-            clip = load_clip(name, args.rate)
+            clip = load_clip(name, args.rate, archive)
             if args.ablate != "none":
                 if clip["kind"] != "cyclic":
                     raise SystemExit(f"--ablate {args.ablate} is defined for cyclic clips only")
@@ -928,7 +945,7 @@ def main() -> int:
             rows.append({"clip": name, "rate": args.rate, "verdict": D.verdict(F),
                          "best_mapping": ranked[0].name, "best_mapping_r": ranked[0].score,
                          **{k: v for k, v in m.items() if not k.startswith("_")}})
-        report(rows)
+        report(rows, args.results_csv)
     finally:
         if _SIM_APP is not None:
             _SIM_APP.close()

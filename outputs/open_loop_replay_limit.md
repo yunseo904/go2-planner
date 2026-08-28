@@ -214,6 +214,83 @@ cycle-to-cycle variation of `q_des` at matched phase within a session *is* the f
 component, and it is discarded when the cycles are averaged into one clip. That is now the
 strongest reason to move the logs, ahead of the startup-segment extraction.
 
+## The averaging question — built, blocked on the logs
+
+*Asked 2026-08-28: the clip is a median over phase-aligned cycles, so the controller's
+correction may have been averaged out. Replay a single raw cycle instead and A/B, over
+several cycles, with a survival-time distribution.*
+
+Agreed that this is an extraction change, not a clip edit. It cannot be run yet:
+**`curated/` is still not on z4**, and the archive holds only the averaged cycle —
+`WALK__hi__q_des` is 306 frames, which is exactly one cycle. The individual cycles exist
+only in the original sessions.
+
+### The premise is correct, and the archive says how much was discarded
+
+`motion_toolkit/clips.py::_phase_average` takes the **median** over every clean cycle on a
+shared phase grid, and keeps `spread = cube.std(axis=0)` of which only the maximum is
+recorded. That maximum is already in the frozen meta:
+
+| clip | cycles | period | period spread | q_des p2p | max cross-cycle std | ratio |
+|---|---|---|---|---|---|---|
+| WALK | 4 | 0.7315 s | 0.0509 s (7.0%) | 0.560 rad | 0.200 rad | **35.8%** |
+| TROT | 5 | 0.6429 s | 0.0369 s (5.7%) | 0.660 rad | 0.203 rad | **30.8%** |
+| RUN | 7 | 0.3241 s | 0.0271 s (8.3%) | 0.856 rad | 0.317 rad | **37.1%** |
+
+So the median did discard something whose worst-case cross-cycle standard deviation is
+about a third of the whole motion range. **Caveat: that is a maximum over all phases and
+joints, and it conflates two things** — genuine cycle-to-cycle correction, and phase
+alignment jitter, which makes a fast-moving joint look highly variable when a cycle is
+resampled 5.7% long. The archive stores only the max, so the two cannot be separated from
+it. The raw cycles separate them.
+
+### What is built and tested, ready to run
+
+- `motion_toolkit/clips.py::build_cyclic_clip(..., cycle_subset=None)` — selects which
+  clean cycles feed the median. `None` is the existing path and its output is unchanged
+  (`extract_skill_clips.py --verify` still reports `aab85a03…` OK). A one-element subset
+  makes the median the identity, which is how a raw cycle is obtained: **same session, same
+  contact-based cycle detection, same phase grid, same low-pass, same channels**. A single
+  cycle also keeps its **own** period rather than being renormalised to the session median,
+  since renormalising would be a second kind of averaging.
+- `scripts/extract_raw_cycles.py --clip TROT` — writes `data/raw_cycles_TROT.npz` with
+  `TROT_med` (all cycles, the control, rebuilt *by this script* so the A/B differs in the
+  averaging and not in the code path) and `TROT_c00…` (each cycle alone). The frozen
+  archive is untouched. `--self-test` runs with no logs and proves the part that matters:
+  a single-cycle subset returns that cycle, the median is a median and not a mean, and the
+  cross-cycle spread it discards is non-zero.
+- `verify_skill_replay.py --clip-archive … --results-csv …` — plays any archive built to
+  the same schema.
+- `scripts/run_raw_cycle_ab.sh TROT` — sweeps every clip in the archive at the settled
+  settings; `analyze_drift.py --ab outputs/raw_cycle_ab/TROT` prints the survival
+  distribution.
+
+The plumbing is verified end to end against a stand-in archive holding the frozen TROT clip
+under the new names: it loaded, chose the same start frame 16, the same handover
+0.068 m/s, the same stride 1.56 Hz and terminated at **2.1899 s** — identical to the frozen
+run. So the alternate-archive path is neutral, and any difference the real A/B shows will
+be the averaging.
+
+### Prediction, and what would refute the conclusion
+
+I expect the raw cycles **not** to survive materially longer, because the divergence
+multiplies roll by 3.6–4.6 per cycle from a 3° disturbance and a single cycle is still an
+open-loop trajectory: even if the correction survives the extraction, it is applied at a
+base state that no longer matches the one it was computed for. Symmetrising — a much larger
+change to the waveform — did not prevent the collapse either.
+
+But there is a real mechanism on the other side, which is why the run is worth making:
+the median smears touchdown timing across cycles whose periods differ by 5.7%, and crisper
+foot-strike timing could genuinely change stability. Pulling the other way, a raw cycle
+loops with a bigger seam discontinuity than the median clip's 0.019 rad. So the outcome is
+not obvious.
+
+**If a raw cycle survives materially longer than `TROT_med`, the conclusion in this document
+is wrong** and the cause is the extraction, not open-loop replay. That is the falsification
+criterion. Note the sample is small: TROT's session yields 5 clean cycles, all that session
+has. The obvious extension is to repeat over the other 3 candidate TROT sessions — say the
+word and I will.
+
 ## Reproducing
 
 ```
