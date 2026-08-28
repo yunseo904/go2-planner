@@ -122,6 +122,34 @@ def offset_error(q_measured: np.ndarray, q_commanded: np.ndarray) -> np.ndarray:
 # Gait measurement (same definitions the clips were cut with)
 # --------------------------------------------------------------------------- #
 
+def gait_from_force(force: np.ndarray, dt: float) -> dict:
+    """Gait numbers from per-foot FORCE, using the rule the logs are read with.
+
+    ``gait_from_contact`` below takes an already-thresholded boolean.  Feeding it
+    ``force > contact_threshold_n`` -- a bare fixed threshold, no hysteresis, no
+    minimum run -- is the mistake ``motion_toolkit/contact.py`` exists to avoid,
+    and it fails in the sim for the same reason it failed on the logs: a foot that
+    hovers near the threshold crosses it repeatedly inside one stance, the stance
+    is chopped into pieces, and since the stride comes from the MEDIAN touchdown
+    interval the median becomes the chatter interval rather than the gait period.
+
+    Measured, on the in-place turn where a foot carries only ~45 N against the 30 N
+    threshold: bare threshold 2.80 Hz against the clip's 1.12, with the FL foot
+    credited with 13 touchdowns where the clip has 5.  Same run, same forces, this
+    rule: 1.12 Hz.  WALK and TROT are unaffected (1.37 and 1.56 either way) because
+    they load a foot far above the threshold -- which is why this went unseen.
+
+    The per-leg thresholds are derived from the run's own force distribution, so
+    nothing here is tuned per clip.
+    """
+    from motion_toolkit.contact import detect_contact
+    f = np.asarray(force, dtype=float)
+    cr = detect_contact(f, np.ones(len(f), dtype=bool), 1.0 / dt)
+    out = gait_from_contact(cr.contact, dt)
+    out["contact_rule"] = "schmitt+despeckle on force"
+    return out
+
+
 def gait_from_contact(contact: np.ndarray, dt: float) -> dict:
     """Stride Hz / duty / phase from an ``(n, 4)`` boolean stance signal.
 

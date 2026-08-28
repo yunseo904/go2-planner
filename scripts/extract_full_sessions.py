@@ -53,6 +53,7 @@ from terrain_toolkit.paths import DATA_DIR, require_curated
 
 CHANNELS = ("t", "q_des", "dq_des", "tau_ff", "q", "dq", "tau", "kp", "kd", "contact", "q_des_valid")
 NPZ = DATA_DIR / "full_sessions.npz"
+GAIT_NPZ = DATA_DIR / "gait_windows.npz"
 META_JSON = DATA_DIR / "full_sessions.meta.json"
 
 #: Only the cyclic locomotion skills.  JUMP is already a whole event in the frozen
@@ -120,6 +121,48 @@ def save(clips: list) -> dict:
         "source": "motion_toolkit/clips.py build_full_session_clip",
     }
     META_JSON.write_text(json.dumps(meta, indent=2, default=float) + "\n")
+    return meta
+
+
+def build_gait_windows(only: str | None = None) -> dict:
+    """``<CLIP>_GAIT``: the motion window, uncut, without the stand either side.
+
+    Between the whole session and a tiled single cycle there is a third thing, and
+    RUN needs it: the session's gait from first movement to last, in one piece, no
+    cycle cutting and no averaging -- but without the standing stretch the session
+    opens with.  For RUN that stretch is not neutral.  Six seconds before the move
+    command the log's own gain schedule drops to kp 1/1/1, which the real robot
+    held by closing a loop it has and the replay does not, so RUN_FULL ends on its
+    belly 5 s BEFORE the gait it was meant to test ever starts.
+
+    This is ``build_oneshot_clip``, which is the JUMP path: the detected motion
+    window plus ONESHOT_PAD_S either side.  Nothing new is introduced.
+    """
+    root = require_curated()
+    print(f"[gait] curated root: {root}")
+    specs = [s for s in FULL_SPECS if only is None or s.name == only]
+    sessions = iter_sessions(root)
+    print(f"[gait] profiling {len(sessions)} sessions to pick the same representatives ...")
+    picks = C.select_sessions(profile_all(sessions))
+    by_name = {s.path.name: s for s in sessions}
+    built = []
+    for spec in specs:
+        pick = picks[spec.name]
+        sess = by_name[pick["session"]]
+        c = C.build_oneshot_clip(sess, spec)
+        c.name = f"{spec.name}_GAIT"
+        c.kind = "oneshot"
+        c.meta["gains"] = C.gain_summary(sess)
+        c.meta["selection"] = {k: v for k, v in pick.items() if k != "candidates"}
+        built.append(c)
+        m = c.meta
+        print(f"[gait] {c.name:10s} {c.session:38s} {m['duration_s']:6.2f}s  "
+              f"hi={c.hi['q_des'].shape[0]:5d}  lo={c.lo['q_des'].shape[0]:5d}  "
+              f"pad {m['pad_s']}s either side")
+    global NPZ, META_JSON
+    NPZ, META_JSON = GAIT_NPZ, GAIT_NPZ.with_suffix("").with_suffix(".meta.json")
+    meta = save(built)
+    print(f"[gait] -> {NPZ}  sha256 {meta['npz_sha256'][:16]}…")
     return meta
 
 
@@ -247,11 +290,14 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--clip", default=None, help="WALK / TROT / RUN (default: all three)")
+    ap.add_argument("--gait-window", action="store_true",
+                    help="build <CLIP>_GAIT instead: the motion window uncut, without the "
+                         "standing stretch either side (data/gait_windows.npz)")
     ap.add_argument("--self-test", action="store_true", help="no curated logs needed")
     args = ap.parse_args()
     if args.self_test:
         return self_test()
-    build(args.clip)
+    (build_gait_windows if args.gait_window else build)(args.clip)
     return 0
 
 

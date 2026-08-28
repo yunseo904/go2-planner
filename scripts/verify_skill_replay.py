@@ -792,7 +792,13 @@ def run_isaac(args, clip: dict, meta: dict) -> dict:
     lim = np.asarray([l if l is not None else np.inf for l in limits], dtype=float)
     saturated = float((np.abs(a["tau"]) >= lim[None, :] - 1e-3).mean())
 
-    m = D.gait_from_contact(a["contact"], dt)
+    # Gait numbers come from the FORCE, read the way the logs are read.  The
+    # boolean at args.contact_threshold_n is still recorded in the trace and still
+    # answers "how many feet are loaded right now"; it is just not what a stride is
+    # measured from.  See sim/diagnose.gait_from_force.
+    m = D.gait_from_force(a["contact_f"], dt)
+    m["duty_bare_threshold"] = float(a["contact"].mean())
+    m["stride_hz_bare_threshold"] = D.gait_from_contact(a["contact"], dt)["stride_hz"]
     m.update({
         "vx_mean": float(a["root_lin_vel_b"][:, 0].mean()),
         "vy_mean": float(a["root_lin_vel_b"][:, 1].mean()),
