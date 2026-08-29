@@ -1357,6 +1357,19 @@ def main() -> int:
         report(rows, args.results_csv)
     finally:
         if _SIM_APP is not None:
+            # SimulationApp.close() tears the process down, so an exception on its
+            # way out of this try never reaches stderr: the interpreter is gone
+            # before the traceback is printed, and the run looks like a clean exit 0
+            # that simply stopped talking half way through the report.  Two runs
+            # were spent finding that out.  Print it here, first, then close.
+            exc = sys.exc_info()[1]
+            if exc is not None:
+                import traceback
+                print("[replay] EXCEPTION -- printed here because closing the app below "
+                      "would otherwise take the traceback with it:", file=sys.stderr)
+                traceback.print_exc()
+                sys.stderr.flush()
+                sys.stdout.flush()
             _SIM_APP.close()
     return 0 if all(r["verdict"] != "FAIL" for r in rows) else 1
 
