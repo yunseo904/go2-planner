@@ -1,5 +1,9 @@
 # Why RUN collapses in 1.13 s, and why foot placement does not move it
 
+**Status: unresolved, to be retried. Not closed.** RUN is out of the executable skill
+set (`planner.skills.SUPPORTED`) and the planner refuses it with this reason at
+runtime. §6 lists what would have to be true for it to come back.
+
 Stage 2's foot placement held TROT for 60 cycles and did not change RUN by a single
 control step: 1.13 s either way. That is not a null result to shrug at — it says the
 thing RUN is missing is not foot placement. This is what it is instead.

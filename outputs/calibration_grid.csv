@@ -1,0 +1,7 @@
+argv,family,fell,final_dist_m,grid_cols,grid_rows,level_m,n_probes,param,probe,reached,run_utc,skill,t_reached_s
+--headless --device cpu --max-probes 3 --params skill.STEP_WALK_MAX --results-csv outputs/calibration_grid.csv,step_up,0,0.533492730455319,2,2,0.02,3,skill.STEP_WALK_MAX,step_up_0p02,0,2026-08-29T12:19:19Z,WALK,nan
+--headless --device cpu --max-probes 3 --params skill.STEP_WALK_MAX --results-csv outputs/calibration_grid.csv,step_up,1,1.8466339457657197,2,2,0.04,3,skill.STEP_WALK_MAX,step_up_0p04,0,2026-08-29T12:19:19Z,WALK,nan
+--headless --device cpu --max-probes 3 --params skill.STEP_WALK_MAX --results-csv outputs/calibration_grid.csv,step_up,1,1.4069732227088658,2,2,0.06,3,skill.STEP_WALK_MAX,step_up_0p06,0,2026-08-29T12:19:19Z,WALK,nan
+--headless --device cpu --max-probes 3 --params skill.STEP_WALK_MAX --results-csv outputs/calibration_grid.csv,step_up,0,1.7847435519646908,2,2,0.02,3,skill.STEP_WALK_MAX,step_up_0p02,0,2026-08-29T12:20:48Z,WALK,nan
+--headless --device cpu --max-probes 3 --params skill.STEP_WALK_MAX --results-csv outputs/calibration_grid.csv,step_up,1,1.93937384661328,2,2,0.04,3,skill.STEP_WALK_MAX,step_up_0p04,0,2026-08-29T12:20:48Z,WALK,nan
+--headless --device cpu --max-probes 3 --params skill.STEP_WALK_MAX --results-csv outputs/calibration_grid.csv,step_up,1,2.2300915387093987,2,2,0.06,3,skill.STEP_WALK_MAX,step_up_0p06,0,2026-08-29T12:20:48Z,WALK,nan
