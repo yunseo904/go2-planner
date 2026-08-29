@@ -381,6 +381,8 @@ def run_isaac(args) -> list:
             for f in foots:
                 f.reset()
 
+        # The heading each robot is asked to hold: the one it settled at, per cell.
+        yaw0_deg = quat_to_rpy_deg(snap(robot.data.root_quat_w))[2]
         reached = np.zeros(n, dtype=bool)
         fell = np.zeros(n, dtype=bool)
         t_reached = np.full(n, np.nan)
@@ -395,9 +397,17 @@ def run_isaac(args) -> list:
             if foots is not None:
                 vb = snap(robot.data.root_lin_vel_b)
                 wb = snap(robot.data.root_ang_vel_b)
+                # Heading error per robot against ITS OWN spawn heading, wrapped to
+                # (-180, 180].  Omitting this is not a small mistake: with psi_err left
+                # at its default the heading term is identically zero and --heading
+                # silently does nothing, which is how the first re-run came back
+                # unimproved and looked like the controller had failed.
+                yaw_now = quat_to_rpy_deg(snap(robot.data.root_quat_w))[2]
+                psi = np.radians((yaw_now - yaw0_deg + 180.0) % 360.0 - 180.0)
                 for k in range(n):
                     cmd[k] = cmd[k] + foots[k].step(float(vb[k, 1]), float(wb[k, 2]),
-                                                    swing[k][frames[k]], vx=float(vb[k, 0]))
+                                                    swing[k][frames[k]], vx=float(vb[k, 0]),
+                                                    psi_err_rad=float(psi[k]))
             tgt[:, idx_t] = torch.as_tensor(cmd, device=sim.device, dtype=torch.float32)
             robot.set_joint_position_target(tgt)
             for _ in range(decim):
