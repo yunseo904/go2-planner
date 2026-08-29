@@ -11,8 +11,26 @@ import csv, sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-EXP = {"WALK": (1.3670, 0.1875), "TROT": (1.5554, 0.4437),
-       "RUN": (2.4685, 0.5140), "TURN": (1.1207, 0.0080)}
+
+
+def expectations():
+    """(stride Hz, vx m/s) per clip, from the archive meta -- never hardcoded.
+
+    They were hardcoded once and RUN's stride was copied from a *measured* row
+    instead of the clip's own cycle_hz: 2.47 against the real 3.09, which made a
+    replay that was 20% slow read as exact. The harness's own verdict was never
+    wrong -- it reads expected_from_meta -- but this table was.
+    """
+    import json
+    m = json.loads((ROOT / "data/skill_clips.meta.json").read_text())
+    out = {}
+    for name, c in m["clips"].items():
+        out[name] = (c.get("cycle_hz", float("nan")),
+                     c.get("selection", {}).get("vx_steady_mean", float("nan")))
+    return out
+
+
+EXP = expectations()
 
 
 def f(x, d=float("nan")):
