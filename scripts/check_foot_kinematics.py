@@ -150,9 +150,21 @@ def main() -> int:
               f"at that height, apex ground clearance would be:")
         print("        " + "  ".join(
             f"{leg} {(drop.max() - drop[:, col_for_leg[leg]].min())*1000:5.1f}" for leg in legs))
-        agree = np.mean([(~contact[:, j]) == (lift[:, col_for_leg[l]] > args.lift_thresh_mm / 1000.0)
+        # Kinematic swing, done properly: PER FRAME, across legs.  A foot is in stance
+        # when it is among the lowest -- i.e. its hip-to-foot drop is within a threshold
+        # of the largest drop at that instant.  The earlier version compared each leg
+        # against ITS OWN lowest over the whole clip, which flags most of stance as
+        # swing (the hip-to-foot distance changes as the body passes over a planted
+        # foot) and produced a spurious 51% disagreement.  Same failure shape as the
+        # clearance error: almost the quantity being reasoned about.
+        low = drop.max(axis=1, keepdims=True)          # the lowest foot this frame
+        sw_kin_all = (low - drop) > args.lift_thresh_mm / 1000.0
+        agree = np.mean([(~contact[:, j]) == sw_kin_all[:, col_for_leg[l]]
                          for j, l in enumerate(legs)])
-        print(f"   contact channel vs kinematic swing agree on {100*agree:.1f}% of leg-frames")
+        print(f"   contact channel vs per-frame kinematic swing: agree on "
+              f"{100*agree:.1f}% of leg-frames")
+        print(f"   clip says swing {100*(~contact).mean():.1f}% of leg-frames, "
+              f"kinematics say {100*sw_kin_all.mean():.1f}%")
     return 0
 
 
