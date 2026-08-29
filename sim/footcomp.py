@@ -103,6 +103,9 @@ class FootPlacement:
         self._wz_sum, self._wz_i, self._wz_n, self._wz = 0.0, 0, 0, 0.0
         self.applied = self.cap_hits = 0
         self.max_abs = 0.0
+        self.last_raw_hip = np.zeros(4)
+        self.last_u = np.zeros(12)
+        self.last_cap_hits = self.last_swing_n = 0
 
     # ------------------------------------------------------------------ step
     def step(self, vy: float, wz: float, swing: np.ndarray, vx: float = 0.0,
@@ -178,6 +181,12 @@ class FootPlacement:
 
         self.applied += int(swing.sum())
         self.cap_hits += int((swing & (np.abs(raw_hip) > cap)).sum())
+        # Per-step, not cumulative: cap_hit_frac is a whole-run average and cannot say
+        # whether saturation changed at a particular moment (a lip, a switch).  These
+        # two are read by traces and by nothing else -- they do not feed the law.
+        self.last_raw_hip = np.where(swing, raw_hip, 0.0)
+        self.last_cap_hits = int((swing & (np.abs(raw_hip) > cap)).sum())
+        self.last_swing_n = int(swing.sum())
 
         # The open-loop steering probes go on AFTER the feedback term so the two add
         # rather than one overwriting the other, and they are NOT clipped -- the bias
@@ -187,6 +196,7 @@ class FootPlacement:
             if self.hip_y_m is not None:
                 u[1::3] += np.where(swing, self.len_bias * np.sign(self.hip_y_m), 0.0)
         self.max_abs = max(self.max_abs, float(np.abs(u).max()))
+        self.last_u = u.copy()
         return u
 
     @property

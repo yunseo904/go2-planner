@@ -265,6 +265,16 @@ def run_isaac(args) -> list:
         xf.AddTranslateOp().Set(Gf.Vec3d(float(spawns[k][0]), float(spawns[k][1]), 0.0))
     robot_cfg = UNITREE_GO2_CFG.replace(prim_path="/World/envs/env_.*/Robot")
     robot = Articulation(robot_cfg)
+    # Contact reporting covers EVERY link, not just the feet.  The question a step
+    # failure asks is which part of the robot is touching the obstacle -- if only the
+    # feet were instrumented, a shin hitting the lip would read as no contact at all,
+    # which is the answer that would be most wrong.
+    contacts = None
+    if args.trace_full:
+        from isaaclab.sensors import ContactSensor, ContactSensorCfg
+        contacts = ContactSensor(ContactSensorCfg(
+            prim_path="/World/envs/env_.*/Robot/.*", history_length=0,
+            track_air_time=False, update_period=0.0))
     sim.reset()
     print(f"[grid] articulation instances: {robot.num_instances} (want {n})")
     if robot.num_instances != n:
@@ -355,7 +365,7 @@ def run_isaac(args) -> list:
             hcap = 0.0
             if args.heading != "off" and c["name"] != "TURN":
                 yaw_mode = args.heading
-                hcap = HEADING_CAP.get(c["name"], 0.0)
+                hcap = args.heading_cap or HEADING_CAP.get(c["name"], 0.0)
             foots.append(FootPlacement(
                 t_stance_s=stance_time_s(c["contact"], c["fs"]), lever_m=lever,
                 hip_x_m=hxy[:, 0], hip_y_m=hxy[:, 1], vy_log=vy_log, wz_log=wz_log,
@@ -419,6 +429,10 @@ def run_isaac(args) -> list:
         fell = np.zeros(n, dtype=bool)
         t_reached = np.full(n, np.nan)
         tr = {"root_pos_w": [], "root_quat_w": [], "foot_z": []} if args.trace_npz else None
+        if tr is not None and args.trace_full:
+            tr.update({k: [] for k in ("body_pos_w", "contact_f_w", "torque", "q",
+                                       "q_cmd", "foot_u", "swing", "raw_hip",
+                                       "cap_hits", "lin_vel_b")})
         print(f"[grid] rep {rep+1}/{args.reps}: entry frames {ent[:6]}"
               f"{'...' if n > 6 else ''}, settled |v| max "
               f"{float(torch.linalg.norm(robot.data.root_lin_vel_b, dim=1).max().item()):.3f} m/s")
@@ -451,6 +465,24 @@ def run_isaac(args) -> list:
                 tr["root_pos_w"].append(pos.copy())
                 tr["root_quat_w"].append(snap(robot.data.root_quat_w))
                 tr["foot_z"].append(snap(robot.data.body_pos_w[:, foot_ids_t, 2]))
+            if tr is not None and args.trace_full:
+                contacts.update(dt)
+                tr["body_pos_w"].append(snap(robot.data.body_pos_w))
+                tr["contact_f_w"].append(snap(contacts.data.net_forces_w))
+                tr["torque"].append(snap(robot.data.applied_torque[:, idx_t]))
+                tr["q"].append(snap(robot.data.joint_pos[:, idx_t]))
+                tr["q_cmd"].append(cmd.copy())
+                tr["lin_vel_b"].append(snap(robot.data.root_lin_vel_b))
+                tr["swing"].append(np.stack([swing[k][frames[k]] for k in range(n)]))
+                if foots is not None:
+                    tr["foot_u"].append(np.stack([f.last_u for f in foots]))
+                    tr["raw_hip"].append(np.stack([f.last_raw_hip for f in foots]))
+                    tr["cap_hits"].append(np.array([[f.last_cap_hits, f.last_swing_n]
+                                                    for f in foots]))
+                else:
+                    tr["foot_u"].append(np.zeros((n, 12)))
+                    tr["raw_hip"].append(np.zeros((n, 4)))
+                    tr["cap_hits"].append(np.zeros((n, 2), dtype=int))
             d = np.linalg.norm(pos[:, :2] - goal2, axis=1)
             newly = (~reached) & (d < GOAL_RADIUS_M) & (step <= budget_steps)
             t_reached[newly] = step * dt
@@ -481,6 +513,10 @@ def run_isaac(args) -> list:
                 skill=np.array([r[1] for r in runs]),
                 level_m=np.array([r[4] for r in runs]),
                 spawn=spawns, goal2=goal2, offsets=offsets,
+                body_names=np.array(robot.body_names),
+                contact_body_names=np.array(contacts.body_names if contacts is not None else []),
+                joint_names=np.array([robot.joint_names[j] for j in idx_t.tolist()]),
+                foot_body_idx=np.array(foot_ids_t),
                 **{k: np.asarray(v) for k, v in tr.items()})
             print(f"[grid] trace -> {out}  ({len(tr['root_pos_w'])} steps x {n} robots)")
 
@@ -571,6 +607,13 @@ def main() -> int:
     ap.add_argument("--skip-unsupported", action="store_true",
                     help="drop probes whose skill the low level cannot execute (RUN/JUMP)")
     ap.add_argument("--results-csv", default=None)
+    ap.add_argument("--heading-cap", type=float, default=0.0,
+                    help="override the per-skill heading cap (rad) for every skill. 0 = use "
+                         "the HEADING_CAP table. For measuring whether a cap is what binds.")
+    ap.add_argument("--trace-full", action="store_true",
+                    help="record contact-force VECTORS on every link, joint torques, per-link "
+                         "positions and the per-step foot-placement correction, not just the "
+                         "root pose. For diagnosing a failure, not for scoring a grid.")
     ap.add_argument("--trace-npz", default=None,
                     help="dump rep 0's per-step base pose and foot heights for every "
                          "robot, so a failure can be located on the probe rather than "

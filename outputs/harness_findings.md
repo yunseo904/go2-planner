@@ -333,3 +333,21 @@ mean says.
 Defect 5 also shows the cost asymmetry. 1–4 waste minutes. 5 hands you a plausible,
 specific, internally consistent explanation pointing at the wrong subsystem — and
 `server_day1.md`'s own branch table would have routed the reader straight into it.
+
+## 10. `ContactSensor.net_forces_w` reports the normal component only
+
+Measured, not assumed. On flat ground during normal walking the total horizontal contact
+force reads `sd(Fx) = 0.00 N` and is exactly zero in 48.5% of frames, while the base's own
+acceleration over the same window requires `m·sd(a_x) = 8.43 N` of friction. The vertical
+channel is sound over the same data — total Fz gives an implied mass of 15.25 kg against
+the robot's 15.0 kg, and non-foot links read exactly 0 N while the ground is flat.
+
+So this channel answers "which link is touching, and how hard is it being pressed" and
+does **not** answer "which way is the ground pushing". Any propulsion, traction, slip or
+friction-cone question needs a different instrument — base acceleration (`m·a`), or joint
+torque against the contact Jacobian.
+
+The check that caught it is the cheap one and should be run before trusting any new
+channel: take a quantity the channel implies, compute the same quantity from an
+independent signal, and require them to agree. Mean Fz vs `m·g` agreed to 2%; sd(Fx) vs
+`m·sd(a_x)` disagreed by everything.
