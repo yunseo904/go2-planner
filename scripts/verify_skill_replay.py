@@ -723,6 +723,39 @@ def run_isaac(args, clip: dict, meta: dict, then_clip: dict | None = None,
     # control and must reproduce --plant-comp off exactly.
     q_des_signed = clip["q_des"] * sign
     comp_offset = np.zeros(12, dtype=np.float64)
+    if args.plant_comp == "height":
+        # The body sits BELOW the clip's own stance geometry from the first step -- not a
+        # drift, measured flat from 1 s onward -- because kp 40 sags under load: the
+        # commanded stance hip-to-foot drop is 338 mm (WALK) and the achieved is 297.
+        # Deficits: WALK 39.5 mm, TROT 45.5, TURN 28.2 (outputs/stance_height.json).
+        #
+        # The correction lengthens the leg with THIGH and CALF, in the ratio that moves
+        # the foot straight DOWN and leaves its fore-aft position alone -- solved as a
+        # 2x2 from a numerical Jacobian at each clip's own mean stance pose. Widening the
+        # stance is what the earlier plant compensation did and it cost a third of the
+        # forward speed; this deliberately does not touch the hip, which is also the
+        # joint foot placement and heading hold use, so the three do not fight for the
+        # same actuator.
+        #
+        # alpha is in units of the SOLVED deficit: 1.0 asks for the whole of it. The
+        # Jacobian is kinematic and the sag is a load effect, so what alpha actually buys
+        # in base height is not 1:1 and is measured per run rather than assumed.
+        import json as _json
+        rec = _json.loads(Path(args.stance_height_json).read_text())[clip["name"]]
+        for k, leg in enumerate(clip["leg_order"]):
+            dth, dca = rec["offset_rad"][leg]
+            comp_offset[3 * k + 1] = args.plant_comp_alpha * dth
+            comp_offset[3 * k + 2] = args.plant_comp_alpha * dca
+        q_des_signed = q_des_signed + comp_offset
+        print(f"[replay] *** PLANT COMPENSATION --plant-comp height "
+              f"--plant-comp-alpha {args.plant_comp_alpha:g}: thigh and calf are offset to "
+              f"stand the body at the clip's own stance geometry, {np.mean(rec['deficit_mm']):.1f} mm "
+              f"higher. Constant, no feedback, hips untouched. This is NOT the recording as "
+              f"played elsewhere and every number below is stamped with it. The archive on "
+              f"disk is unchanged. ***")
+        for k, leg in enumerate(clip["leg_order"]):
+            print(f"[replay]   {leg}: thigh {comp_offset[3*k+1]:+.4f}, calf "
+                  f"{comp_offset[3*k+2]:+.4f} rad  (deficit {rec['deficit_mm'][k]:.1f} mm)")
     if args.plant_comp == "stance":
         _, env_pose, _ = ucfg.ordered(clip["leg_order"], clip["joint_order"])
         hip_default = np.asarray(env_pose, dtype=float)[0::3]
@@ -1659,12 +1692,19 @@ def main() -> int:
     ap.add_argument("--balance-clip-rad", type=float, default=0.30,
                     help="hard limit on the correction, so a diverging loop cannot be reported "
                          "as a gait; the hip range is +-1.047 rad")
-    ap.add_argument("--plant-comp", choices=("off", "stance"), default="off",
+    ap.add_argument("--stance-height-json", default="outputs/stance_height.json",
+                    help="per-clip stance-height deficit and the solved thigh/calf offset, "
+                         "from scripts/check_stance_height.py")
+    ap.add_argument("--plant-comp", choices=("off", "stance", "height"), default="off",
                     help="off (default): play the recording as stored. stance: shift the hip "
                          "DC level toward the env's init_state.joint_pos, correcting the "
                          "~0.17 rad stance-width difference between the sport controller's "
                          "stand and this fork's default. Constant offset, no feedback, archive "
-                         "untouched; banner printed and stamped into the results row.")
+                         "untouched; banner printed and stamped into the results row. "
+                         "height: offset thigh and calf so the body stands at the clip's own "
+                         "stance geometry, correcting the 28-46 mm the PD sags under load. "
+                         "Does not touch the hip, so it does not fight foot placement or "
+                         "heading hold for the same joint.")
     ap.add_argument("--plant-comp-alpha", type=float, default=1.0,
                     help="how much of the stance difference to take out: 0 = none (the null "
                          "control, must equal --plant-comp off), 0.5 = half, 1 = all of it")
