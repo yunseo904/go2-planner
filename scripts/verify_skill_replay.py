@@ -464,6 +464,110 @@ def deviation_report(foot_u: np.ndarray, q_meas: np.ndarray, q_orig: np.ndarray,
     return rows, summ
 
 
+
+
+def swing_lift_offsets(robot, sim, idx_t, clip, target_m, phys_dt, eps=0.02, sign=None):
+    """Per-frame thigh/calf offsets that raise each swing foot to ``target_m`` at its apex.
+
+    The real robot's ``classic_walk`` lifts its rear feet about 5 mm and its front ones
+    12-29 mm (outputs/achieved_clearance.md); Unitree's own ``footRaiseHeight`` default is
+    0.08 m.  This raises the clip's swing arc to a chosen apex rather than waiting for a
+    re-recording, which is the supervisor's decision, and it is applied at replay time
+    only -- the archive is not touched.
+
+    Shape.  Height is added over each swing bout as ``A * sin^2(pi * phase)``: zero at
+    liftoff and at touchdown, zero SLOPE at both, peak at mid-swing.  The endpoints are
+    where stride length and forward speed live, so leaving them untouched is what keeps
+    this from being a speed edit.  ``A`` is per leg per bout, ``target - the apex that leg
+    already has``, so a leg that already clears the target is left alone.
+
+    Geometry from ``q``, not ``q_des``.  The commanded stream is not a pose the robot can
+    hold (outputs/commanded_angles.md), so the existing apex is measured from the achieved
+    angles, against the CHORD joining that bout's liftoff and touchdown feet -- which is
+    the height a step cares about and is independent of trunk attitude.
+
+    Joints.  The vertical displacement is turned into thigh and calf offsets by a
+    numerical Jacobian solved per frame for (dz = lift, dx = 0), so the foot goes straight
+    up and its fore-aft position is unchanged.  The HIP is not used: that is foot
+    placement's and heading hold's joint, and the two must not compete for it.
+    """
+    import torch
+    from sim.replay import quat_rotate_inv, snap
+
+    foot_ids, foot_names = robot.find_bodies(".*_foot")
+    fcol = {n.split("_")[0]: i for i, n in enumerate(foot_names)}
+    legs = clip["leg_order"]
+    q_ach = np.asarray(clip["q"], dtype=np.float32)
+    if sign is not None:
+        q_ach = q_ach * sign
+    contact = np.asarray(clip["contact"], dtype=bool)
+    n = len(q_ach)
+    air = robot.data.default_root_state.clone()
+    air[:, 2] = 1.5
+
+    def feet_at(qv):
+        qj = robot.data.default_joint_pos.clone()
+        qj[:, idx_t] = torch.as_tensor(np.asarray(qv, np.float32), device=robot.device,
+                                       dtype=torch.float32)
+        robot.write_root_state_to_sim(air)
+        robot.write_joint_state_to_sim(qj, torch.zeros_like(qj))
+        robot.write_data_to_sim(); sim.step(); robot.update(phys_dt)
+        bq = snap(robot.data.root_quat_w[0]); bpos = snap(robot.data.root_pos_w[0])
+        bp = snap(robot.data.body_pos_w[0])
+        return np.array([quat_rotate_inv(bq[None, :], (bp[foot_ids[fcol[l]]] - bpos)[None, :])[0]
+                         for l in legs])
+
+    fpos = np.stack([feet_at(q_ach[i]) for i in range(n)])       # (n, 4, 3)
+
+    def bouts(mask):
+        d = np.diff(np.concatenate([[False], mask, [False]]).astype(np.int8))
+        return list(zip(np.flatnonzero(d == 1), np.flatnonzero(d == -1)))
+
+    lift = np.zeros((n, 4))
+    report = {}
+    for j, leg in enumerate(legs):
+        sw = ~contact[:, j]
+        # A cyclic clip can start mid-swing; roll so a bout is not cut at the seam.
+        apexes, added = [], []
+        for a, b in bouts(sw):
+            if b - a < 3:
+                continue
+            p0, p1 = fpos[a, j], fpos[b - 1, j]
+            t = np.linspace(0.0, 1.0, b - a)
+            chord_z = p0[2] + (p1[2] - p0[2]) * t
+            h = fpos[a:b, j, 2] - chord_z            # height above the liftoff/touchdown chord
+            apex = float(h.max())
+            apexes.append(apex)
+            need = max(0.0, target_m - apex)
+            added.append(need)
+            lift[a:b, j] = need * np.sin(np.pi * t) ** 2
+        report[leg] = {"apex_existing_mm": [round(a * 1000, 1) for a in apexes],
+                       "added_mm": [round(a * 1000, 1) for a in added]}
+
+    # --- vertical displacement -> (thigh, calf), per frame, foot straight up
+    off = np.zeros((n, 12))
+    for i in range(n):
+        if not lift[i].any():
+            continue
+        f0 = fpos[i]
+        d = np.zeros(12, dtype=np.float32); d[1::3] = eps
+        f_th = feet_at(q_ach[i] + d)
+        d = np.zeros(12, dtype=np.float32); d[2::3] = eps
+        f_ca = feet_at(q_ach[i] + d)
+        for j in range(4):
+            if lift[i, j] <= 0:
+                continue
+            A = np.array([[(f_th[j, 2] - f0[j, 2]) / eps, (f_ca[j, 2] - f0[j, 2]) / eps],
+                          [(f_th[j, 0] - f0[j, 0]) / eps, (f_ca[j, 0] - f0[j, 0]) / eps]])
+            try:
+                sol = np.linalg.solve(A, np.array([lift[i, j], 0.0]))
+            except np.linalg.LinAlgError:
+                continue
+            off[i, 3 * j + 1] = sol[0]
+            off[i, 3 * j + 2] = sol[1]
+    return off, report, lift
+
+
 def _log_motion_for(meta: dict, clip: str) -> tuple:
     """The lateral speed and YAW RATE the log measured for this clip's session.
 
@@ -722,7 +826,24 @@ def run_isaac(args, clip: dict, meta: dict, then_clip: dict | None = None,
     # and thigh and calf entirely, are the recording's.  alpha 0 is the null
     # control and must reproduce --plant-comp off exactly.
     q_des_signed = clip["q_des"] * sign
+    q_des_untouched = q_des_signed.copy()      # deviation baseline: before ANY edit
     comp_offset = np.zeros(12, dtype=np.float64)
+    lift_off = np.zeros_like(q_des_signed, dtype=np.float64)
+    lift_report = {}
+    if args.swing_lift > 0:
+        lift_off, lift_report, lift_z = swing_lift_offsets(
+            robot, sim, idx_t, clip, args.swing_lift / 1000.0, phys_dt, sign=sign)
+        q_des_signed = q_des_signed + lift_off
+        print(f"[replay] *** SWING LIFT --swing-lift {args.swing_lift:g} mm: each swing "
+              f"foot's arc is raised to that apex above its own liftoff/touchdown chord, "
+              f"as A*sin^2(pi*phase) so both ends and both end SLOPES are unchanged. "
+              f"Stance is untouched and so is the hip. This EDITS THE RECORDING and every "
+              f"number below is stamped with it. The archive on disk is unchanged. ***")
+        for leg, r in lift_report.items():
+            print(f"[replay]   {leg}: apex already {r['apex_existing_mm']} mm, "
+                  f"adding {r['added_mm']} mm")
+        print(f"[replay]   joint offsets: thigh max {np.abs(lift_off[:, 1::3]).max():.4f} rad, "
+              f"calf max {np.abs(lift_off[:, 2::3]).max():.4f} rad")
     if args.plant_comp == "height":
         # The body sits BELOW the clip's own stance geometry from the first step -- not a
         # drift, measured flat from 1 s onward -- because kp 40 sags under load: the
@@ -1320,8 +1441,14 @@ def run_isaac(args, clip: dict, meta: dict, then_clip: dict | None = None,
     # How far the run departed from the recording it is a replay of.  This is the
     # deliverable of stage 2, not a diagnostic: the constraint that was released is
     # "keep the recorded trajectory", and what replaces it is a measured budget.
-    q_orig_np = q_cmd.detach().cpu().numpy()[: a["q"].shape[0]]
-    dev_rows, dev_summ = deviation_report(a["foot_u"], a["q"], q_orig_np, a["swing"],
+    # The baseline is the clip as stored, before plant compensation and before the swing
+    # lift -- otherwise an edit that is applied to q_des before the run would report a
+    # deviation of zero, which is the opposite of what "how far from the original" means.
+    n_meas = a["q"].shape[0]
+    q_orig_np = np.tile(q_des_untouched, (reps, 1))[:n_meas]
+    q_cmd_np = q_cmd.detach().cpu().numpy()[:n_meas]
+    edit_total = (q_cmd_np - q_orig_np) + a["foot_u"]      # every edit, per step per joint
+    dev_rows, dev_summ = deviation_report(edit_total, a["q"], q_orig_np, a["swing"],
                                           clip["leg_order"], clip["joint_order"])
     for r in dev_rows:
         r.update({"clip": clip["name"], "foot_comp": args.foot_comp,
@@ -1407,6 +1534,9 @@ def run_isaac(args, clip: dict, meta: dict, then_clip: dict | None = None,
         "foot_vx_des": float(clip_par_seq[0, 1]),
         "foot_cap_hit_frac": (fc_cap_hits / fc_applied) if fc_applied else 0.0,
         "tag": args.tag,
+        "swing_lift_mm": args.swing_lift,
+        "swing_lift_thigh_max_rad": float(np.abs(lift_off[:, 1::3]).max()),
+        "swing_lift_calf_max_rad": float(np.abs(lift_off[:, 2::3]).max()),
         **dev_summ,
         "hip_offset_rad_max": float(np.abs(comp_offset).max()),
         "run_utc": _RUN_UTC,
@@ -1692,6 +1822,13 @@ def main() -> int:
     ap.add_argument("--balance-clip-rad", type=float, default=0.30,
                     help="hard limit on the correction, so a diverging loop cannot be reported "
                          "as a gait; the hip range is +-1.047 rad")
+    ap.add_argument("--swing-lift", type=float, default=0.0,
+                    help="raise every swing foot's arc to this apex in MILLIMETRES above "
+                         "its own liftoff/touchdown chord. 0 (default) plays the recording. "
+                         "80 is Unitree's own footRaiseHeight default, so it restores a "
+                         "documented value rather than tuning one. Endpoints and their "
+                         "slopes are untouched, so stride and speed are not being edited; "
+                         "stance and the hip are untouched too.")
     ap.add_argument("--stance-height-json", default="outputs/stance_height.json",
                     help="per-clip stance-height deficit and the solved thigh/calf offset, "
                          "from scripts/check_stance_height.py")

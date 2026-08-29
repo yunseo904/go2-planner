@@ -283,6 +283,20 @@ def run_isaac(args) -> list:
     idx_t = torch.as_tensor([robot.joint_names.index(nm) for nm in want],
                             device=sim.device, dtype=torch.long)
 
+    # ---- swing lift, the same edit the flat sweep uses, resolved once per CLIP ------
+    if args.swing_lift > 0:
+        from verify_skill_replay import swing_lift_offsets
+        lift_by_clip = {}
+        for name, c in clips.items():
+            off, rep_, _ = swing_lift_offsets(robot, sim, idx_t, c,
+                                              args.swing_lift / 1000.0, phys_dt)
+            lift_by_clip[name] = off
+            print(f"[grid] swing lift {args.swing_lift:g} mm on {name}: "
+                  + ", ".join(f"{l} +{r['added_mm']}" for l, r in rep_.items()))
+        q_seq = [q + lift_by_clip[r[1]] for q, r in zip(q_seq, runs)]
+        print(f"[grid] *** SWING LIFT ON: the recording's swing arcs are raised. Stance and "
+              f"the hip are untouched; the archive on disk is unchanged. ***")
+
     # Put every robot at its own cell's spawn, at the env's spawn height.
     root = robot.data.default_root_state.clone()
     root[:, :3] = torch.as_tensor(origins, device=sim.device, dtype=root.dtype) + \
@@ -454,6 +468,7 @@ def run_isaac(args) -> list:
                              "fell": int(fell[k]), "final_dist_m": float(dist[k]),
                              "grid_rows": rows, "grid_cols": cols, "n_probes": n,
                              "foot_comp": args.foot_comp, "steps": step + 1,
+                             "swing_lift_mm": args.swing_lift,
                              "run_utc": _RUN_UTC, "argv": " ".join(sys.argv[1:])})
         print(f"[grid]   rep {rep+1}: reached {int(reached.sum())}/{n}, "
               f"fell {int(fell.sum())}/{n}, {step+1} steps")
@@ -548,6 +563,9 @@ def main() -> int:
     ap.add_argument("--budget-slack", type=float, default=2.0,
                     help="budget = distance / skill speed x this. 2.0 gives a gait twice "
                          "the time a straight-line traverse needs.")
+    ap.add_argument("--swing-lift", type=float, default=0.0,
+                    help="raise every swing foot's arc to this apex in mm, the same edit "
+                         "scripts/verify_skill_replay.py --swing-lift applies")
     ap.add_argument("--heading", choices=("off", "heading", "heading-only"), default="off",
                     help="hold the spawn heading with differential lateral foot placement")
     ap.add_argument("--skip-unsupported", action="store_true",
