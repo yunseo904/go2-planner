@@ -112,3 +112,62 @@ The real robot is level in all three; the sim holds 1.5–3.2° of pitch on the 
 targets. Same family as the stance-width and ground-friction mismatches. Its direction is
 *opposite* to what would explain the rear clearance — −3.25° raises the rear hips 11 mm —
 so it is recorded rather than corrected.
+
+
+---
+
+# Resolved: the premise was wrong, and the compensation should stay off
+
+Two measurements close this out.
+
+## The real robot's rear feet are also low
+
+Achieved angles (`q`, not `q_des`) through the same air-held pipeline, clearance against
+the plane the stance feet define:
+
+| | FL | FR | RL | RR |
+|---|---|---|---|---|
+| **real robot** | 29.0 | 11.9 | **4.9** | **11.4** mm |
+| sim replay | 35.7 | 19.6 | 1.9 | −2.1 mm |
+
+**It is that kind of walk.** `classic_walk` lifts its rear feet about 5–11 mm and its front
+feet 12–29 mm, and the replay reproduces that to the same order. The sim is not failing to
+reproduce the gait; the gait has very little rear-foot lift.
+
+So **WALK's 2 cm step limit is a real property of the skill**, not an artefact — the
+original conclusion, restored on evidence that survives the checks the first version
+failed.
+
+## And the sim is not sitting low
+
+| clip | real `body_height` | sim base, α=0 | sim base, α=0.5 |
+|---|---|---|---|
+| WALK | **311.2 mm** | 316.0 | 348.8 |
+| TROT | 317.5 | 333.5 | — |
+| TURN | 319.9 | 342.0 | — |
+
+The sim already stands **at or slightly above** the real robot in all three clips. There
+was never a height deficit against the plant; the 28–46 mm was measured against the
+*commanded* stance geometry, which `outputs/commanded_angles.md` shows is not a
+configuration the robot can hold.
+
+`--plant-comp height` at α=0.5 pushes WALK to 348.8 mm — **38 mm above the real robot**.
+It corrects toward a number that does not exist and makes the plant mismatch worse.
+
+## Recommendation: leave it off
+
+- Its original purpose (rear clearance) is gone: common-mode, measured.
+- Its remaining justification ("closer to the real robot") is now **backwards**.
+- α=1 destabilises all three clips.
+- The one thing in its favour — vx 0.231 → 0.268 — is an unexplained side effect of
+  standing taller, not a reason, and taking it would be tuning toward a number we like.
+
+The code stays: it is banner-printed, stamped, α=0 is an exact null, and it is the right
+instrument if a body-height question ever has a real target. It is **not** enabled by
+default and `outputs/height_comp.csv` records what it does.
+
+## What this leaves open
+
+The deficit between commanded and achieved leg extension is real and identical in kind on
+both robots (~40 mm of PD sag). It is not a defect. It only matters because it makes
+`q_des` unusable as geometry — which is now written down.
