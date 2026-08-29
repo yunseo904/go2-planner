@@ -226,6 +226,22 @@ def load_clip(name: str, rate: str = "lo", archive: Path | None = None) -> dict:
 _PER_FRAME = ("t", "q_des", "dq_des", "tau_ff", "q", "dq", "kp", "kd", "contact", "q_des_valid")
 
 
+def stance_time_s(clip: dict) -> float:
+    """Mean stance duration per cycle, from the clip's own contact channel.
+
+    A cyclic clip spans exactly one gait cycle by construction, so the fraction of
+    frames a leg is loaded for, times the cycle's length, is that leg's stance
+    time.  This is the ``T_stance`` the Raibert neutral point is defined against
+    and it is MEASURED -- duty x period, both from the recording -- so the foot
+    placement law's leading term carries no free parameter.  Cross-check for TROT:
+    duty_clip 0.577 x cycle 0.643 s = 0.371 s, against 0.369 s from the meta's
+    duty_mean / stride_hz.
+    """
+    c = np.asarray(clip["contact"], dtype=float)
+    cycle_s = c.shape[0] / float(clip["fs"])
+    return float(c.mean() * cycle_s)
+
+
 def quiescent_start(clip: dict) -> tuple[int, dict]:
     """Pick the phase of a cyclic clip to begin the replay at.
 
@@ -385,6 +401,77 @@ def expected_from_meta(meta: dict, clip: str) -> dict:
         "position_controlled": c["gains"]["position_controlled"],
         "kind": c["kind"],
     }
+
+
+def deviation_report(foot_u: np.ndarray, q_meas: np.ndarray, q_orig: np.ndarray,
+                     swing: np.ndarray, legs: list, joints: list) -> tuple:
+    """How far this run departed from the recording, per joint and per gait phase.
+
+    Two different departures, kept apart because they answer different questions:
+
+    ``cmd``   what the compensator OVERWROTE -- the correction added to the
+              commanded angle.  This is the quantity the supervisor's release is
+              spent on: "how far from the original do you have to go before it
+              stands up".  By construction it is nonzero only on the hip columns
+              and only in swing, so the zeros in the table are a claim being
+              checked, not padding.
+    ``meas``  what the JOINT ACTUALLY DID against what the recording commanded.
+              Nonzero everywhere even with the compensator off -- a PD tracking a
+              trajectory under load always lags -- so it is reported next to the
+              off run rather than on its own.
+
+    Split by the recording's own swing/stance labels for the leg the joint belongs
+    to, because a deviation while the foot is in the air and the same deviation
+    while it is carrying the robot are not the same event.
+    """
+    n = min(len(foot_u), len(q_meas), len(q_orig), len(swing))
+    u, qm, qo, sw = foot_u[:n], q_meas[:n], q_orig[:n], swing[:n].astype(bool)
+    dm = qm - qo
+    rows, summ = [], {}
+    rms = lambda x: float(np.sqrt(np.mean(np.square(x)))) if x.size else float("nan")
+    for k, leg in enumerate(legs):
+        for j, jn in enumerate(joints):
+            col = 3 * k + j
+            for phase, mask in (("swing", sw[:, k]), ("stance", ~sw[:, k])):
+                rows.append({
+                    "leg": leg, "joint": jn, "phase": phase,
+                    "n_steps": int(mask.sum()),
+                    "cmd_rms_rad": rms(u[mask, col]),
+                    "cmd_max_rad": float(np.abs(u[mask, col]).max()) if mask.any() else float("nan"),
+                    "meas_rms_rad": rms(dm[mask, col]),
+                    "meas_max_rad": float(np.abs(dm[mask, col]).max()) if mask.any() else float("nan"),
+                })
+    # Roll-ups: by joint type x phase, which is the shape the result is read in.
+    for j, jn in enumerate(joints):
+        cols = np.arange(3 * len(legs))[j::3]
+        for phase in ("swing", "stance"):
+            mask = np.stack([sw[:, k] if phase == "swing" else ~sw[:, k]
+                             for k in range(len(legs))], axis=1)
+            sel_u = np.concatenate([u[mask[:, k], cols[k]] for k in range(len(legs))])
+            sel_m = np.concatenate([dm[mask[:, k], cols[k]] for k in range(len(legs))])
+            summ[f"dev_cmd_rms_{jn}_{phase}"] = rms(sel_u)
+            summ[f"dev_meas_rms_{jn}_{phase}"] = rms(sel_m)
+    touched = np.abs(u) > 1e-6
+    summ["dev_cmd_max_rad"] = float(np.abs(u).max())
+    summ["overwrite_frac_time"] = float(touched.any(axis=1).mean())
+    summ["overwrite_frac_legsteps"] = float(touched[:, 0::3].mean())
+    summ["swing_frac"] = float(sw.mean())
+    return rows, summ
+
+
+def _vx_des_for(meta: dict, clip: str) -> float:
+    """The forward speed the LOG measured for this clip, or nan.
+
+    The foot placement law needs a velocity target and CLAUDE.md 3 is explicit
+    that the commanded speed and the achieved speed are different numbers
+    (``move x=1.5-2.0`` produced 0.48 m/s).  So the target is the log's own
+    steady-state measurement, never the command that produced it, and never a
+    number chosen to make the sim look better.
+    """
+    try:
+        return float(meta["clips"][clip]["selection"]["vx_steady_mean"])
+    except (KeyError, TypeError, ValueError):
+        return float("nan")
 
 
 # --------------------------------------------------------------------------- #
@@ -624,16 +711,28 @@ def run_isaac(args, clip: dict, meta: dict, then_clip: dict | None = None,
     # new skill.  The size of that jump is measured and reported rather than
     # smoothed away, because a discontinuity the PD cannot follow is a real cost of
     # switching and hiding it would flatter the result.
+    # Each entry carries, beyond the command channels, the two things the foot
+    # placement law needs per step and which are properties of the CLIP rather than
+    # of the run: the recording's own swing/stance schedule, and its measured
+    # stance time and forward speed.  They travel in the sequence so a run that
+    # plays two clips uses each clip's own numbers rather than the first one's --
+    # the same defect the per-segment gait gate was fixed for.
+    def _par(e, m_rows):
+        return np.tile(np.array([[stance_time_s(e), _vx_des_for(meta, e["name"])]]), (m_rows, 1))
+
     seq = [("A", clip["name"], np.tile(q_des_signed, (reps, 1)),
             np.tile(clip["tau_ff"] * sign, (reps, 1)),
-            np.tile(clip["kp"], (reps, 1)), np.tile(clip["kd"], (reps, 1)))]
+            np.tile(clip["kp"], (reps, 1)), np.tile(clip["kd"], (reps, 1)),
+            np.tile(clip["contact"], (reps, 1)), _par(clip, reps * n))]
     seams = []
     if args.then_clip:
         seq[0] = ("A", clip["name"],
                   np.tile(q_des_signed, (args.switch_after_cycles, 1)),
                   np.tile(clip["tau_ff"] * sign, (args.switch_after_cycles, 1)),
                   np.tile(clip["kp"], (args.switch_after_cycles, 1)),
-                  np.tile(clip["kd"], (args.switch_after_cycles, 1)))
+                  np.tile(clip["kd"], (args.switch_after_cycles, 1)),
+                  np.tile(clip["contact"], (args.switch_after_cycles, 1)),
+                  _par(clip, args.switch_after_cycles * n))
         for role, extra, ncyc, hold_s in (("VIA", via_clip, None, args.via_s),
                                           ("B", then_clip, args.then_cycles, None)):
             if extra is None:
@@ -654,7 +753,9 @@ def run_isaac(args, clip: dict, meta: dict, then_clip: dict | None = None,
             seq.append((role, e["name"], qs,
                         np.tile(e["tau_ff"] * sign, (m, 1))[:n_keep],
                         np.tile(e["kp"], (m, 1))[:n_keep],
-                        np.tile(e["kd"], (m, 1))[:n_keep]))
+                        np.tile(e["kd"], (m, 1))[:n_keep],
+                        np.tile(e["contact"], (m, 1))[:n_keep],
+                        _par(e, n_keep)))
         off = 0
         for i, (role, nm, qs, *_rest) in enumerate(seq):
             if i:
@@ -672,6 +773,8 @@ def run_isaac(args, clip: dict, meta: dict, then_clip: dict | None = None,
     tau_ff = torch.as_tensor(np.concatenate([x[3] for x in seq]), device=sim.device, dtype=torch.float32)
     kp_seq = np.concatenate([x[4] for x in seq])
     kd_seq = np.concatenate([x[5] for x in seq])
+    clip_contact_seq = np.concatenate([x[6] for x in seq]).astype(bool)   # (total, 4)
+    clip_par_seq = np.concatenate([x[7] for x in seq])                    # (total, 2)
 
     # ------------------------------------------------------------------ settle
     # The initial condition is not a formality here: it decides the verdict.  The
@@ -773,7 +876,7 @@ def run_isaac(args, clip: dict, meta: dict, then_clip: dict | None = None,
         video["frames"] += 1
 
     rec = {k: [] for k in ("q", "tau", "root_lin_vel_b", "root_ang_vel_b", "root_pos_w", "contact",
-                           "root_quat_w", "contact_f", "foot_pos_w")}
+                           "root_quat_w", "contact_f", "foot_pos_w", "foot_u", "swing")}
     foot_ids, foot_names = foot_body_ids(robot)   # articulation indices, not sensor indices
     terminated_s, term_reason, gain_writes, clipped = None, "", 0, 0
     # ------------------------------------------------------- balance compensation
@@ -807,6 +910,93 @@ def run_isaac(args, clip: dict, meta: dict, then_clip: dict | None = None,
     bc_thigh_t = torch.as_tensor(bc_thigh.astype(np.float32), device=sim.device)
     bc_max = 0.0
 
+    # ------------------------------------------- foot placement, Raibert (stage 2)
+    # Stage 1 (--balance-comp pd) moved WHERE THE BODY IS and did not hold any of
+    # these gaits; the reading it left was that for a trot what holds the robot up
+    # is where the next foot LANDS.  This is that, and it is the first thing here
+    # that is allowed to overwrite the recording: the supervisor has released the
+    # constraint that the played trajectory stay the recorded one, on condition
+    # that the skill stays the same skill.  So the recording is no longer the
+    # output -- it is the BASELINE, and how far a run has to depart from it before
+    # it stands up is the measurement (see the deviation table below).
+    #
+    # The law, lateral first, because roll is what diverges and left-right foot
+    # position is what has authority over roll:
+    #
+    #     foot_y = (T_stance / 2) * v_y  +  k * (v_y - v_y_target),  v_y_target = 0
+    #
+    # The leading term is the neutral point -- the place a foot has to land for the
+    # stance to be symmetric about the body at the speed it is actually going -- and
+    # it has NO free parameter: T_stance is duty x period measured from the clip's
+    # own contact channel (stance_time_s).  ``--foot-k`` adds velocity damping on
+    # top and defaults to 0, so the default law is the parameter-free one.
+    #
+    # Joint mapping.  Every Go2 hip rotates about +x, so a positive hip angle moves
+    # that foot toward +y whichever side it is on (which is why the zero-action pose
+    # is +0.1/-0.1/+0.1/-0.1 for outboard).  The lever is then exactly the hip-to-foot
+    # VERTICAL drop: y_foot = y_hip + L sin(q), so dy/dq = L cos(q) = z_hip - z_foot.
+    # It is measured once, here, from the robot's own body positions after the
+    # settle, and printed -- proprioception and geometry, no terrain and no depth.
+    #
+    # Swing only.  A correction is added to a leg's hip target for the frames the
+    # RECORDING has that leg in the air; a loaded leg keeps the recording exactly.
+    # That means the correction is released the moment the clip's schedule says the
+    # foot is down, which is a discontinuity of at most --foot-clip-rad and is
+    # deliberately not smoothed: the cap is the quantity being swept, so it must
+    # also bound every edit the run makes.
+    #
+    # This CLOSES A LOOP on the base's lateral velocity.  A run with it on is not an
+    # open-loop replay, exactly as --balance-comp is not, and is banner-printed and
+    # stamped for the same reason.
+    fc_on = args.foot_comp != "off"
+    fc_lever = np.full(4, np.nan)
+    fc_sensor_col = None
+    fc_vy = fc_vx = 0.0
+    fc_alpha = 1.0
+    fc_cap_hits = fc_applied = 0
+    u_foot = np.zeros(12, dtype=np.float32)
+    if fc_on:
+        hip_ids, hip_names = robot.find_bodies(".*_hip")
+        h_by = {n.split("_")[0]: i for i, n in zip(hip_ids, hip_names)}
+        f_by = {n.split("_")[0]: i for i, n in zip(foot_ids, foot_names)}
+        missing = [l for l in clip["leg_order"] if l not in h_by or l not in f_by]
+        if missing:
+            raise SystemExit(f"[replay] cannot build the foot placement lever: no hip/foot "
+                             f"body for {missing} (hips {hip_names}, feet {foot_names})")
+        bp = snap(robot.data.body_pos_w[0])
+        for k, leg in enumerate(clip["leg_order"]):
+            fc_lever[k] = float(bp[h_by[leg], 2] - bp[f_by[leg], 2])
+        if not np.all(fc_lever > 0.05):
+            raise SystemExit(f"[replay] hip-to-foot drop {fc_lever} is not a usable lever; "
+                             f"the robot is not standing on the pose the correction is "
+                             f"linearised about. Refusing to report numbers.")
+        if args.foot_swing_source == "sim":
+            cn = [str(x) for x in getattr(contacts, "body_names", [])]
+            c_by = {n.split("_")[0]: i for i, n in enumerate(cn)}
+            if any(l not in c_by for l in clip["leg_order"]):
+                raise SystemExit(f"--foot-swing-source sim needs the contact sensor's body "
+                                 f"names to identify legs; it reports {cn}")
+            # The sensor's body order is NOT the articulation's and NOT the clip's
+            # (harness_findings.md 5). Resolve it by name or not at all.
+            fc_sensor_col = np.array([c_by[l] for l in clip["leg_order"]], dtype=int)
+        if args.foot_vel_filter_hz > 0:
+            fc_alpha = float(1.0 - np.exp(-2 * np.pi * args.foot_vel_filter_hz * dt))
+        print(f"[replay] *** FOOT PLACEMENT --foot-comp {args.foot_comp} axis={args.foot_axis} "
+              f"k={args.foot_k:g}s cap={args.foot_clip_rad:g} rad sign={args.foot_sign:+g}: "
+              f"a Raibert lateral foot-placement term is added to the SWING legs' hip "
+              f"targets. THIS CLOSES A LOOP on base lateral velocity and it OVERWRITES "
+              f"the recording. The run below is not an open-loop replay and its departure "
+              f"from the clip is measured, not assumed. The archive on disk is unchanged. ***")
+        print(f"[replay]   T_stance (clip, measured) {clip_par_seq[0, 0]:.3f} s -> neutral-point "
+              f"gain {0.5 * clip_par_seq[0, 0]:.3f} s; vx target (log) {clip_par_seq[0, 1]:.3f} m/s")
+        print("[replay]   hip->foot lever: " + ", ".join(
+            f"{leg} {fc_lever[k]:.3f} m" for k, leg in enumerate(clip["leg_order"]))
+            + f"  (cap {args.foot_clip_rad:g} rad = "
+              f"{args.foot_clip_rad * float(np.mean(fc_lever)) * 1000:.0f} mm of foot travel)")
+        print(f"[replay]   swing source: {args.foot_swing_source}"
+              + (f", velocity low-pass {args.foot_vel_filter_hz:g} Hz (alpha {fc_alpha:.3f})"
+                 if args.foot_vel_filter_hz > 0 else ", velocity unfiltered"))
+
     wall_per_step = dt * args.slowdown if args.slowdown > 1.0 else 0.0
     if wall_per_step:
         print(f"[replay] pacing playback at 1/{args.slowdown:g} real time "
@@ -839,6 +1029,39 @@ def run_isaac(args, clip: dict, meta: dict, then_clip: dict | None = None,
             u_thigh = float(np.clip(u_thigh, -args.balance_clip_rad, args.balance_clip_rad))
             bc_max = max(bc_max, abs(u_hip), abs(u_thigh))
             cmd_i = cmd_i + bc_hip_t * u_hip + bc_thigh_t * u_thigh
+        u_foot[:] = 0.0
+        # The recording's own swing/stance schedule, phase-locked to the frame being
+        # played.  Recorded whether or not the compensator is on, so an off run
+        # carries the same phase labels the deviation table is split by.
+        swing_now = ~clip_contact_seq[i]
+        if fc_on:
+            vb = robot.data.root_lin_vel_b[0]
+            fc_vy += fc_alpha * (float(vb[1].item()) - fc_vy)
+            fc_vx += fc_alpha * (float(vb[0].item()) - fc_vx)
+            t_st, vx_des = float(clip_par_seq[i, 0]), float(clip_par_seq[i, 1])
+            gain = 0.5 * t_st + args.foot_k
+            dy = gain * (fc_vy - args.foot_vy_target)
+            dx = (gain * (fc_vx - vx_des)
+                  if args.foot_axis == "xy" and np.isfinite(vx_des) else 0.0)
+            if args.foot_swing_source == "sim":
+                fnow = snap(contacts.data.net_forces_w[0].norm(dim=-1))
+                swing_now = fnow[fc_sensor_col] <= args.contact_threshold_n
+            swing = swing_now
+            # +hip moves the foot toward +y on every leg, so the same sign serves
+            # all four; the thigh is the other way round (+thigh swings the foot
+            # backward), hence the minus on dx.
+            raw_hip = args.foot_sign * dy / fc_lever
+            raw_thigh = -args.foot_sign * dx / fc_lever
+            # NOT `cap`: that name is the Capabilities record this run's mode was
+            # resolved against, and shadowing it made the whole result block raise
+            # after every number in it had already been computed.
+            fc_cap = args.foot_clip_rad
+            u_foot[0::3] = np.where(swing, np.clip(raw_hip, -fc_cap, fc_cap), 0.0)
+            if args.foot_axis == "xy":
+                u_foot[1::3] = np.where(swing, np.clip(raw_thigh, -fc_cap, fc_cap), 0.0)
+            fc_applied += int(swing.sum())
+            fc_cap_hits += int((swing & (np.abs(raw_hip) > fc_cap)).sum())
+            cmd_i = cmd_i + torch.as_tensor(u_foot, device=sim.device, dtype=torch.float32)
         tgt[:, idx_t] = cmd_i
         robot.set_joint_position_target(tgt)
         if mode.needs_effort:
@@ -866,6 +1089,11 @@ def run_isaac(args, clip: dict, meta: dict, then_clip: dict | None = None,
         rec["contact_f"].append(snap(f))
         rec["root_quat_w"].append(snap(robot.data.root_quat_w[0]))
         rec["foot_pos_w"].append(snap(robot.data.body_pos_w[0, foot_ids]))
+        # What this step overwrote, and which legs the gate called swing.  Recorded
+        # per step rather than reconstructed afterwards: the swing gate can come
+        # from the sim's own contacts, which no replay of the clip can recover.
+        rec["foot_u"].append(u_foot.copy())
+        rec["swing"].append(np.asarray(swing_now, dtype=bool).copy())
         if video is not None and i % args.video_stride == 0:
             grab_frame()
         # Height alone does not detect a fall.  A Go2 lying on its side keeps its
@@ -913,6 +1141,31 @@ def run_isaac(args, clip: dict, meta: dict, then_clip: dict | None = None,
     lim = np.asarray([l if l is not None else np.inf for l in limits], dtype=float)
     saturated = float((np.abs(a["tau"]) >= lim[None, :] - 1e-3).mean())
 
+    # How far the run departed from the recording it is a replay of.  This is the
+    # deliverable of stage 2, not a diagnostic: the constraint that was released is
+    # "keep the recorded trajectory", and what replaces it is a measured budget.
+    q_orig_np = q_cmd.detach().cpu().numpy()[: a["q"].shape[0]]
+    dev_rows, dev_summ = deviation_report(a["foot_u"], a["q"], q_orig_np, a["swing"],
+                                          clip["leg_order"], clip["joint_order"])
+    for r in dev_rows:
+        r.update({"clip": clip["name"], "foot_comp": args.foot_comp,
+                  "foot_k": args.foot_k, "foot_clip_rad": args.foot_clip_rad,
+                  "foot_axis": args.foot_axis, "foot_sign": args.foot_sign,
+                  "run_utc": _RUN_UTC, "tag": args.tag})
+    print(f"-- departure from the recording ({clip['name']}, "
+          f"--foot-comp {args.foot_comp}) --")
+    print(f"   {'joint':6s} {'cmd RMS swing':>14s} {'cmd RMS stance':>15s} "
+          f"{'meas RMS swing':>15s} {'meas RMS stance':>16s}   (rad)")
+    for jn in clip["joint_order"]:
+        print(f"   {jn:6s} {dev_summ[f'dev_cmd_rms_{jn}_swing']:14.4f} "
+              f"{dev_summ[f'dev_cmd_rms_{jn}_stance']:15.4f} "
+              f"{dev_summ[f'dev_meas_rms_{jn}_swing']:15.4f} "
+              f"{dev_summ[f'dev_meas_rms_{jn}_stance']:16.4f}")
+    print(f"   overwritten: {dev_summ['overwrite_frac_time']:.1%} of control steps, "
+          f"{dev_summ['overwrite_frac_legsteps']:.1%} of leg-steps "
+          f"(swing is {dev_summ['swing_frac']:.1%} of leg-steps); "
+          f"largest edit {dev_summ['dev_cmd_max_rad']:.4f} rad")
+
     # Gait numbers come from the FORCE, read the way the logs are read.  The
     # boolean at args.contact_threshold_n is still recorded in the trace and still
     # answers "how many feet are loaded right now"; it is just not what a stride is
@@ -957,6 +1210,22 @@ def run_isaac(args, clip: dict, meta: dict, then_clip: dict | None = None,
         "balance_kd_pitch": bc_kd_pitch if args.balance_comp != "off" else 0.0,
         "balance_max_rad": bc_max,
         "plant_comp_alpha": args.plant_comp_alpha if args.plant_comp != "off" else 0.0,
+        # Foot placement (stage 2).  Every knob is a column: a cap sweep is only
+        # readable if the row says which cap produced it.
+        "foot_comp": args.foot_comp,
+        "foot_axis": args.foot_axis if fc_on else "",
+        "foot_k": args.foot_k if fc_on else 0.0,
+        "foot_clip_rad": args.foot_clip_rad if fc_on else 0.0,
+        "foot_sign": args.foot_sign if fc_on else 0,
+        "foot_vy_target": args.foot_vy_target if fc_on else 0.0,
+        "foot_swing_source": args.foot_swing_source if fc_on else "",
+        "foot_vel_filter_hz": args.foot_vel_filter_hz if fc_on else 0.0,
+        "foot_lever_m": float(np.mean(fc_lever)) if fc_on else 0.0,
+        "foot_t_stance_s": float(clip_par_seq[0, 0]),
+        "foot_vx_des": float(clip_par_seq[0, 1]),
+        "foot_cap_hit_frac": (fc_cap_hits / fc_applied) if fc_applied else 0.0,
+        "tag": args.tag,
+        **dev_summ,
         "hip_offset_rad_max": float(np.abs(comp_offset).max()),
         "run_utc": _RUN_UTC,
         "argv": " ".join(sys.argv[1:]),
@@ -1012,6 +1281,7 @@ def run_isaac(args, clip: dict, meta: dict, then_clip: dict | None = None,
                      "yaw_rate_deg_s": float(np.degrees(a["root_ang_vel_b"][lo:hi_, 2].mean()))})
     m["_segments"] = segs
 
+    m["_dev_rows"] = dev_rows
     m["_q_measured"] = a["q"]
     m["_q_commanded"] = np.tile(q_des_signed, (reps, 1))[: a["q"].shape[0]]
     return m
@@ -1249,6 +1519,49 @@ def main() -> int:
     ap.add_argument("--plant-comp-alpha", type=float, default=1.0,
                     help="how much of the stance difference to take out: 0 = none (the null "
                          "control, must equal --plant-comp off), 0.5 = half, 1 = all of it")
+    ap.add_argument("--foot-comp", choices=("off", "raibert"), default="off",
+                    help="off (default): the swing legs play the recording. raibert: add a "
+                         "lateral foot-placement term to the SWING legs' hip targets, "
+                         "foot_y = (T_stance/2) v_y + k (v_y - v_y_target), with T_stance "
+                         "measured from the clip's own contact channel. Stance legs keep the "
+                         "recording. This CLOSES A LOOP on base lateral velocity and it "
+                         "OVERWRITES the recording; both are banner-printed and stamped, and "
+                         "how far it departed is measured into the results row.")
+    ap.add_argument("--foot-axis", choices=("y", "xy"), default="y",
+                    help="y (default): lateral only -- roll is what diverges and left/right "
+                         "foot position is what has authority over it. xy: also correct "
+                         "fore-aft on the thigh, toward the LOG's measured forward speed "
+                         "(not the command that produced it).")
+    ap.add_argument("--foot-k", type=float, default=0.0,
+                    help="velocity-error gain, in seconds, on top of the neutral point. "
+                         "0 (default) leaves the parameter-free law: the (T_stance/2) v term "
+                         "alone, whose only input is measured from the clip.")
+    ap.add_argument("--foot-clip-rad", type=float, default=0.10,
+                    help="hard cap on the correction, per joint, in radians. This is the "
+                         "sweep knob: it bounds how far a run is allowed to depart from the "
+                         "recording, so raising it until the gait holds is the measurement "
+                         "'how much of the trajectory has to be overwritten'.")
+    ap.add_argument("--foot-sign", type=float, choices=(1.0, -1.0), default=1.0,
+                    help="direction of the correction. +1 is the one the geometry says "
+                         "(+hip moves the foot toward +y on every leg); -1 exists because "
+                         "stage 1's stabilising sign turned out not to be the one reasoning "
+                         "about the joint frame predicted, so it is settled by measurement.")
+    ap.add_argument("--foot-vy-target", type=float, default=0.0,
+                    help="lateral velocity the placement aims for. 0 by design: the clips are "
+                         "straight-line gaits and the log's own vy is ~0.")
+    ap.add_argument("--foot-swing-source", choices=("clip", "sim"), default="clip",
+                    help="which leg counts as swinging. clip (default): the recording's own "
+                         "contact channel, phase-locked and identical run to run. sim: the "
+                         "contact sensor, resolved to legs BY NAME.")
+    ap.add_argument("--foot-vel-filter-hz", type=float, default=0.0,
+                    help="first-order low-pass on the base velocity the law reads. 0 (default) "
+                         "is unfiltered.")
+    ap.add_argument("--dev-csv", default=None,
+                    help="write the per-leg/per-joint/per-phase departure-from-the-recording "
+                         "table here (one file, appended, same lock as --results-csv)")
+    ap.add_argument("--tag", default="",
+                    help="free-text label carried into every row, so a sweep point can be "
+                         "found again without parsing argv")
     ap.add_argument("--hold-s", type=float, default=0.0,
                     help="render the scene, without advancing physics, for this many "
                          "seconds before playback starts and again after it ends. For "
@@ -1340,6 +1653,9 @@ def main() -> int:
             offs = None
             F = D.diagnose(m, exp, mapping=ranked, offsets=offs)
             segs = m.pop("_segments", [])
+            dev = m.pop("_dev_rows", [])
+            if args.dev_csv and dev:
+                report(dev, args.dev_csv)
             if len(segs) > 1:
                 print(f"-- {name} sequence, per segment --")
                 for sg in segs:
