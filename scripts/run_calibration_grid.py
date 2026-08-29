@@ -225,7 +225,13 @@ def run_isaac(args) -> list:
     importer = TerrainImporter(ti_cfg)
     importer.import_mesh("probes", mesh)
     origins = np.concatenate([spawns, np.full((n, 1), 0.0)], axis=1)
-    importer.configure_env_origins(origins)
+    # NOT importer.configure_env_origins(origins): in Isaac Lab 3.0 that call expects a
+    # generator-shaped (rows, cols, 3) grid and, given a flat (N, 3) list, takes the
+    # curriculum path and indexes it with terrain_levels/terrain_types.  With exactly
+    # three probes the (3, 3) array made that fancy indexing succeed and return nonsense,
+    # so the smoke passed and the 72-probe run raised IndexError -- a shape coincidence
+    # standing in for a check.  Every robot's pose is written explicitly below, which is
+    # what actually places them, so the importer does not need to own the origins.
     print(f"[grid] terrain: {len(V)} vertices, {len(F)} faces, {n} cells in a {rows}x{cols} grid")
 
     # One robot per cell.  The prims are created first and then a SINGLE Articulation
@@ -319,56 +325,142 @@ def run_isaac(args) -> list:
     swing = [~np.asarray(c["contact"], dtype=bool) for c in per_robot_clip]
 
     n_steps = int(args.time_budget_s / dt)
-    reached = np.zeros(n, dtype=bool)
-    fell = np.zeros(n, dtype=bool)
-    t_reached = np.full(n, np.nan)
+
+    # Repeats have to vary something, and physics here does not vary: the friction is
+    # fixed at the env's midpoint rather than sampled per episode, so five identical
+    # repeats of a deterministic sim give five identical rows.  The original protocol's
+    # reps assumed the env's per-episode randomisation, which this harness deliberately
+    # does not do.
+    #
+    # What IS arbitrary is where in its cycle a clip starts -- whoever cut the clip chose
+    # frame 0 -- so rep r enters every clip at frame round(r * n / reps).  A step limit
+    # that only holds at one entry phase is not a limit, which is exactly what a repeat
+    # is supposed to find out.
+    def entry_frames(rep: int) -> list:
+        return [int(round(rep * len(q) / max(args.reps, 1))) % len(q) for q in q_seq]
     goal2 = np.array([probes["goals"][i][1] for i in idx]) + offsets     # world frame
-
-    print(f"[grid] stepping {n_steps} control steps ({args.time_budget_s:.0f} s) for all "
-          f"{n} probes together")
-    for step in range(n_steps):
-        tgt = robot.data.default_joint_pos.clone()
-        frames = [step % len(q_seq[k]) for k in range(n)]
-        cmd = np.stack([q_seq[k][frames[k]] for k in range(n)])
-        if foots is not None:
-            vb = snap(robot.data.root_lin_vel_b)
-            wb = snap(robot.data.root_ang_vel_b)
-            for k in range(n):
-                cmd[k] = cmd[k] + foots[k].step(float(vb[k, 1]), float(wb[k, 2]),
-                                                swing[k][frames[k]], vx=float(vb[k, 0]))
-        tgt[:, idx_t] = torch.as_tensor(cmd, device=sim.device, dtype=torch.float32)
-        robot.set_joint_position_target(tgt)
-        for _ in range(decim):
-            robot.write_data_to_sim(); sim.step(); robot.update(phys_dt)
-
-        p = snap(robot.data.root_pos_w)[:, :2]
-        z = snap(robot.data.root_pos_w)[:, 2]
-        d = np.linalg.norm(p - goal2, axis=1)
-        newly = (~reached) & (d < GOAL_RADIUS_M)
-        t_reached[newly] = step * dt
-        reached |= newly
-        fell |= z < FALL_HEIGHT_M
-        if reached.all() or fell.all():
-            break
-
     rows_out = []
-    print(f"\n  {'k':>3s} {'probe':16s} {'skill':6s} {'param m':>8s} {'reached':>8s} "
-          f"{'t_s':>6s} {'fell':>5s} {'dist m':>7s}")
-    p = snap(robot.data.root_pos_w)[:, :2]
-    dist = np.linalg.norm(p - goal2, axis=1)
+
+    for rep in range(max(args.reps, 1)):
+        ent = entry_frames(rep)
+        # Re-place and re-settle on the SAME scene.  No prim is created or destroyed
+        # between repeats, which is the whole reason this harness exists.
+        robot.write_root_state_to_sim(root)
+        q_ent = q_stand.clone()
+        q_ent[:, idx_t] = torch.as_tensor(
+            np.stack([q_seq[k][ent[k]] for k in range(n)]),
+            device=sim.device, dtype=torch.float32)
+        robot.write_joint_state_to_sim(q_stand, torch.zeros_like(q_stand))
+        _hold(q_stand, n_settle)
+        for j in range(1, n_settle + 1):
+            _hold(q_stand * (1 - j / n_settle) + q_ent * (j / n_settle), 1)
+        if foots is not None:
+            for f in foots:
+                f.reset()
+
+        reached = np.zeros(n, dtype=bool)
+        fell = np.zeros(n, dtype=bool)
+        t_reached = np.full(n, np.nan)
+        print(f"[grid] rep {rep+1}/{args.reps}: entry frames {ent[:6]}"
+              f"{'...' if n > 6 else ''}, settled |v| max "
+              f"{float(torch.linalg.norm(robot.data.root_lin_vel_b, dim=1).max().item()):.3f} m/s")
+
+        for step in range(n_steps):
+            tgt = robot.data.default_joint_pos.clone()
+            frames = [(ent[k] + step) % len(q_seq[k]) for k in range(n)]
+            cmd = np.stack([q_seq[k][frames[k]] for k in range(n)])
+            if foots is not None:
+                vb = snap(robot.data.root_lin_vel_b)
+                wb = snap(robot.data.root_ang_vel_b)
+                for k in range(n):
+                    cmd[k] = cmd[k] + foots[k].step(float(vb[k, 1]), float(wb[k, 2]),
+                                                    swing[k][frames[k]], vx=float(vb[k, 0]))
+            tgt[:, idx_t] = torch.as_tensor(cmd, device=sim.device, dtype=torch.float32)
+            robot.set_joint_position_target(tgt)
+            for _ in range(decim):
+                robot.write_data_to_sim(); sim.step(); robot.update(phys_dt)
+
+            pos = snap(robot.data.root_pos_w)
+            d = np.linalg.norm(pos[:, :2] - goal2, axis=1)
+            newly = (~reached) & (d < GOAL_RADIUS_M)
+            t_reached[newly] = step * dt
+            reached |= newly
+            fell |= pos[:, 2] < FALL_HEIGHT_M
+            if reached.all() or fell.all():
+                break
+
+        dist = np.linalg.norm(snap(robot.data.root_pos_w)[:, :2] - goal2, axis=1)
+        for k, (param, skill, family, i, level) in enumerate(runs):
+            rows_out.append({"param": param, "skill": skill, "family": family,
+                             "probe": probes["names"][i], "level_m": level, "rep": rep,
+                             "entry_frame": ent[k],
+                             "reached": int(reached[k]), "t_reached_s": t_reached[k],
+                             "fell": int(fell[k]), "final_dist_m": float(dist[k]),
+                             "grid_rows": rows, "grid_cols": cols, "n_probes": n,
+                             "foot_comp": args.foot_comp, "steps": step + 1,
+                             "run_utc": _RUN_UTC, "argv": " ".join(sys.argv[1:])})
+        print(f"[grid]   rep {rep+1}: reached {int(reached.sum())}/{n}, "
+              f"fell {int(fell.sum())}/{n}, {step+1} steps")
+
+    # -- the protocol's own reduction: a level passes only if EVERY repeat passed ----
+    print(f"\n  {'probe':16s} {'skill':6s} {'param m':>8s} {'passed':>10s}  reps")
     for k, (param, skill, family, i, level) in enumerate(runs):
-        print(f"  {k:3d} {probes['names'][i]:16s} {skill:6s} {level:8.3f} "
-              f"{str(bool(reached[k])):>8s} {t_reached[k]:6.2f} {str(bool(fell[k])):>5s} "
-              f"{dist[k]:7.2f}")
-        rows_out.append({"param": param, "skill": skill, "family": family,
-                         "probe": probes["names"][i], "level_m": level,
-                         "reached": int(reached[k]), "t_reached_s": t_reached[k],
-                         "fell": int(fell[k]), "final_dist_m": float(dist[k]),
-                         "grid_rows": rows, "grid_cols": cols, "n_probes": n,
-                         "run_utc": _RUN_UTC, "argv": " ".join(sys.argv[1:])})
-    print(f"\n  reached {int(reached.sum())}/{n}, fell {int(fell.sum())}/{n}, "
-          f"in one scene and {step+1} control steps")
+        mine = [r for r in rows_out if r["probe"] == probes["names"][i] and r["param"] == param]
+        got = sum(r["reached"] for r in mine)
+        print(f"  {probes['names'][i]:16s} {skill:6s} {level:8.3f} {got:5d}/{len(mine):<4d}  "
+              + "".join("R" if r["reached"] else ("F" if r["fell"] else ".") for r in mine))
+    print("\n  R = reached goal 2, F = fell, . = neither inside the time budget")
+    print(config_patch(rows_out))
     return rows_out
+
+
+def config_patch(rows: list) -> str:
+    """Turn the per-repeat rows into the config values, using the existing protocol.
+
+    Reuses ``run_calibration.thresholds_from_rows`` rather than re-deriving the rule,
+    so the grid harness and the per-episode one reduce identical data identically:
+    the reported limit is the top of the unbroken run of levels that passed on EVERY
+    repeat, minus one level of margin.  A limit that works four repeats in five is a
+    limit the planner will walk off.
+    """
+    from run_calibration import thresholds_from_rows
+    adapted = [{"parameter": r["param"], "level_m": r["level_m"], "rep": r["rep"],
+                "passed": r["reached"], "family": r["family"], "skill": r["skill"]}
+               for r in rows]
+    try:
+        ths = thresholds_from_rows(adapted)
+    except Exception as exc:                                    # pragma: no cover
+        return f"(threshold reduction failed: {type(exc).__name__}: {exc})"
+    L = ["", "=" * 78, "CONFIG PATCH -- proposed values, not applied", "=" * 78, "",
+         f"  {'parameter':26s} {'skill':6s} {'value':>8s} {'top all-pass':>13s} "
+         f"{'first fail':>11s}  monotone"]
+    fmt = lambda x: f"{x:8.3f}" if isinstance(x, (int, float)) else f"{'none':>8s}"
+    for t in ths:
+        L.append(f"  {t.parameter:26s} {t.skill:6s} {fmt(t.value_m)} "
+                 f"{fmt(t.highest_all_pass_m):>13s} {fmt(t.first_failure_m):>11s}  {t.monotone}")
+    L += ["", "  apply by editing planner/config.py:", ""]
+    any_value = False
+    for t in ths:
+        field = t.parameter.split(".", 1)[1]
+        if isinstance(t.value_m, (int, float)):
+            any_value = True
+            L.append(f"    {field}: float = {t.value_m:.3f}")
+        else:
+            L.append(f"    # {field}: NO VALUE -- no level passed every repeat "
+                     f"({t.note or 'the lowest probe already failed'})")
+    if not any_value:
+        L.append("")
+        L.append("    Nothing to apply: not one level of any family passed all repeats, so")
+        L.append("    the limits are below the smallest probe or the protocol did not")
+        L.append("    measure what it meant to. Read the per-probe table above before")
+        L.append("    touching config.py.")
+    L += ["", "  and move each one's _p() provenance from CALIBRATION_NEEDED to MEASURED,",
+          "  citing outputs/calibration_grid.csv and this run's run_utc.",
+          "",
+          "  NOT applied automatically: a threshold becoming a planner guarantee is a",
+          "  decision, and a non-monotone column means the probe family did not behave",
+          "  like a ladder and the number should not be read as a limit at all."]
+    return "\n".join(L)
 
 
 def main() -> int:
