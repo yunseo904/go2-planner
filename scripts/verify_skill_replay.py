@@ -53,6 +53,7 @@ from terrain_toolkit.paths import (
     REPLAY_RESULTS_CSV,
     SKILL_CLIPS_META_JSON,
     SKILL_CLIPS_NPZ,
+    SKILL_PROFILE_CSV,
 )
 
 # --------------------------------------------------------------------------- #
@@ -397,6 +398,10 @@ def expected_from_meta(meta: dict, clip: str) -> dict:
         "stride_hz": c.get("cycle_hz", np.nan),
         "duty": c.get("duty_clip", np.nan),
         "vx_mean": sel.get("vx_steady_mean", np.nan),
+        # The yaw rate the recording actually had, in deg/s, so a turn is judged against
+        # its own turn and not against zero.  nan when the profile table is absent, which
+        # diagnose() reads as "no expectation" and falls back to the straight-line test.
+        "yaw_rate_deg_s": float(np.degrees(_log_motion_for(meta, clip)[1])),
         "flight_frac": c.get("flight_frac", sel.get("flight_frac", np.nan)),
         "position_controlled": c["gains"]["position_controlled"],
         "kind": c["kind"],
@@ -457,6 +462,36 @@ def deviation_report(foot_u: np.ndarray, q_meas: np.ndarray, q_orig: np.ndarray,
     summ["overwrite_frac_legsteps"] = float(touched[:, 0::3].mean())
     summ["swing_frac"] = float(sw.mean())
     return rows, summ
+
+
+def _log_motion_for(meta: dict, clip: str) -> tuple:
+    """The lateral speed and YAW RATE the log measured for this clip's session.
+
+    Returned as ``(v_y, omega_z)`` in m/s and rad/s, or ``(nan, nan)`` if the
+    profile table is not on disk.  Read from ``outputs/skill_profile.csv`` by the
+    session name the archive meta records, so nothing is re-extracted and nothing
+    is chosen: TURN's target comes out as omega_z = -0.3954 rad/s (-22.7 deg/s),
+    which is the recording's own steady turn rate and NOT the -0.6 rad/s that was
+    commanded to produce it (CLAUDE.md 3: command is not measurement).
+
+    This is what makes an in-place turn's foot placement well posed. For a body
+    rotating at omega about its own centre, the hip at body-frame offset
+    (x_i, y_i) is itself moving: v_i = v_base + omega x r_i, so the lateral
+    velocity that hip SHOULD have is v_y + omega * x_i -- forward hips one way,
+    rear hips the other. Driving every foot to v_y = 0 fights the turn instead of
+    supporting it, which is what the -37% stride on TURN was.
+    """
+    import csv
+    sess = meta["clips"][clip].get("session")
+    if not sess or not SKILL_PROFILE_CSV.is_file():
+        return float("nan"), float("nan")
+    try:
+        for r in csv.DictReader(open(SKILL_PROFILE_CSV)):
+            if r.get("session") == sess:
+                return (float(r["vy_steady_mean"]), float(r["yaw_rate_steady_mean"]))
+    except (KeyError, ValueError, OSError):
+        pass
+    return float("nan"), float("nan")
 
 
 def _vx_des_for(meta: dict, clip: str) -> float:
@@ -718,7 +753,13 @@ def run_isaac(args, clip: dict, meta: dict, then_clip: dict | None = None,
     # plays two clips uses each clip's own numbers rather than the first one's --
     # the same defect the per-segment gait gate was fixed for.
     def _par(e, m_rows):
-        return np.tile(np.array([[stance_time_s(e), _vx_des_for(meta, e["name"])]]), (m_rows, 1))
+        vy_log, wz_log = _log_motion_for(meta, e["name"])
+        # Column 4 is the clip's cycle length IN CONTROL STEPS.  A cyclic clip spans
+        # exactly one gait cycle, so it is the averaging window that removes the
+        # within-stride oscillation from a rate signal without introducing a cutoff
+        # frequency to tune.
+        return np.tile(np.array([[stance_time_s(e), _vx_des_for(meta, e["name"]),
+                                  vy_log, wz_log, float(len(e["q_des"]))]]), (m_rows, 1))
 
     seq = [("A", clip["name"], np.tile(q_des_signed, (reps, 1)),
             np.tile(clip["tau_ff"] * sign, (reps, 1)),
@@ -949,13 +990,24 @@ def run_isaac(args, clip: dict, meta: dict, then_clip: dict | None = None,
     # open-loop replay, exactly as --balance-comp is not, and is banner-printed and
     # stamped for the same reason.
     fc_on = args.foot_comp != "off"
+    # The two OPEN-LOOP steering probes.  They add a constant differential offset to the
+    # swing legs and read nothing back, so a run with one of them on is still an
+    # open-loop replay plus a constant edit -- the same category as --plant-comp, not the
+    # same category as --foot-comp.  They exist because "can differential foot placement
+    # steer this robot, and how hard?" is a question about the ACTUATOR, and a closed
+    # loop that fails answers it only ambiguously.  Measure the gain, then decide whether
+    # a controller is worth building on it.
+    fc_bias = abs(args.foot_yaw_bias) > 0 or abs(args.foot_len_bias) > 0
+    fc_geo = fc_on or fc_bias
     fc_lever = np.full(4, np.nan)
+    fc_hip_xy = np.zeros((4, 2))
     fc_sensor_col = None
-    fc_vy = fc_vx = 0.0
+    fc_vy = fc_vx = fc_wz = 0.0
+    fc_wz_buf, fc_wz_sum, fc_wz_i, fc_wz_n = None, 0.0, 0, 0
     fc_alpha = 1.0
     fc_cap_hits = fc_applied = 0
     u_foot = np.zeros(12, dtype=np.float32)
-    if fc_on:
+    if fc_geo:
         hip_ids, hip_names = robot.find_bodies(".*_hip")
         h_by = {n.split("_")[0]: i for i, n in zip(hip_ids, hip_names)}
         f_by = {n.split("_")[0]: i for i, n in zip(foot_ids, foot_names)}
@@ -966,6 +1018,17 @@ def run_isaac(args, clip: dict, meta: dict, then_clip: dict | None = None,
         bp = snap(robot.data.body_pos_w[0])
         for k, leg in enumerate(clip["leg_order"]):
             fc_lever[k] = float(bp[h_by[leg], 2] - bp[f_by[leg], 2])
+        # Where each hip sits on the body, in the BODY frame.  This is the lever the
+        # yaw-rate term acts through: a body turning at omega carries the hip at
+        # (x_i, y_i) sideways at omega * x_i, so front and rear hips need opposite
+        # lateral placement to support the same turn.  Taken from the articulation's
+        # own body positions, rotated out of world by the base quaternion -- measured
+        # geometry, no constant typed in.
+        from sim.replay import quat_rotate_inv
+        base_p = snap(robot.data.root_pos_w[0])
+        base_q = snap(robot.data.root_quat_w[0])
+        for k, leg in enumerate(clip["leg_order"]):
+            fc_hip_xy[k] = quat_rotate_inv(base_q[None, :], (bp[h_by[leg]] - base_p)[None, :])[0, :2]
         if not np.all(fc_lever > 0.05):
             raise SystemExit(f"[replay] hip-to-foot drop {fc_lever} is not a usable lever; "
                              f"the robot is not standing on the pose the correction is "
@@ -981,18 +1044,45 @@ def run_isaac(args, clip: dict, meta: dict, then_clip: dict | None = None,
             fc_sensor_col = np.array([c_by[l] for l in clip["leg_order"]], dtype=int)
         if args.foot_vel_filter_hz > 0:
             fc_alpha = float(1.0 - np.exp(-2 * np.pi * args.foot_vel_filter_hz * dt))
-        print(f"[replay] *** FOOT PLACEMENT --foot-comp {args.foot_comp} axis={args.foot_axis} "
-              f"k={args.foot_k:g}s cap={args.foot_clip_rad:g} rad sign={args.foot_sign:+g}: "
-              f"a Raibert lateral foot-placement term is added to the SWING legs' hip "
-              f"targets. THIS CLOSES A LOOP on base lateral velocity and it OVERWRITES "
-              f"the recording. The run below is not an open-loop replay and its departure "
-              f"from the clip is measured, not assumed. The archive on disk is unchanged. ***")
+        if fc_bias:
+            print(f"[replay] *** STEERING PROBE --foot-yaw-bias {args.foot_yaw_bias:g} "
+                  f"--foot-len-bias {args.foot_len_bias:g}: a CONSTANT differential offset "
+                  f"is added to the swing legs (yaw-bias: hips, +front/-rear; len-bias: "
+                  f"thighs, +left/-right). No feedback -- this measures how much yaw rate "
+                  f"the placement is worth, open loop. The archive on disk is unchanged. ***")
+        if not fc_on:
+            print("[replay]   (--foot-comp is off: the only edit is the constant bias above)")
+        if fc_on:
+            print(f"[replay] *** FOOT PLACEMENT --foot-comp {args.foot_comp} "
+                  f"axis={args.foot_axis} k={args.foot_k:g}s cap={args.foot_clip_rad:g} rad "
+                  f"sign={args.foot_sign:+g}: a Raibert lateral foot-placement term is added "
+                  f"to the SWING legs' hip targets. THIS CLOSES A LOOP on base lateral "
+                  f"velocity and it OVERWRITES the recording. The run below is not an "
+                  f"open-loop replay and its departure from the clip is measured, not "
+                  f"assumed. The archive on disk is unchanged. ***")
         print(f"[replay]   T_stance (clip, measured) {clip_par_seq[0, 0]:.3f} s -> neutral-point "
               f"gain {0.5 * clip_par_seq[0, 0]:.3f} s; vx target (log) {clip_par_seq[0, 1]:.3f} m/s")
         print("[replay]   hip->foot lever: " + ", ".join(
             f"{leg} {fc_lever[k]:.3f} m" for k, leg in enumerate(clip["leg_order"]))
             + f"  (cap {args.foot_clip_rad:g} rad = "
               f"{args.foot_clip_rad * float(np.mean(fc_lever)) * 1000:.0f} mm of foot travel)")
+        if args.foot_yaw != "off":
+            vyl, wzl = float(clip_par_seq[0, 2]), float(clip_par_seq[0, 3])
+            if not (np.isfinite(vyl) and np.isfinite(wzl)):
+                raise SystemExit(
+                    f"--foot-yaw {args.foot_yaw} needs the log's own v_y and yaw rate for "
+                    f"{clip['name']}, "
+                    f"and {SKILL_PROFILE_CSV} did not supply them for session "
+                    f"{meta['clips'][clip['name']].get('session')!r}. Refusing to fall back "
+                    f"to a target of zero silently -- that is the assumption being tested.")
+            print(f"[replay]   TARGET from the log, not from zero: v_y {vyl:+.4f} m/s, "
+                  f"yaw {wzl:+.4f} rad/s ({np.degrees(wzl):+.2f} deg/s)")
+            print("[replay]   hip offsets in body frame (the yaw lever): " + ", ".join(
+                f"{leg} x{fc_hip_xy[k, 0]:+.3f} y{fc_hip_xy[k, 1]:+.3f}"
+                for k, leg in enumerate(clip["leg_order"])))
+            print("[replay]   per-leg v_y target = v_y_log + wz_log * x_i: " + ", ".join(
+                f"{leg} {vyl + wzl * fc_hip_xy[k, 0]:+.4f}"
+                for k, leg in enumerate(clip["leg_order"])) + " m/s")
         print(f"[replay]   swing source: {args.foot_swing_source}"
               + (f", velocity low-pass {args.foot_vel_filter_hz:g} Hz (alpha {fc_alpha:.3f})"
                  if args.foot_vel_filter_hz > 0 else ", velocity unfiltered"))
@@ -1040,9 +1130,44 @@ def run_isaac(args, clip: dict, meta: dict, then_clip: dict | None = None,
             fc_vx += fc_alpha * (float(vb[0].item()) - fc_vx)
             t_st, vx_des = float(clip_par_seq[i, 0]), float(clip_par_seq[i, 1])
             gain = 0.5 * t_st + args.foot_k
-            dy = gain * (fc_vy - args.foot_vy_target)
-            dx = (gain * (fc_vx - vx_des)
-                  if args.foot_axis == "xy" and np.isfinite(vx_des) else 0.0)
+            if args.foot_yaw != "off":
+                # Rotation kinematics, not a chosen target.  The hip at body-frame
+                # (x_i, y_i) on a base with velocity v and yaw rate w is itself moving
+                # at v + w x r_i, so the error this foot has to answer for is
+                #   (v_y - v_y_log) + (w - w_log) * x_i
+                # per leg.  Front and rear hips get opposite signs from the same yaw
+                # error, which is what makes an in-place turn representable at all --
+                # and, on a straight clip where w_log is ~0, is a heading corrector.
+                wz_raw = float(robot.data.root_ang_vel_b[0][2].item())
+                if args.foot_yaw == "log-cycle":
+                    # Mean over exactly one cycle of the clip being played.  Measured on
+                    # the working TROT: the instantaneous yaw rate is +5.32 deg/s with a
+                    # standard deviation of 20.70 -- 3.9x larger than the bias it is
+                    # supposed to correct -- while the one-cycle mean keeps the same
+                    # +5.32 at sd 3.64.  Feeding back the raw signal is feeding back the
+                    # stride, and that is what --foot-yaw log did when it turned a 60-cycle
+                    # TROT into a 2.71 s one.  The window is the clip's own period, so
+                    # this adds no constant to tune.
+                    L = int(clip_par_seq[i, 4])
+                    if fc_wz_buf is None or fc_wz_buf.size != L:
+                        fc_wz_buf, fc_wz_sum, fc_wz_i, fc_wz_n = np.zeros(L), 0.0, 0, 0
+                    fc_wz_sum += wz_raw - fc_wz_buf[fc_wz_i]
+                    fc_wz_buf[fc_wz_i] = wz_raw
+                    fc_wz_i = (fc_wz_i + 1) % L
+                    fc_wz_n = min(fc_wz_n + 1, L)
+                    fc_wz = fc_wz_sum / fc_wz_n          # warms up over the first cycle
+                else:
+                    fc_wz += fc_alpha * (wz_raw - fc_wz)
+                vy_log, wz_log = float(clip_par_seq[i, 2]), float(clip_par_seq[i, 3])
+                dvy = (fc_vy - vy_log) + (fc_wz - wz_log) * fc_hip_xy[:, 0]
+                dvx = ((fc_vx - vx_des) - (fc_wz - wz_log) * fc_hip_xy[:, 1]
+                       if args.foot_axis == "xy" and np.isfinite(vx_des) else np.zeros(4))
+            else:
+                dvy = np.full(4, fc_vy - args.foot_vy_target)
+                dvx = (np.full(4, fc_vx - vx_des)
+                       if args.foot_axis == "xy" and np.isfinite(vx_des) else np.zeros(4))
+            dy = gain * dvy
+            dx = gain * dvx
             if args.foot_swing_source == "sim":
                 fnow = snap(contacts.data.net_forces_w[0].norm(dim=-1))
                 swing_now = fnow[fc_sensor_col] <= args.contact_threshold_n
@@ -1061,6 +1186,24 @@ def run_isaac(args, clip: dict, meta: dict, then_clip: dict | None = None,
                 u_foot[1::3] = np.where(swing, np.clip(raw_thigh, -fc_cap, fc_cap), 0.0)
             fc_applied += int(swing.sum())
             fc_cap_hits += int((swing & (np.abs(raw_hip) > fc_cap)).sum())
+        if fc_bias:
+            # Constant, open loop, and applied AFTER the feedback term so the two ADD.
+            # The first version put it before, where --foot-comp's assignment to
+            # u_foot[0::3] silently erased it -- caught because the probe's own null
+            # control reproduced the uncompensated run to the digit instead of steering.
+            # Not clipped by --foot-clip-rad either: the bias IS the amplitude being
+            # set, so clipping it would measure the clip.
+            #
+            # +front/-rear on the hips is a differential LATERAL placement, the yaw
+            # moment a quadruped steers with; +left/-right on the thighs is a
+            # differential STEP LENGTH, the other candidate. The signs follow the
+            # measured hip geometry: sign(x_i) is +1 for the front pair, sign(y_i) is
+            # +1 for the left pair.
+            u_foot[0::3] += np.where(swing_now,
+                                     args.foot_yaw_bias * np.sign(fc_hip_xy[:, 0]), 0.0)
+            u_foot[1::3] += np.where(swing_now,
+                                     args.foot_len_bias * np.sign(fc_hip_xy[:, 1]), 0.0)
+        if fc_on or fc_bias:
             cmd_i = cmd_i + torch.as_tensor(u_foot, device=sim.device, dtype=torch.float32)
         tgt[:, idx_t] = cmd_i
         robot.set_joint_position_target(tgt)
@@ -1217,7 +1360,13 @@ def run_isaac(args, clip: dict, meta: dict, then_clip: dict | None = None,
         "foot_k": args.foot_k if fc_on else 0.0,
         "foot_clip_rad": args.foot_clip_rad if fc_on else 0.0,
         "foot_sign": args.foot_sign if fc_on else 0,
-        "foot_vy_target": args.foot_vy_target if fc_on else 0.0,
+        "foot_vy_target": args.foot_vy_target if fc_on and args.foot_yaw == "off" else "",
+        "foot_yaw": args.foot_yaw if fc_on else "",
+        "foot_yaw_bias": args.foot_yaw_bias,
+        "foot_len_bias": args.foot_len_bias,
+        "foot_vy_log": float(clip_par_seq[0, 2]),
+        "foot_wz_log": float(clip_par_seq[0, 3]),
+        "foot_hip_x_front_m": float(np.mean(fc_hip_xy[fc_hip_xy[:, 0] > 0, 0])) if fc_on else 0.0,
         "foot_swing_source": args.foot_swing_source if fc_on else "",
         "foot_vel_filter_hz": args.foot_vel_filter_hz if fc_on else 0.0,
         "foot_lever_m": float(np.mean(fc_lever)) if fc_on else 0.0,
@@ -1546,6 +1695,21 @@ def main() -> int:
                          "(+hip moves the foot toward +y on every leg); -1 exists because "
                          "stage 1's stabilising sign turned out not to be the one reasoning "
                          "about the joint frame predicted, so it is settled by measurement.")
+    ap.add_argument("--foot-yaw", choices=("off", "log", "log-cycle"), default="off",
+                    help="off (default, and what the stage-2 result was measured with): "
+                         "every leg is driven toward --foot-vy-target. log: the target is "
+                         "the recording's own motion and the ROTATION KINEMATICS that "
+                         "follow from it -- leg i answers for "
+                         "(v_y - v_y_log) + (wz - wz_log) * x_i, with v_y_log and wz_log "
+                         "read from outputs/skill_profile.csv for this clip's session and "
+                         "x_i measured from the articulation's own hip positions. No free "
+                         "parameter is introduced. This is what an in-place turn needs "
+                         "(v_y = 0 is wrong for it), and on a straight clip it is a "
+                         "yaw-rate corrector. log-cycle: the same, but the yaw rate is "
+                         "averaged over exactly one cycle of the clip being played -- the "
+                         "instantaneous rate is 3.9x noisier than the heading bias it is "
+                         "meant to correct, and feeding it back raw destabilises a trot. "
+                         "The window is the clip's own period, so it is not a tuned filter.")
     ap.add_argument("--foot-vy-target", type=float, default=0.0,
                     help="lateral velocity the placement aims for. 0 by design: the clips are "
                          "straight-line gaits and the log's own vy is ~0.")
@@ -1556,6 +1720,18 @@ def main() -> int:
     ap.add_argument("--foot-vel-filter-hz", type=float, default=0.0,
                     help="first-order low-pass on the base velocity the law reads. 0 (default) "
                          "is unfiltered.")
+    ap.add_argument("--foot-yaw-bias", type=float, default=0.0,
+                    help="OPEN-LOOP STEERING PROBE, radians. Adds a constant +front/-rear "
+                         "differential to the swing legs' hip targets, which is a "
+                         "differential lateral foot placement and therefore a yaw moment. "
+                         "No feedback: this measures the actuator's gain (deg/s of yaw per "
+                         "rad of bias) so a heading controller can be costed before it is "
+                         "built. Works with --foot-comp off, and then the run is still an "
+                         "open-loop replay plus a constant edit.")
+    ap.add_argument("--foot-len-bias", type=float, default=0.0,
+                    help="OPEN-LOOP STEERING PROBE, radians. The other candidate: a constant "
+                         "+left/-right differential on the swing legs' THIGH targets, i.e. a "
+                         "step-length difference between the two sides.")
     ap.add_argument("--dev-csv", default=None,
                     help="write the per-leg/per-joint/per-phase departure-from-the-recording "
                          "table here (one file, appended, same lock as --results-csv)")

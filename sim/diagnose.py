@@ -319,14 +319,27 @@ def diagnose(measured: dict, expected: dict, mapping: Optional[List[MappingResul
             "look for 'left_right_swapped' in the mapping ranking; if identity still wins, this "
             "is asymmetric friction or an uncentred spawn, not a mapping bug",
         ))
-    yaw = abs(measured.get("yaw_rate_deg_s", 0.0))
-    if yaw > t["yaw_deg_per_s"]:
+    # Against the LOG's own yaw rate, not against zero.  TURN is a clip whose whole
+    # content is a yaw rate (-22.7 deg/s measured), and judging it against straight-line
+    # intent reported the skill working correctly as a leg-indexing bug -- on the one run
+    # that finally reproduced its stride.  A clip that carries no expected yaw rate keeps
+    # the old test, because for the straight clips zero is the right reference.
+    yaw = measured.get("yaw_rate_deg_s", 0.0)
+    eyaw = expected.get("yaw_rate_deg_s", 0.0)
+    eyaw = eyaw if np.isfinite(eyaw) else 0.0
+    if abs(yaw - eyaw) > t["yaw_deg_per_s"]:
+        turning = abs(eyaw) > t["yaw_deg_per_s"]
         F.append(Finding(
             "warn",
-            f"yaws at {yaw:.1f} deg/s while commanded straight",
-            "one diagonal pair leads the other — front/rear swap, or one leg mis-indexed",
+            (f"yaws at {yaw:+.1f} deg/s against the log's {eyaw:+.1f}"
+             if turning else f"yaws at {abs(yaw):.1f} deg/s while commanded straight"),
+            ("the turn is not being reproduced at the rate it was recorded at"
+             if turning else
+             "one diagonal pair leads the other — front/rear swap, or one leg mis-indexed"),
             "check 'front_rear_swapped' in the ranking and the per-joint correlations",
         ))
+    elif abs(eyaw) > t["yaw_deg_per_s"]:
+        F.append(Finding("ok", f"turn rate {yaw:+.1f} deg/s vs the log's {eyaw:+.1f}", "—", "—"))
     if np.isfinite(measured.get("vx_mean", np.nan)) and np.isfinite(ev) and ev > 0.05 and measured["vx_mean"] < -0.05:
         F.append(Finding(
             "fail",
