@@ -267,8 +267,31 @@ class RulePlanner:
             self._jump_block_until_x = None
         return True
 
+    # -- turn trigger --------------------------------------------------------
+    def _wants_turn(self, heading_err_deg: float) -> bool:
+        """Is the body pointed far enough off the goal bearing to spend a TURN?
+
+        TURN is not on the duty axis the other gaits are ranked by -- it answers a
+        heading question, not a roughness one -- so it is selected here rather
+        than in ``_best_fit``.  The threshold is asymmetric for the same reason
+        every other threshold here is: leaving a turn early costs a second turn.
+
+        ``heading_err_deg`` is the planner's own quantity (goal bearing minus
+        heading).  A NaN means nobody is supplying one, and then TURN is never
+        requested -- which is what the offline sweep and every existing caller
+        get, unchanged.
+        """
+        lim = self.cfg.skill.HEADING_ERR_TURN_DEG
+        if not (np.isfinite(heading_err_deg) and np.isfinite(lim)):
+            return False
+        err = abs(heading_err_deg)
+        if self.active is SkillId.TURN:
+            return err > lim * (1.0 - self.cfg.switch.HYSTERESIS)
+        return err > lim
+
     # -- main tick ------------------------------------------------------------
-    def step(self, obs: Observation, dt: float, x_m: float = float("nan")) -> Decision:
+    def step(self, obs: Observation, dt: float, x_m: float = float("nan"),
+             heading_err_deg: float = float("nan")) -> Decision:
         cfg = self.cfg
         self._t += dt
         self._hold_timer += dt
@@ -310,6 +333,10 @@ class RulePlanner:
         # 4. what does the terrain ask for?
         if self._wants_jump(obs, x_m):
             requested, reason = SkillId.JUMP, "step within jump reach at the near edge"
+        elif self._wants_turn(heading_err_deg):
+            requested, reason = SkillId.TURN, (
+                f"heading off by {heading_err_deg:+.1f} deg, over "
+                f"{self.cfg.skill.HEADING_ERR_TURN_DEG:.1f}")
         else:
             requested, reason = self._best_fit(obs, margin=0.0)
             if any(u.fatal for u in unsupported):
@@ -317,6 +344,10 @@ class RulePlanner:
                 reason = "unsupported terrain ahead - falling back to WALK and attempting it anyway"
 
         # 5. upgrades are conditional, downgrades are not
+        # TURN is off the duty axis: entering it is never an "upgrade" (so it is not
+        # gated behind MIN_HOLD_S -- a heading error is a downgrade-shaped event),
+        # and leaving it for a straight gait is, so it goes through the hold timer
+        # and the hysteresis check like any other speed-up.
         cur_rank = SAFETY_ORDER.index(self.active) if self.active in SAFETY_ORDER else 0
         req_rank = SAFETY_ORDER.index(requested) if requested in SAFETY_ORDER else 0
         upgrade = requested is not SkillId.JUMP and req_rank > cur_rank

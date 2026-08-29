@@ -57,11 +57,17 @@ class SkillLimits:
     DUTY_WALK: float = 0.64
     DUTY_TROT: float = 0.52
     DUTY_RUN: float = 0.31
+    DUTY_TURN: float = 0.59
 
     # -- achieved forward speed (steady state, middle 60 % of the motion) ----
     SPEED_WALK: float = 0.20
     SPEED_TROT: float = 0.55
     SPEED_RUN: float = 0.48
+    SPEED_TURN: float = 0.0075
+
+    # -- turning -------------------------------------------------------------
+    YAW_RATE_TURN: float = -0.3954
+    HEADING_ERR_TURN_DEG: float = 12.0
 
     # -- vertical capability -------------------------------------------------
     JUMP_APEX: float = 0.25
@@ -91,6 +97,18 @@ _p("skill.SPEED_TROT", Provenance.MEASURED, "m/s", "skill_profile.csv speed_stea
 _p("skill.SPEED_RUN", Provenance.MEASURED, "m/s",
    "skill_profile.md §5: move x=1.5-2.0 + speed_level 0 -> 0.48 m/s measured. "
    "NB this is *below* SPEED_TROT - trot_run buys an aerial phase, not speed")
+_p("skill.DUTY_TURN", Provenance.MEASURED, "-",
+   "skill_clips.meta.json TURN duty_clip 0.591, session turn_right_20260824_223951")
+_p("skill.SPEED_TURN", Provenance.MEASURED, "m/s",
+   "skill_profile.csv vx_steady_mean 0.0075 for the TURN session - it turns on the spot")
+_p("skill.YAW_RATE_TURN", Provenance.MEASURED, "rad/s",
+   "skill_profile.csv yaw_rate_steady_mean -0.3954 (-22.66 deg/s) for turn_right_20260824_223951. "
+   "This is the MEASURED rate, not the -0.6 rad/s that was commanded to produce it, and it is "
+   "the same number the low level uses as its foot-placement target (outputs/turn_target.md)")
+_p("skill.HEADING_ERR_TURN_DEG", Provenance.CALIBRATION_NEEDED, "deg",
+   "placeholder. How far off the goal bearing before TURN is worth the switch. It trades the "
+   "switch cost against the heading a straight gait would give away, and neither side has been "
+   "measured on terrain yet, so this number is arbitrary and is here to make the wiring testable")
 _p("skill.JUMP_APEX", Provenance.MEASURED, "m", "jump_profile.csv apex_rise_ballistic_m, 0.250 ± 0.031 over 5 front_jump sessions")
 _p("skill.JUMP_FLIGHT_S", Provenance.MEASURED, "s", "jump_profile.csv flight_s, 0.451 ± 0.028")
 _p("skill.JUMP_HORIZONTAL", Provenance.MEASURED, "m", "jump_profile.csv dx_jump_m, 26 ± 4 mm - front_jump is a vertical hop in place")
