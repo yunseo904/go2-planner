@@ -146,3 +146,16 @@ Go2 파쿠르: 룰베이스 스킬 플래너 vs E2E 학습 정책 비교 (Isaac 
 
 - 논리 단위로 나눠 커밋한다.
 - `.npz` 등 대용량은 gitignore, 해시 파일과 CSV 요약은 커밋한다 (임계값 근거 자료).
+- **커밋 메시지에 `Co-Authored-By:` 나 "Generated with Claude Code" 류의 서명을 넣지 않는다.**
+  도구 이름은 이 리포의 기록이 아니다. 무엇을 왜 바꿨는지만 남긴다.
+- **작성자는 `user.name = yunseo904`, `user.email = yunseotwo@gmail.com` 으로 고정한다.**
+  전역 `~/.gitconfig` 에는 사용자 정보가 없으므로 리포 로컬 설정이 정본이다. 새로 클론하면
+  가장 먼저 다음을 실행한다:
+
+  ```bash
+  git config user.name  yunseo904
+  git config user.email yunseotwo@gmail.com
+  ```
+
+  커밋 전에 `git log -1 --format='%an <%ae>'` 로 확인한다. 다른 주소로 올라간 커밋은
+  GitHub 잔디와 작성자 귀속이 어긋나므로 뒤늦게 고치려면 히스토리를 다시 써야 한다.
