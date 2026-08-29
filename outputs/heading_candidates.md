@@ -102,6 +102,29 @@ Two things change on the trot:
   the stride up at 1.75 Hz. So (b) on TROT works only between about 0.02 and 0.04 rad, in
   one direction.
 
+### Together, on TROT, they cross zero
+
+Each at its own safe amplitude — (a) at −0.02, (b) at −0.04, applied through different
+joints in the same run:
+
+| | survived | yaw °/s | curvature | vx | stride |
+|---|---|---|---|---|---|
+| neither | 60+ cycles | +5.32 | 8.08 °/m | 0.659 | 1.56 (+0%) |
+| (a) alone, −0.02 | 60+ cycles | +2.22 | 3.37 °/m | 0.660 | 1.56 (+0%) |
+| (b) alone, −0.04 | 60+ cycles | +0.61 | 0.94 °/m | 0.650 | 1.56 (+0%) |
+| **both** | **60+ cycles** | **−2.01** | −3.06 °/m | 0.656 (−0.5%) | 1.56 (+0%) |
+
+**They add, and together they overshoot through zero.** The combined change is 7.33 °/s
+against 3.10 + 4.71 = 7.81 for the two separately, so they are close to independent —
+they act through different joints — and the trot takes both at once for half a percent of
+forward speed and no change in stride at all.
+
+That is the important result for a controller: the drift is not just reducible, it is
+**crossable**, so there is an interior operating point where it is zero. Nothing here is
+that point (the biases are constants, not a loop), but it exists and it is inside the
+budget: 0.02 + 0.04 rad against the 0.03 the trot already spends, so the total departure
+from the recording roughly triples.
+
 ---
 
 ## 3. Why closing the loop on yaw *rate* made it worse
@@ -173,6 +196,10 @@ Two conditions come out of the measurements, and neither is a preference:
    falls the trot in both directions; ±0.02 is safe on both. A planner switching skills
    has to carry the skill's own limit with it, the same way `T_stance` and `ω_log` are
    already carried per clip.
+
+**Use both together, each inside its own window.** The combined run is the best heading
+result measured — +5.32 to −2.01 °/s, through zero, for 0.5% of forward speed and no
+change in stride — and it says an interior zero exists for a loop to find.
 
 **Not recommended as primary: step length (b).** Strong on TROT in one direction
 (−4.71 °/s, the largest single correction measured) and destructive in the other at an
