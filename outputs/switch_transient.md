@@ -127,3 +127,73 @@ state.** Two directions follow, and they are different experiments:
 Candidate ① (route through `balance_stand`) is still not attempted and is still second on
 merit: 04a16cb measured direct handover at 7.68° of heading cost against 16.17° through
 BALANCE, and a stop-and-restart raises the planner's switch cost for every decision.
+
+
+---
+
+# Rejected, with the measurement that rejected them
+
+Recorded so neither is re-proposed from first principles.
+
+## Speed matching — REJECTED
+
+Implemented as a transition safety condition in the rule engine (`SPEED_MATCH_MAX`) and
+kept, because it is cheap and correctly expresses a real constraint. It does not solve
+this problem and cannot:
+
+- the library's measured speeds are **WALK 0.19, TROT 0.44, TURN 0.008 m/s**, so any band
+  under 0.43 forbids WALK↔TROT outright and any band over it admits everything;
+- at the placeholder 0.25 it refused 19 switches and admitted one — **at the tick WALK was
+  moving fastest (0.30 m/s)**, which is the peak of an excursion, not a settled moment —
+  and that one still fell.
+
+**The problem is the library's speed distribution, not the threshold.** Nothing in
+{WALK, TROT, TURN} is within 0.25 m/s of anything else, and no value of the band changes
+that. Superseded by `--switch-gate settled`, which tests whether the *current* gait is
+inside its own linear range rather than whether two gaits happen to be near each other.
+
+## Blending — REJECTED
+
+Ramping the commanded pose from the one held at the switch into the new clip's stream,
+phase still advancing:
+
+| window | 0 | 0.05 s | 0.10 s | 0.20 s | 0.40 s |
+|---|---|---|---|---|---|
+| terminated | 7.66 s | 7.54 | 7.52 | 7.62 | 7.58 |
+
+**Every window is within 0.14 s of the sharp seam** — a spread smaller than the
+run-to-run variation. Combined with the settled gate it was actively worse (7.46 s
+against 8.02 s).
+
+The pose discontinuity was never the mechanism, which three independent measurements now
+say: the entry-criterion comparison (a *smaller* seam did worse), this sweep, and the
+step-by-step trace showing the correction already pinned three steps *before* the seam.
+
+---
+
+# Resolved: heading first, then the gate
+
+With `outputs/heading_hold.md` built, the transition was retried:
+
+| | switches executed | segments ok | terminated |
+|---|---|---|---|
+| heading only, no gate | 1 | 1 | **7.54 s** |
+| **heading + settled gate** | **4** | **4** | **26.48 s** |
+
+Heading alone does not fix the switch. The two together do: the heading controller cuts
+WALK's cap saturation from 46.8% to 30.7%, which is what makes the settled gate's window
+open often enough to be usable (8 deferrals, then it opens), and then
+
+    0.00 -  6.40  WALK   stride 1.35/1.37 (+1%)  vx 0.229   ok
+    6.40 - 12.30  TROT   stride 1.56/1.56 (+0%)  vx 0.618   ok
+   12.30 - 18.40  WALK   stride 1.35/1.37 (+1%)  vx 0.251   ok
+   18.40 - 24.50  TROT   stride 1.56/1.56 (+0%)  vx 0.641   ok
+   24.50 - 26.50  TURN   stride 1.59/1.12        vx 0.130   FAIL
+
+**Three consecutive switches survive and reproduce their gaits** — WALK→TROT, TROT→WALK,
+WALK→TROT — where before, the first switch always ended the run. The 8.02 s collapse is
+gone.
+
+The failure has moved to **TROT→TURN**, which is the largest speed gap in the library:
+0.64 m/s into a gait whose measured speed is 0.008. That is the case the rejected speed
+condition was pointing at all along, and it is now the only one left.

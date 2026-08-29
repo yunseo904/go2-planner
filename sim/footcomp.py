@@ -66,7 +66,8 @@ class FootPlacement:
     k_s: float = 0.0
     cap_rad: float = 0.05
     sign: float = 1.0
-    yaw_mode: str = "off"               # off | log | log-cycle
+    yaw_mode: str = "off"               # off | log | log-cycle | heading | heading-only
+    heading_cap_rad: float = 0.0        # separate cap for the heading term (0 = same as cap)
     axis: str = "y"                     # y | xy
     vy_target: float = 0.0
     cycle_len: int = 0                  # control steps in one clip cycle
@@ -104,13 +105,49 @@ class FootPlacement:
         self.max_abs = 0.0
 
     # ------------------------------------------------------------------ step
-    def step(self, vy: float, wz: float, swing: np.ndarray, vx: float = 0.0) -> np.ndarray:
-        """The 12-vector to ADD to the commanded joint angles this control step."""
+    def step(self, vy: float, wz: float, swing: np.ndarray, vx: float = 0.0,
+             psi_err_rad: float = 0.0) -> np.ndarray:
+        """The 12-vector to ADD to the commanded joint angles this control step.
+
+        ``psi_err_rad`` is the heading error against the commanded heading, used only
+        by the heading modes.  It is an angle the body knows about itself; no terrain
+        and no depth reach this function.
+        """
         swing = np.asarray(swing, dtype=bool)
         u = np.zeros(12, dtype=np.float32)
+        u_head = np.zeros(4)
 
-        if self.yaw_mode != "off":
-            if self.yaw_mode == "log-cycle":
+        if self.yaw_mode in ("heading", "heading-only"):
+            # omega_target = omega_log - psi_err / T_stance, i.e. spend one stance time
+            # returning to the reference.  Substituted into the per-leg error term
+            # (omega - omega_target) * x_i, the heading half is
+            #
+            #     (T_stance/2) * (psi_err / T_stance) * x_i / lever = psi_err * x_i / (2 lever)
+            #
+            # -- T_stance CANCELS.  The heading correction carries no constant at all,
+            # not even a measured one: it is the heading error, the hip's own fore-aft
+            # offset, and the hip-to-foot lever.  Front and rear hips get opposite signs
+            # from the same error, which is the differential lateral placement the
+            # open-loop probe measured at 155-175 deg/s per rad.
+            # NEGATIVE. The substitution omega_target = omega_log - psi_err/T_stance
+            # yields +psi*x/(2*lever), and that sign is positive feedback: the open-loop
+            # steering probe measured +bias (front outboard one way, rear the other) ->
+            # +yaw rate, so a positive heading error needs a NEGATIVE bias to come back.
+            # Implemented as written it drove WALK's curvature from 13.26 to 19.99 deg/m
+            # and made the full-formula TROT fall at 2.12 s. Settled by measurement, the
+            # same way the stage-1 attitude PD's sign was.
+            u_head = -psi_err_rad * self.hip_x_m / (2.0 * self.lever_m)
+            hcap = self.heading_cap_rad or self.cap_rad
+            u_head = np.clip(u_head, -hcap, hcap)
+        if self.yaw_mode == "heading-only":
+            # The rate half dropped.  Every yaw-RATE loop measured made heading worse
+            # (outputs/heading_candidates.md 3), so it is separable here rather than
+            # carried on faith: `heading` is the full substitution, `heading-only` is
+            # the half the evidence supports.
+            dvy = np.full(4, vy - self.vy_log)
+            dvx = np.zeros(4)
+        elif self.yaw_mode != "off":
+            if self.yaw_mode in ("log-cycle", "heading"):
                 self._wz_sum += wz - self._wz_buf[self._wz_i]
                 self._wz_buf[self._wz_i] = wz
                 self._wz_i = (self._wz_i + 1) % self._wz_buf.size
@@ -131,7 +168,11 @@ class FootPlacement:
         raw_hip = self.sign * (gain * dvy) / self.lever_m
         raw_thigh = -self.sign * (gain * np.asarray(dvx, dtype=float)) / self.lever_m
         cap = self.cap_rad
-        u[0::3] = np.where(swing, np.clip(raw_hip, -cap, cap), 0.0)
+        # The two terms are capped SEPARATELY and then added: the lateral cap is the
+        # stage-2 budget for answering v_y, and the heading cap is what the steering
+        # probe measured each gait tolerates.  Clipping their sum would let one starve
+        # the other, and they answer different questions.
+        u[0::3] = np.where(swing, np.clip(raw_hip, -cap, cap) + u_head, 0.0)
         if self.axis == "xy":
             u[1::3] = np.where(swing, np.clip(raw_thigh, -cap, cap), 0.0)
 
@@ -199,6 +240,26 @@ def _self_test() -> int:
     for i in range(4 * n):
         fp5.step(vy=0.0, wz=bias + ripple * rng.standard_normal(), swing=np.ones(4, bool))
     ok("cycle mean tracks the bias, not the ripple", fp5._wz, bias, 4 * ripple / np.sqrt(n))
+
+    # 5. the heading term: parameter-free, opposite on front and rear, and it is the
+    #    heading error that drives it rather than any rate
+    fp6 = FootPlacement(t_stance_s=0.484, lever_m=lever, hip_x_m=hip_x,
+                        yaw_mode="heading-only", cycle_len=37, cap_rad=0.05,
+                        heading_cap_rad=0.04, vy_log=0.0, wz_log=0.0)
+    u6 = fp6.step(vy=0.0, wz=0.0, swing=np.ones(4, bool), psi_err_rad=0.1)
+    # u is float32, so the tolerance is float32 epsilon rather than the default 1e-9
+    ok("heading term = -psi*x/(2*lever), front", float(u6[0]), -0.1 * 0.193 / (2 * 0.306), 1e-7)
+    ok("heading term, rear is opposite", float(u6[6]), -0.1 * -0.193 / (2 * 0.316), 1e-7)
+    ok("no heading error, no heading term",
+       float(np.abs(fp6.step(0.0, 0.0, np.ones(4, bool), psi_err_rad=0.0)).max()), 0.0)
+    u7 = fp6.step(vy=0.0, wz=0.0, swing=np.ones(4, bool), psi_err_rad=2.0)
+    ok("heading term respects its own cap", float(u7[0]), -0.04)
+    # T_stance must not appear: the same error on a clip with a different stance time
+    fp7 = FootPlacement(t_stance_s=0.372, lever_m=lever, hip_x_m=hip_x,
+                        yaw_mode="heading-only", cycle_len=32, cap_rad=0.05,
+                        heading_cap_rad=0.04)
+    ok("T_stance cancels out of the heading term",
+       float(fp7.step(0.0, 0.0, np.ones(4, bool), psi_err_rad=0.1)[0]), float(u6[0]), 1e-7)
 
     print(f"footcomp self-test: {'PASS' if fails == 0 else f'{fails} FAILURES'}")
     return 0 if fails == 0 else 1

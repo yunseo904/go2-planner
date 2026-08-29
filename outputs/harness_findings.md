@@ -249,6 +249,40 @@ presented as *exit 0 with no CSV*.
 
 ---
 
+## 9 · `configure_env_origins` — the smoke passed because 3 probes make a square
+
+The grid calibration harness hands `TerrainImporter` one mesh and then called
+
+    importer.configure_env_origins(origins)     # origins: (N, 3)
+
+In Isaac Lab 3.0 that method expects a **generator-shaped `(rows, cols, 3)` grid**. Given
+a flat `(N, 3)` list it takes the curriculum branch and evaluates
+
+    env_origins[:] = origins[self.terrain_levels, self.terrain_types]
+
+With the smoke's **three** probes, `origins` is `(3, 3)` — square — so indexing it with
+two index arrays of length 3 *succeeds*, returns three rows of nonsense, and raises
+nothing. The smoke printed `articulation instances: 3 (want 3)`, settled to
+`|v| 0.023 m/s`, ran 1000 steps and reported results. The 42-probe run raised `IndexError`
+on the first line that mattered.
+
+The origins it computed were never used — every robot's pose is written explicitly a few
+lines later — so the call was both wrong and unnecessary, and it was removed rather than
+reshaped.
+
+**Why this one is worth a number in this file.** It is the exact failure mode the
+`--max-probes 3` smoke exists to prevent, and the smoke *validated the bug*: three is the
+only cell count at which an `(N, 3)` array is square, and the smoke's default is three.
+A shape coincidence stood in for a check, and the "smoke passed" line in the previous
+session's report was true and meaningless.
+
+The generalisable version: **a smoke run whose size is small enough to be special is not
+a smoke run.** Anything shaped `(n, k)` where the harness also sweeps `n` should be smoked
+at `n != k`, and a smoke that exercises a library call should assert on what the call
+returned rather than on the process surviving it.
+
+---
+
 ## Self-inflicted recurrences, same session
 
 Three of the five original defects reappeared in code written *during* the diagnosis:

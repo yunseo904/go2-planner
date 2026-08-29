@@ -68,6 +68,11 @@ from terrain_toolkit.paths import CALIBRATION_NPZ, SKILL_CLIPS_META_JSON
 from run_calibration import (FALL_HEIGHT_M, GOAL_RADIUS_M, PARAM_SKILL, TIME_BUDGET_S,
                              load_probes, planned_runs)
 
+#: Measured steady speeds, m/s -- the same numbers planner/config.py carries.
+SKILL_SPEED = {"WALK": 0.187, "TROT": 0.444, "TURN": 0.008, "RUN": 0.514, "JUMP": 0.006}
+#: Per-skill heading cap, from the open-loop steering probe.
+HEADING_CAP = {"WALK": 0.04, "TROT": 0.02}
+
 _SIM_APP = None
 _RUN_UTC = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
@@ -316,15 +321,33 @@ def run_isaac(args) -> list:
                             for l in legs])
             vy_log, wz_log = _log_motion_for(meta, c["name"])
             yaw_mode = "log-cycle" if c["name"] == "TURN" else "off"
+            hcap = 0.0
+            if args.heading != "off" and c["name"] != "TURN":
+                yaw_mode = args.heading
+                hcap = HEADING_CAP.get(c["name"], 0.0)
             foots.append(FootPlacement(
                 t_stance_s=stance_time_s(c["contact"], c["fs"]), lever_m=lever,
                 hip_x_m=hxy[:, 0], hip_y_m=hxy[:, 1], vy_log=vy_log, wz_log=wz_log,
-                cap_rad=args.foot_clip_rad, yaw_mode=yaw_mode, cycle_len=len(c["q_des"])))
+                cap_rad=args.foot_clip_rad, yaw_mode=yaw_mode, heading_cap_rad=hcap,
+                cycle_len=len(c["q_des"])))
         print(f"[grid] *** FOOT PLACEMENT ON for all {n} robots (cap {args.foot_clip_rad:g} rad). "
               f"This CLOSES A LOOP on base velocity and OVERWRITES the recording. ***")
     swing = [~np.asarray(c["contact"], dtype=bool) for c in per_robot_clip]
 
-    n_steps = int(args.time_budget_s / dt)
+    # Time budget from the SKILL's own measured speed, not one number shared across
+    # skills.  The probes put goal 2 about 3.95 m from the spawn; at WALK's 0.233 m/s
+    # that is 17 s, and the old shared 20 s left 15% margin for a gait that curves --
+    # so a probe could fail for running out of clock rather than for the obstacle.
+    # The budget is now distance / speed x a stated slack factor, per robot.
+    goal2_pre = np.array([probes["goals"][i][1] for i in idx]) + offsets
+    spawn_d = np.linalg.norm(goal2_pre - spawns, axis=1)
+    speed = np.array([SKILL_SPEED[r[1]] for r in runs])
+    budget = spawn_d / speed * args.budget_slack
+    n_steps = int(np.ceil(budget.max() / dt))
+    print(f"[grid] time budget from speed: distance {spawn_d.min():.2f}-{spawn_d.max():.2f} m, "
+          f"slack x{args.budget_slack:g} -> {budget.min():.1f}-{budget.max():.1f} s "
+          f"({n_steps} steps; each robot is scored against its own)")
+    budget_steps = np.ceil(budget / dt).astype(int)
 
     # Repeats have to vary something, and physics here does not vary: the friction is
     # fixed at the env's midpoint rather than sampled per episode, so five identical
@@ -382,7 +405,7 @@ def run_isaac(args) -> list:
 
             pos = snap(robot.data.root_pos_w)
             d = np.linalg.norm(pos[:, :2] - goal2, axis=1)
-            newly = (~reached) & (d < GOAL_RADIUS_M)
+            newly = (~reached) & (d < GOAL_RADIUS_M) & (step <= budget_steps)
             t_reached[newly] = step * dt
             reached |= newly
             fell |= pos[:, 2] < FALL_HEIGHT_M
@@ -476,7 +499,13 @@ def main() -> int:
     ap.add_argument("--settle-s", type=float, default=0.5)
     ap.add_argument("--foot-comp", choices=("off", "on"), default="on")
     ap.add_argument("--foot-clip-rad", type=float, default=0.05)
-    ap.add_argument("--time-budget-s", type=float, default=TIME_BUDGET_S)
+    ap.add_argument("--time-budget-s", type=float, default=TIME_BUDGET_S,
+                    help="ignored: the budget is derived per robot from its skill's speed")
+    ap.add_argument("--budget-slack", type=float, default=2.0,
+                    help="budget = distance / skill speed x this. 2.0 gives a gait twice "
+                         "the time a straight-line traverse needs.")
+    ap.add_argument("--heading", choices=("off", "heading", "heading-only"), default="off",
+                    help="hold the spawn heading with differential lateral foot placement")
     ap.add_argument("--skip-unsupported", action="store_true",
                     help="drop probes whose skill the low level cannot execute (RUN/JUMP)")
     ap.add_argument("--results-csv", default=None)

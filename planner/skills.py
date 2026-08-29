@@ -131,6 +131,10 @@ class BaseState:
     vx: float = 0.0
     vy: float = 0.0
     wz: float = 0.0
+    #: Heading error against the commanded heading, radians.  An angle the body knows
+    #: about itself -- odometry, not terrain -- and the only thing the heading
+    #: controller reads beyond the velocities above.
+    psi_err: float = 0.0
 
 
 @dataclass
@@ -284,7 +288,8 @@ class ClipPolicy:
             vy = float(getattr(obs, "vy", 0.0))
             wz = float(getattr(obs, "wz", 0.0))
             vx = float(getattr(obs, "vx", 0.0))
-            self.last_u = self.foot.step(vy, wz, self._swing[f], vx=vx)
+            psi = float(getattr(obs, "psi_err", 0.0))
+            self.last_u = self.foot.step(vy, wz, self._swing[f], vx=vx, psi_err_rad=psi)
             q = q + self.last_u
         self._i += 1
         self._elapsed += dt

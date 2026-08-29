@@ -85,7 +85,11 @@ SCHEDULES = {
         (6.0, 0.050, 25.0, "heading off while rough -> TURN    [WALK->TURN]"),
         (6.0, 0.050,  0.0, "heading recovered, still rough     [TURN->WALK]"),
     ],
-    "hold": [(40.0, 0.020, 0.0, "one skill, no switches: the control for everything else")],
+    "hold": [(40.0, 0.020, 0.0, "TROT held, no switches: the control for everything else")],
+    # roughness past TROT's 0.030 limit, so the planner asks for WALK and keeps asking.
+    # "hold" alone asks for TROT, which is why an --initial WALK run on it switches at
+    # the first tick instead of holding anything.
+    "hold_walk": [(40.0, 0.050, 0.0, "WALK held, no switches")],
     "chatter": [   # a feature parked exactly on TROT's limit, to provoke oscillation
         (4.0, 0.020, 0.0, "TROT"),
         (24.0, 0.0301, 0.0, "roughness parked 0.1 mm over TROT's limit"),
@@ -235,6 +239,13 @@ FOOT_COMP = {
     SkillId.TURN: dict(yaw_mode="log-cycle", cap_rad=0.05),
 }
 
+#: With --heading on, the yaw mode is replaced and each skill gets the heading cap the
+#: open-loop steering probe measured it tolerates: WALK took +-0.04 rad with no cost,
+#: TROT falls in BOTH directions at +-0.04 and is safe at +-0.02
+#: (outputs/heading_candidates.md 2).  TURN is excluded -- it is not trying to hold a
+#: heading, it is trying to change one, and its own log yaw rate is the target.
+HEADING_CAP = {SkillId.WALK: 0.04, SkillId.TROT: 0.02, SkillId.TURN: 0.0}
+
 
 def run_isaac(args) -> dict:
     from isaaclab.app import AppLauncher
@@ -346,7 +357,10 @@ def run_isaac(args) -> dict:
         if args.foot_comp == "off":
             return None
         vy_log, wz_log = _log_motion_for(meta, clip["name"])
-        s = FOOT_COMP[sid]
+        s = dict(FOOT_COMP[sid])
+        if args.heading != "off" and sid is not SkillId.TURN:
+            s["yaw_mode"] = args.heading
+            s["heading_cap_rad"] = HEADING_CAP[sid]
         return FootPlacement(t_stance_s=stance_time_s(clip["contact"], clip["fs"]),
                              lever_m=lever, hip_x_m=hip_xy[:, 0], hip_y_m=hip_xy[:, 1],
                              vy_log=vy_log, wz_log=wz_log,
@@ -361,6 +375,18 @@ def run_isaac(args) -> dict:
             print(f"[planner]   {sid.value:5s} {FOOT_COMP[sid]}, T_stance "
                   f"{stance_time_s(clips[sid]['contact'], clips[sid]['fs']):.3f} s, "
                   f"log v_y {vy_log:+.4f} yaw {np.degrees(wz_log):+.2f} deg/s")
+
+    # The commanded heading is the one the robot was handed over at: "keep going the way
+    # you were pointed".  A planner would supply this; on flat ground with no goal it is
+    # the spawn heading, which is what makes the curvature measurable at all.
+    _, _, _yaw0 = quat_to_rpy_deg(snap(robot.data.root_quat_w[0])[None, :])
+    yaw_ref = float(_yaw0[0])
+    if args.heading != "off":
+        print(f"[planner] *** HEADING HOLD --heading {args.heading}: reference {yaw_ref:+.2f} deg "
+              f"(the handover heading), caps " + ", ".join(
+                  f"{k.value} {v:g}" for k, v in HEADING_CAP.items() if v) +
+              ". omega_target = omega_log - psi_err / T_stance; T_stance cancels, so the "
+              "heading term carries no constant. ***")
 
     planner = RulePlanner(cfg=DEFAULT, initial=initial)
     policies = {sid: make_policy(sid, clips=clips, foot_for=foot_for) for sid in SkillId}
@@ -482,8 +508,14 @@ def run_isaac(args) -> dict:
 
         vb = robot.data.root_lin_vel_b[0]
         wb = robot.data.root_ang_vel_b[0]
+        # Heading error against the heading the robot was handed over at.  Wrapped to
+        # (-pi, pi] so a run that turns past 180 deg does not command a correction the
+        # long way round.  Proprioception: the base's own yaw, no terrain, no goal.
+        _, _, yaw_now = quat_to_rpy_deg(snap(robot.data.root_quat_w[0])[None, :])
+        psi_err = float(np.radians((float(yaw_now[0]) - yaw_ref + 180.0) % 360.0 - 180.0))
         cmd = policies[playing].act(
-            BaseState(vx=float(vb[0].item()), vy=float(vb[1].item()), wz=float(wb[2].item())), dt)
+            BaseState(vx=float(vb[0].item()), vy=float(vb[1].item()), wz=float(wb[2].item()),
+                      psi_err=psi_err if args.heading != "off" else 0.0), dt)
         q = np.asarray(cmd.q, dtype=np.float32)
         if blend_left > 0:
             # Ramp from the pose held at the switch to the new clip's stream, while the
@@ -581,6 +613,7 @@ def summarise(args, a, dt, sched, planner, events, refused, meta, clips,
            "switch_entry": args.switch_entry, "switch_blend_s": args.switch_blend_s,
            "speed_gate": args.speed_gate, "speed_refusals": planner.speed_refusals,
            "switch_gate": args.switch_gate, "gate_deferrals": gate_defer,
+           "heading": args.heading,
            "planner_switches": planner.switches, "executed_switches": len(switches),
            "refused_ticks": sum(refused.values()),
            "refused_skills": "|".join(sorted(s.value for s in refused)),
@@ -614,6 +647,13 @@ def main() -> int:
                     help="ramp the commanded pose from the one held at the switch to the "
                          "new clip's stream over this long, with the clip's phase still "
                          "advancing. 0 (default) is the sharp seam the harness measured.")
+    ap.add_argument("--heading", choices=("off", "heading", "heading-only"), default="off",
+                    help="hold the handover heading with differential lateral foot "
+                         "placement. heading: the full substitution omega_target = "
+                         "omega_log - psi_err/T_stance, which keeps the yaw-RATE term. "
+                         "heading-only: the heading half alone, because every rate loop "
+                         "measured made heading worse. Caps are per skill, from the "
+                         "open-loop steering probe.")
     ap.add_argument("--switch-gate", choices=("off", "settled"), default="off",
                     help="settled: defer a switch while the foot-placement correction is "
                          "pinned at its cap, i.e. while the current gait is in an excursion "
