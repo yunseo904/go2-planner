@@ -373,8 +373,10 @@ def run_isaac(args) -> dict:
           f"{tick_every} steps ({DEFAULT.feature.TICK_HZ:.0f} Hz)")
 
     rec = {k: [] for k in ("contact_f", "root_lin_vel_b", "root_ang_vel_b", "root_pos_w",
-                           "root_quat_w", "played", "planned")}
+                           "root_quat_w", "played", "planned", "foot_u", "swing")}
     events, refused, last_q, entry_note = [], {}, None, ""
+    blend_left, blend_steps, blend_from = 0, 0, None
+    last_u, gate_defer = None, 0
     cn = [str(x).split("_")[0] for x in getattr(contacts, "body_names", [])]
     c_by = {n: i for i, n in enumerate(cn)}
     # Sensor body order is NOT the articulation's and NOT the clip's; resolve by name
@@ -391,8 +393,26 @@ def run_isaac(args) -> dict:
         t = i * dt
         if i % tick_every == 0:
             rough, head, label, seg_i = schedule_at(sched, t)
-            dec = planner.step(make_obs(rough), tick_every * dt, x_m=x_m, heading_err_deg=head)
-            if dec.active is not playing:
+            speed_now = float(np.hypot(*snap(robot.data.root_lin_vel_b[0])[:2])) \
+                if args.speed_gate == "on" else float("nan")
+            dec = planner.step(make_obs(rough), tick_every * dt, x_m=x_m,
+                               heading_err_deg=head, speed_m_s=speed_now)
+            if dec.active is not playing and args.switch_gate == "settled" \
+                    and dec.active in SUPPORTED and last_u is not None \
+                    and float(np.abs(last_u).max()) >= args.foot_clip_rad - 1e-6:
+                # Do not hand a new gait a body the current one cannot hold.
+                #
+                # The instrumented run says the correction was ALREADY pinned at its cap
+                # for three steps before the seam: WALK was mid lateral excursion, v_y
+                # climbing 0.044 -> 0.132 m/s, and the switch landed on that.  A capped
+                # correction is one that has stopped being a function of the velocity it
+                # is supposed to answer, so it is exactly the moment not to change gait.
+                #
+                # No new constant: the test is the cap the foot placement already uses.
+                # Unsaturated moments recur every stride, so this defers rather than
+                # forbids -- which is the difference between this and the speed band.
+                gate_defer += 1
+            elif dec.active is not playing:
                 if dec.active in SUPPORTED:
                     prev, playing = playing, dec.active
                     policies[playing].reset()
@@ -434,6 +454,11 @@ def run_isaac(args) -> dict:
                         k = int(np.argmin(np.abs(qs - last_q[None, :]).max(axis=1)))
                         policies[playing]._start = k
                         policies[playing]._i = 0
+                    blend_steps = int(round(args.switch_blend_s / dt))
+                    blend_left = blend_steps
+                    blend_from = last_q.copy() if last_q is not None else None
+                    if blend_from is None:
+                        blend_left = 0
                     q_new = policies[playing]._q[policies[playing].frame]
                     jump = float(np.abs(q_new - last_q).max()) if last_q is not None else float("nan")
                     events.append({"t_s": t, "kind": "switch", "from": prev.value,
@@ -460,6 +485,15 @@ def run_isaac(args) -> dict:
         cmd = policies[playing].act(
             BaseState(vx=float(vb[0].item()), vy=float(vb[1].item()), wz=float(wb[2].item())), dt)
         q = np.asarray(cmd.q, dtype=np.float32)
+        if blend_left > 0:
+            # Ramp from the pose held at the switch to the new clip's stream, while the
+            # new clip's PHASE keeps advancing -- the gait's rhythm is not paused, only
+            # the amplitude of the handover.  This is the same shape as the cold-start
+            # settle, which ramps stand -> clip over 0.5 s and is the one entry that is
+            # known to work; the switch is the same problem without the ramp.
+            a = 1.0 - blend_left / max(blend_steps, 1)
+            q = (1.0 - a) * blend_from + a * q
+            blend_left -= 1
         last_q = q
         tgt = robot.data.default_joint_pos.clone()
         tgt[:, idx_t] = torch.as_tensor(q, device=sim.device, dtype=torch.float32)
@@ -473,6 +507,11 @@ def run_isaac(args) -> dict:
         rec["root_ang_vel_b"].append(snap(robot.data.root_ang_vel_b[0]))
         rec["root_pos_w"].append(snap(robot.data.root_pos_w[0]))
         rec["root_quat_w"].append(snap(robot.data.root_quat_w[0]))
+        last_u = np.asarray(getattr(policies[playing], "last_u", np.zeros(12, np.float32)))
+        rec["foot_u"].append(np.asarray(getattr(policies[playing], "last_u",
+                                                 np.zeros(12, np.float32))).copy())
+        rec["swing"].append(np.asarray(getattr(policies[playing], "last_swing",
+                                               np.zeros(4, bool)), dtype=bool).copy())
         rec["played"].append(list(SkillId).index(playing))
         rec["planned"].append(list(SkillId).index(planner.active))
         x_m = float(robot.data.root_pos_w[0, 0].item())
@@ -489,11 +528,11 @@ def run_isaac(args) -> dict:
 
     a = {k: np.asarray(v) for k, v in rec.items()}
     return summarise(args, a, dt, sched, planner, events, refused, meta, clips,
-                     terminated_s, term_reason)
+                     terminated_s, term_reason, gate_defer)
 
 
 def summarise(args, a, dt, sched, planner, events, refused, meta, clips,
-              terminated_s, term_reason) -> dict:
+              terminated_s, term_reason, gate_defer=0) -> dict:
     """Per-segment gait numbers against the clip that was actually playing."""
     from verify_skill_replay import expected_from_meta, report
     played = a["played"]
@@ -539,7 +578,9 @@ def summarise(args, a, dt, sched, planner, events, refused, meta, clips,
 
     row = {"schedule": args.schedule, "run_utc": _RUN_UTC, "argv": " ".join(sys.argv[1:]),
            "foot_comp": args.foot_comp, "initial": args.initial,
-           "switch_entry": args.switch_entry,
+           "switch_entry": args.switch_entry, "switch_blend_s": args.switch_blend_s,
+           "speed_gate": args.speed_gate, "speed_refusals": planner.speed_refusals,
+           "switch_gate": args.switch_gate, "gate_deferrals": gate_defer,
            "planner_switches": planner.switches, "executed_switches": len(switches),
            "refused_ticks": sum(refused.values()),
            "refused_skills": "|".join(sorted(s.value for s in refused)),
@@ -569,6 +610,21 @@ def main() -> int:
     ap.add_argument("--rate", choices=("hi", "lo"), default="lo")
     ap.add_argument("--foot-comp", choices=("off", "on"), default="on")
     ap.add_argument("--contact-threshold-n", type=float, default=30.0)
+    ap.add_argument("--switch-blend-s", type=float, default=0.0,
+                    help="ramp the commanded pose from the one held at the switch to the "
+                         "new clip's stream over this long, with the clip's phase still "
+                         "advancing. 0 (default) is the sharp seam the harness measured.")
+    ap.add_argument("--switch-gate", choices=("off", "settled"), default="off",
+                    help="settled: defer a switch while the foot-placement correction is "
+                         "pinned at its cap, i.e. while the current gait is in an excursion "
+                         "it cannot answer. Uses the existing cap as its test, adds no "
+                         "constant, and defers rather than forbids.")
+    ap.add_argument("--foot-clip-rad", type=float, default=0.05,
+                    help="the foot-placement cap, also the --switch-gate settled test")
+    ap.add_argument("--speed-gate", choices=("off", "on"), default="off",
+                    help="on: the planner refuses a switch while the body's speed is "
+                         "further than SPEED_MATCH_MAX from the incoming skill's measured "
+                         "speed. What the band admits is the measurement.")
     ap.add_argument("--switch-entry", choices=("contact", "nearest", "level"), default="contact",
                     help="where in the new clip a mid-run switch lands. nearest (default): "
                          "contact (default): the frame whose stance/swing assignment agrees "

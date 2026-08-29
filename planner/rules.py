@@ -136,6 +136,7 @@ class RulePlanner:
         self.jump_detections = 0
         self.jump_missed = 0
         self.requests_dropped_busy = 0
+        self.speed_refusals = 0
 
     # -- capability test ---------------------------------------------------
     def _fits(self, skill_id: SkillId, obs: Observation, margin: float = 0.0) -> Tuple[bool, str]:
@@ -290,8 +291,36 @@ class RulePlanner:
         return err > lim
 
     # -- main tick ------------------------------------------------------------
+    def _speed_ok(self, requested: SkillId, speed_m_s: float) -> Tuple[bool, str]:
+        """Transition safety condition: is the body near the incoming gait's speed?
+
+        The fourth safety mechanism, added after the integration run found that no
+        mid-run switch survives (``outputs/planner_integration.md``).  A gait's clip
+        is the trajectory of a robot already at that gait's speed; handing it a body
+        travelling at a different one asks the first frame to be a pose it is not.
+
+        This refuses rather than blends -- it is the cheap half of the answer, and it
+        is the planner's half.  ``SPEED_MATCH_MAX`` is a CALIBRATION_NEEDED
+        placeholder; what the band ADMITS is the measurement, because the library's
+        measured speeds are 0.19 / 0.44 / 0.008 m/s and a band under 0.43 forbids
+        WALK<->TROT outright.  That is a fact about the library, not the threshold.
+
+        NaN speed means nobody is supplying one, and then the condition never fires --
+        every existing caller is unchanged.
+        """
+        lim = self.cfg.skill.SPEED_MATCH_MAX
+        if not (np.isfinite(speed_m_s) and np.isfinite(lim)) or requested is SkillId.JUMP:
+            return True, ""
+        want = self.library[requested].speed_m_s
+        gap = abs(speed_m_s - want)
+        if gap > lim:
+            return False, (f"speed {speed_m_s:.3f} is {gap:.3f} m/s from "
+                           f"{requested.value}'s {want:.3f}, over SPEED_MATCH_MAX {lim:.2f}")
+        return True, ""
+
     def step(self, obs: Observation, dt: float, x_m: float = float("nan"),
-             heading_err_deg: float = float("nan")) -> Decision:
+             heading_err_deg: float = float("nan"),
+             speed_m_s: float = float("nan")) -> Decision:
         cfg = self.cfg
         self._t += dt
         self._hold_timer += dt
@@ -375,6 +404,12 @@ class RulePlanner:
         #    cosmetic: with a 2.4 s delay a queued JUMP survives ~24 ticks, and
         #    letting the next tick's request overwrite it deleted every jump at
         #    long delay while leaving the short-delay numbers untouched.
+        if requested is not self.active:
+            ok_v, why_v = self._speed_ok(requested, speed_m_s)
+            if not ok_v:
+                self.speed_refusals += 1
+                return Decision(self.active, requested, f"switch refused: {why_v}",
+                                unsupported=unsupported_new, warnings=warnings)
         if requested is not self.active:
             if self._pending is None:
                 self._pending = requested

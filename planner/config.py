@@ -69,6 +69,9 @@ class SkillLimits:
     YAW_RATE_TURN: float = -0.3954
     HEADING_ERR_TURN_DEG: float = 12.0
 
+    # -- how close the body has to be to the incoming gait's speed to switch ----
+    SPEED_MATCH_MAX: float = 0.25
+
     # -- vertical capability -------------------------------------------------
     JUMP_APEX: float = 0.25
     JUMP_FLIGHT_S: float = 0.451
@@ -109,6 +112,12 @@ _p("skill.HEADING_ERR_TURN_DEG", Provenance.CALIBRATION_NEEDED, "deg",
    "placeholder. How far off the goal bearing before TURN is worth the switch. It trades the "
    "switch cost against the heading a straight gait would give away, and neither side has been "
    "measured on terrain yet, so this number is arbitrary and is here to make the wiring testable")
+_p("skill.SPEED_MATCH_MAX", Provenance.CALIBRATION_NEEDED, "m/s",
+   "placeholder. Transition safety condition: refuse a switch while the body's own speed "
+   "is further than this from the incoming skill's measured speed. There is no measurement "
+   "behind the number yet -- the point of having it is that the library's speeds are "
+   "0.19 (WALK), 0.44 (TROT) and 0.008 (TURN), so any band under 0.43 forbids WALK<->TROT "
+   "outright, and that is a fact about the library rather than about the threshold")
 _p("skill.JUMP_APEX", Provenance.MEASURED, "m", "jump_profile.csv apex_rise_ballistic_m, 0.250 ± 0.031 over 5 front_jump sessions")
 _p("skill.JUMP_FLIGHT_S", Provenance.MEASURED, "s", "jump_profile.csv flight_s, 0.451 ± 0.028")
 _p("skill.JUMP_HORIZONTAL", Provenance.MEASURED, "m", "jump_profile.csv dx_jump_m, 26 ± 4 mm - front_jump is a vertical hop in place")

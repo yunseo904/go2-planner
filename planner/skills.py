@@ -254,10 +254,16 @@ class ClipPolicy:
         self._start = int(start_frame) % self._n
         self._i = 0
         self._elapsed = 0.0
+        #: Last correction and swing gate, kept so a run can be asked what the foot
+        #: placement actually did rather than have it inferred from the outcome.
+        self.last_u = np.zeros(12, dtype=np.float32)
+        self.last_swing = np.zeros(4, dtype=bool)
 
     def reset(self) -> None:
         self._i = 0
         self._elapsed = 0.0
+        self.last_u = np.zeros(12, dtype=np.float32)
+        self.last_swing = np.zeros(4, dtype=bool)
         if self.foot is not None:
             self.foot.reset()
 
@@ -272,11 +278,14 @@ class ClipPolicy:
     def act(self, obs, dt: float) -> Command:
         f = self.frame
         q = self._q[f].astype(np.float32, copy=True)
+        self.last_u = np.zeros(12, dtype=np.float32)
+        self.last_swing = self._swing[f]
         if self.foot is not None:
             vy = float(getattr(obs, "vy", 0.0))
             wz = float(getattr(obs, "wz", 0.0))
             vx = float(getattr(obs, "vx", 0.0))
-            q = q + self.foot.step(vy, wz, self._swing[f], vx=vx)
+            self.last_u = self.foot.step(vy, wz, self._swing[f], vx=vx)
+            q = q + self.last_u
         self._i += 1
         self._elapsed += dt
         return Command(note=f"{self.skill} clip {self.name} frame {f}/{self._n}", q=q)
