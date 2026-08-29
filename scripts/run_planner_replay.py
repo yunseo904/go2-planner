@@ -90,6 +90,22 @@ SCHEDULES = {
     # "hold" alone asks for TROT, which is why an --initial WALK run on it switches at
     # the first tick instead of holding anything.
     "hold_walk": [(40.0, 0.050, 0.0, "WALK held, no switches")],
+    # TROT -> TURN direct is the one switch that still fails, and the speed gap is the
+    # suspect: 0.64 m/s into a gait whose measured speed is 0.008.  WALK sits between
+    # them at 0.23, so this asks whether it can serve as the bridge -- TROT -> WALK ->
+    # TURN, each leg of it a switch that already works.
+    "bridge": [
+        (10.0, 0.020,  0.0, "TROT, established"),
+        (6.0,  0.050,  0.0, "rough -> WALK                       [TROT->WALK]"),
+        (10.0, 0.050, 25.0, "heading off while rough -> TURN     [WALK->TURN]"),
+        (8.0,  0.050,  0.0, "heading recovered -> WALK           [TURN->WALK]"),
+    ],
+    # the control: the same TURN demand reached directly from TROT
+    "direct": [
+        (10.0, 0.020,  0.0, "TROT, established"),
+        (10.0, 0.020, 25.0, "heading off -> TURN                 [TROT->TURN]"),
+        (8.0,  0.020,  0.0, "heading recovered -> TROT           [TURN->TROT]"),
+    ],
     "chatter": [   # a feature parked exactly on TROT's limit, to provoke oscillation
         (4.0, 0.020, 0.0, "TROT"),
         (24.0, 0.0301, 0.0, "roughness parked 0.1 mm over TROT's limit"),

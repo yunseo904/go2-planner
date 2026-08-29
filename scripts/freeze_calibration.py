@@ -77,9 +77,15 @@ def build_archive() -> dict:
 
 def save(arrays: dict) -> str:
     paths.DATA_DIR.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(paths.CALIBRATION_NPZ, **arrays)
-    digest = hashlib.sha256(paths.CALIBRATION_NPZ.read_bytes()).hexdigest()
-    paths.CALIBRATION_SHA256.write_text(f"{digest}  {paths.CALIBRATION_NPZ.name}\n")
+    # OUT_NPZ lets a new probe set be frozen beside the existing archive instead of
+    # over it.  data/calibration_probes.npz is hash-pinned and 42 runs of results already
+    # reference it; adding the slope and roughness families writes a v2 rather than
+    # invalidating that.
+    out = OUT_NPZ or paths.CALIBRATION_NPZ
+    sha = out.with_suffix("").with_suffix(".sha256") if OUT_NPZ else paths.CALIBRATION_SHA256
+    np.savez_compressed(out, **arrays)
+    digest = hashlib.sha256(out.read_bytes()).hexdigest()
+    sha.write_text(f"{digest}  {out.name}\n")
     meta = {
         "content_sha256": str(arrays["content_sha256"]),
         "npz_sha256": digest,
@@ -99,7 +105,7 @@ def save(arrays: dict) -> str:
         "names": arrays["names"].tolist(),
         "source": "terrain_toolkit/calibrate.py (synthetic; no upstream code, no RNG)",
     }
-    paths.CALIBRATION_META_JSON.write_text(json.dumps(meta, indent=2) + "\n")
+    (paths.CALIBRATION_META_JSON if OUT_NPZ is None else OUT_NPZ.with_suffix('').with_suffix('.meta.json')).write_text(json.dumps(meta, indent=2) + "\n")
     return digest
 
 
@@ -208,11 +214,26 @@ mean.
 """
 
 
+#: Set by --out; None means the canonical archive.
+OUT_NPZ = None
+
+
+def _sha_path_for(out):
+    """Where the digest for ``out`` goes.  None -> the canonical sha256 file."""
+    from terrain_toolkit import paths as _p
+    return _p.CALIBRATION_SHA256 if out is None else out.with_suffix("").with_suffix(".sha256")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--out", default=None,
+                    help="write to this .npz instead of the canonical archive, so a new "
+                         "probe family can be frozen without invalidating the pinned one")
     ap.add_argument("--verify", action="store_true", help="rebuild once more and check determinism")
     ap.add_argument("--no-plan", action="store_true", help="skip outputs/calibration_plan.md")
     args = ap.parse_args()
+    global OUT_NPZ
+    OUT_NPZ = Path(args.out) if args.out else None
 
     arrays = build_archive()
     if args.verify:
@@ -225,11 +246,11 @@ def main() -> int:
     n = int(arrays["height_fields"].shape[0])
     fams = {f: int((arrays["families"] == f).sum())
             for f in sorted(set(arrays["families"].tolist()))}
-    print(f"[calib] wrote {paths.CALIBRATION_NPZ} ({n} probes: "
+    print(f"[calib] wrote {OUT_NPZ or paths.CALIBRATION_NPZ} ({n} probes: "
           f"{', '.join(f'{k}x{v}' for k, v in fams.items())})")
     print(f"[calib] sha256 {digest}")
-    print(f"[calib] wrote {paths.CALIBRATION_SHA256}")
-    print(f"[calib] wrote {paths.CALIBRATION_META_JSON}")
+    print(f"[calib] wrote {_sha_path_for(OUT_NPZ)}")
+    print(f"[calib] wrote {(paths.CALIBRATION_META_JSON if OUT_NPZ is None else OUT_NPZ.with_suffix('').with_suffix('.meta.json'))}")
 
     if not args.no_plan:
         paths.OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)

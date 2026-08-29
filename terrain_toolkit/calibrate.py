@@ -61,6 +61,15 @@ PIT_DEPTH_M = -1.0
 
 STEP_HEIGHTS_M = np.round(np.arange(0.02, 0.30 + 1e-9, 0.02), 3)
 GAP_WIDTHS_M = np.round(np.arange(0.05, 0.60 + 1e-9, 0.05), 3)
+#: Incline angles, degrees.  Spans the placeholder range (RUN 10, TROT 20, WALK 35).
+SLOPE_ANGLES_DEG = np.round(np.arange(5.0, 40.0 + 1e-9, 5.0), 3)
+#: Square-wave amplitudes, m.  Bottom of the ladder is one VERTICAL_SCALE unit, and the
+#: top is twice the largest placeholder (ROUGHNESS_TROT_MAX 0.03).
+ROUGHNESS_AMPLITUDES_M = np.round(np.arange(0.005, 0.060 + 1e-9, 0.005), 3)
+#: How long the varying patch runs, m.  Long enough that a gait takes several strides
+#: inside it rather than crossing it in one.
+RAMP_RUN_M = 2.0
+ROUGH_RUN_M = 2.0
 
 
 @dataclass
@@ -131,11 +140,84 @@ def make_gap_probe(width_m: float) -> Probe:
     )
 
 
+def make_slope_probe(angle_deg: float) -> Probe:
+    """Flat lane, then a constant incline of ``angle_deg``, then flat again.
+
+    One condition per terrain, like the others: the only thing that varies down the
+    family is the angle.  The ramp is ``RAMP_RUN_M`` long, which at the steepest angle
+    is a rise of about 1.1 m, and the lane is flat before and after so a failure is on
+    the incline rather than on getting to it.
+
+    The rise is quantised to ``VERTICAL_SCALE`` like every other probe, so the surface
+    is a staircase of 5 mm risers rather than a true plane.  That is deliberate and
+    matches how the archive stores everything else; the planner's own slope feature
+    ignores windows containing a cell step larger than ``STEP_THRESH``, and a 5 mm
+    riser is far below it, so the probe reads as slope and not as a series of steps.
+    """
+    hf = _blank()
+    i0 = int(round(OBSTACLE_X / HORIZONTAL_SCALE))
+    n_ramp = int(round(RAMP_RUN_M / HORIZONTAL_SCALE))
+    rise = np.tan(np.radians(angle_deg)) * HORIZONTAL_SCALE
+    for k in range(n_ramp):
+        hf[i0 + k, :] = _to_raw(rise * (k + 1))
+    hf[i0 + n_ramp:, :] = _to_raw(rise * n_ramp)
+    return Probe(
+        family="slope",
+        level=int(round(angle_deg / 5.0)) - 1,
+        param_m=float(angle_deg),                  # degrees, not metres, for this family
+        height_field=hf,
+        goals_m=_goals(OBSTACLE_X + RAMP_RUN_M + 0.5),
+        description=f"flat lane, {RAMP_RUN_M:.1f} m incline at {angle_deg:.0f} deg from "
+                    f"x={OBSTACLE_X} m, then flat",
+    )
+
+
+def make_roughness_probe(amplitude_m: float) -> Probe:
+    """Flat lane, then a patch of deterministic square-wave roughness.
+
+    NO RNG.  The pattern is a fixed four-cell triangle wave -- 0, +A, 0, -A, repeating --
+    so the archive is reproducible from the amplitude alone and two runs of the generator
+    cannot disagree.  Random noise would be closer to the benchmark's own terrain but
+    would put an unseeded draw inside a frozen archive, which is the thing this toolkit
+    exists to avoid.
+
+    **Roughness and step are not independent at short wavelength**, and the wave shape is
+    chosen to minimise the coupling rather than to pretend it away.  A two-cell square
+    wave of amplitude A has a cell-to-cell jump of 2A, so at the top of the ladder the
+    planner reads a 0.12 m STEP as well as 0.057 m of roughness and a failure could be
+    attributed to either -- that breaks the one-condition-per-terrain rule the whole
+    toolkit rests on.  The triangle halves the jump to A for the same amplitude.  It
+    cannot be removed entirely: roughness at this scale IS local steps.
+
+    The planner measures roughness as the RMS residual to a local straight line
+    (``features._detrended_rms``); for this wave that residual is about 0.7 A, and the
+    measured value is recorded next to the nominal one when the archive is frozen.
+    """
+    hf = _blank()
+    i0 = int(round(OBSTACLE_X / HORIZONTAL_SCALE))
+    n_patch = int(round(ROUGH_RUN_M / HORIZONTAL_SCALE))
+    raw = _to_raw(amplitude_m)
+    pattern = (0, raw, 0, -raw)
+    for k in range(n_patch):
+        hf[i0 + k, :] = pattern[k % 4]
+    return Probe(
+        family="roughness",
+        level=int(round(amplitude_m / 0.005)) - 1,
+        param_m=float(amplitude_m),
+        height_field=hf,
+        goals_m=_goals(OBSTACLE_X + ROUGH_RUN_M + 0.5),
+        description=f"flat lane, {ROUGH_RUN_M:.1f} m of two-cell square-wave roughness at "
+                    f"+-{amplitude_m*1000:.0f} mm from x={OBSTACLE_X} m",
+    )
+
+
 def build_probes() -> List[Probe]:
-    """Every probe, in a stable order: step_up, step_down, gap."""
+    """Every probe, in a stable order: step_up, step_down, gap, slope, roughness."""
     probes = [make_step_probe(h) for h in STEP_HEIGHTS_M]
     probes += [make_step_probe(h, down=True) for h in STEP_HEIGHTS_M]
     probes += [make_gap_probe(w) for w in GAP_WIDTHS_M]
+    probes += [make_slope_probe(a) for a in SLOPE_ANGLES_DEG]
+    probes += [make_roughness_probe(a) for a in ROUGHNESS_AMPLITUDES_M]
     return probes
 
 
@@ -174,11 +256,31 @@ CALIBRATION_MAP: Dict[str, Tuple[str, str, str]] = {
         "walk every gap level; the largest crossed by stepping bounds the fore-aft foot span "
         "from below. Distinct from GAP_MAX (measured: 0.0 m), which is what a *jump* clears",
     ),
-    "skill.ROUGHNESS_TROT_MAX": (None, "residual RMS to a local plane", "needs a roughness probe (not in this set)"),
-    "skill.ROUGHNESS_RUN_MAX": (None, "residual RMS to a local plane", "needs a roughness probe (not in this set)"),
-    "skill.SLOPE_WALK_MAX": (None, "sustained incline in degrees", "needs a ramp probe (not in this set)"),
-    "skill.SLOPE_TROT_MAX": (None, "sustained incline in degrees", "needs a ramp probe (not in this set)"),
-    "skill.SLOPE_RUN_MAX": (None, "sustained incline in degrees", "needs a ramp probe (not in this set)"),
+    "skill.ROUGHNESS_TROT_MAX": (
+        "roughness",
+        "residual RMS to a local plane",
+        "run every roughness level in TROT; the family's amplitude IS the feature the planner measures, so the level that fails is the limit directly",
+    ),
+    "skill.ROUGHNESS_RUN_MAX": (
+        "roughness",
+        "residual RMS to a local plane",
+        "same sweep held in RUN",
+    ),
+    "skill.SLOPE_WALK_MAX": (
+        "slope",
+        "sustained incline in degrees",
+        "run every slope level in WALK; take the steepest cleared on all repeats, back off one level (5 deg) for margin",
+    ),
+    "skill.SLOPE_TROT_MAX": (
+        "slope",
+        "sustained incline in degrees",
+        "same sweep held in TROT",
+    ),
+    "skill.SLOPE_RUN_MAX": (
+        "slope",
+        "sustained incline in degrees",
+        "same sweep held in RUN",
+    ),
 }
 
 #: ``step_down`` measures no placeholder directly.  It is included because the

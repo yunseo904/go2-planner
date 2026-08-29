@@ -229,6 +229,23 @@ def run_isaac(args) -> list:
                                 num_envs=n, env_spacing=0.0)
     importer = TerrainImporter(ti_cfg)
     importer.import_mesh("probes", mesh)
+    # DELETE the ground plane the importer just made.  terrain_type="plane" is the only
+    # option that needs no extra config, and it calls import_ground_plane(), which lays a
+    # 2000 km x 2000 km plane at z = 0 UNDER the probe mesh.  That floors every pit and
+    # makes every gutter solid: the gap family measured a robot walking over its own
+    # 1 m deep, 0.60 m wide trench on an invisible floor, reported 60/60 reached and 0%
+    # fallen, and produced a FOOT_SPAN_X of 0.550 m that no walking Go2 could earn.
+    # Removing it is the whole fix; a probe that walks off its cell now falls, which is
+    # the correct verdict for a probe that walks off its cell.
+    plane_path = ti_cfg.prim_path + "/terrain"
+    _stage = omni.usd.get_context().get_stage()
+    if _stage.GetPrimAtPath(plane_path).IsValid():
+        _stage.RemovePrim(plane_path)
+    if _stage.GetPrimAtPath(plane_path).IsValid():
+        raise SystemExit(f"[grid] refusing to run: the ground plane at {plane_path} is "
+                         f"still on the stage, so every pit in the archive is floored")
+    print(f"[grid] removed the importer's infinite ground plane at {plane_path}; "
+          f"pits are open and the gutters are void")
     origins = np.concatenate([spawns, np.full((n, 1), 0.0)], axis=1)
     # NOT importer.configure_env_origins(origins): in Isaac Lab 3.0 that call expects a
     # generator-shaped (rows, cols, 3) grid and, given a flat (N, 3) list, takes the
@@ -362,6 +379,7 @@ def run_isaac(args) -> list:
     def entry_frames(rep: int) -> list:
         return [int(round(rep * len(q) / max(args.reps, 1))) % len(q) for q in q_seq]
     goal2 = np.array([probes["goals"][i][1] for i in idx]) + offsets     # world frame
+    foot_ids_t, _foot_names_t = robot.find_bodies(".*_foot")
     rows_out = []
 
     for rep in range(max(args.reps, 1)):
@@ -386,6 +404,7 @@ def run_isaac(args) -> list:
         reached = np.zeros(n, dtype=bool)
         fell = np.zeros(n, dtype=bool)
         t_reached = np.full(n, np.nan)
+        tr = {"root_pos_w": [], "root_quat_w": [], "foot_z": []} if args.trace_npz else None
         print(f"[grid] rep {rep+1}/{args.reps}: entry frames {ent[:6]}"
               f"{'...' if n > 6 else ''}, settled |v| max "
               f"{float(torch.linalg.norm(robot.data.root_lin_vel_b, dim=1).max().item()):.3f} m/s")
@@ -414,6 +433,10 @@ def run_isaac(args) -> list:
                 robot.write_data_to_sim(); sim.step(); robot.update(phys_dt)
 
             pos = snap(robot.data.root_pos_w)
+            if tr is not None:
+                tr["root_pos_w"].append(pos.copy())
+                tr["root_quat_w"].append(snap(robot.data.root_quat_w))
+                tr["foot_z"].append(snap(robot.data.body_pos_w[:, foot_ids_t, 2]))
             d = np.linalg.norm(pos[:, :2] - goal2, axis=1)
             newly = (~reached) & (d < GOAL_RADIUS_M) & (step <= budget_steps)
             t_reached[newly] = step * dt
@@ -434,6 +457,17 @@ def run_isaac(args) -> list:
                              "run_utc": _RUN_UTC, "argv": " ".join(sys.argv[1:])})
         print(f"[grid]   rep {rep+1}: reached {int(reached.sum())}/{n}, "
               f"fell {int(fell.sum())}/{n}, {step+1} steps")
+        if tr is not None and rep == 0:
+            out = Path(args.trace_npz)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(
+                out, dt=dt, obstacle_x=float(probes.get("obstacle_x", 4.0)),
+                probe=np.array([probes["names"][i] for i in idx]),
+                skill=np.array([r[1] for r in runs]),
+                level_m=np.array([r[4] for r in runs]),
+                spawn=spawns, goal2=goal2, offsets=offsets,
+                **{k: np.asarray(v) for k, v in tr.items()})
+            print(f"[grid] trace -> {out}  ({len(tr['root_pos_w'])} steps x {n} robots)")
 
     # -- the protocol's own reduction: a level passes only if EVERY repeat passed ----
     print(f"\n  {'probe':16s} {'skill':6s} {'param m':>8s} {'passed':>10s}  reps")
@@ -519,6 +553,10 @@ def main() -> int:
     ap.add_argument("--skip-unsupported", action="store_true",
                     help="drop probes whose skill the low level cannot execute (RUN/JUMP)")
     ap.add_argument("--results-csv", default=None)
+    ap.add_argument("--trace-npz", default=None,
+                    help="dump rep 0's per-step base pose and foot heights for every "
+                         "robot, so a failure can be located on the probe rather than "
+                         "inferred from the verdict")
     ap.add_argument("--plan", action="store_true")
     ap.add_argument("--self-test", action="store_true")
     try:
