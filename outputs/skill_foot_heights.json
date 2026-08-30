@@ -1,0 +1,97 @@
+{
+  "WALK": {
+    "chord_apex_mm": {
+      "FL": 22.0,
+      "FR": 31.3,
+      "RL": 1.2,
+      "RR": 8.1
+    },
+    "plane_p90_mm": {
+      "FL": 35.5,
+      "FR": 11.9,
+      "RL": 7.3,
+      "RR": 13.4
+    },
+    "chord_median_mm": 15.1,
+    "chord_max_mm": 31.3,
+    "plane_median_mm": 12.7,
+    "n_frames": 37,
+    "swing_frac": 0.338
+  },
+  "TROT": {
+    "chord_apex_mm": {
+      "FL": 75.1,
+      "FR": 59.8,
+      "RL": 21.2,
+      "RR": 55.2
+    },
+    "plane_p90_mm": {
+      "FL": null,
+      "FR": 6.0,
+      "RL": 32.6,
+      "RR": null
+    },
+    "chord_median_mm": 57.5,
+    "chord_max_mm": 75.1,
+    "plane_median_mm": 19.3,
+    "n_frames": 32,
+    "swing_frac": 0.422
+  },
+  "RUN": {
+    "chord_apex_mm": {
+      "FL": 47.4,
+      "FR": 56.9,
+      "RL": 50.3,
+      "RR": 56.4
+    },
+    "plane_p90_mm": {
+      "FL": null,
+      "FR": null,
+      "RL": null,
+      "RR": null
+    },
+    "chord_median_mm": 53.3,
+    "chord_max_mm": 56.9,
+    "plane_median_mm": null,
+    "n_frames": 16,
+    "swing_frac": 0.656
+  },
+  "TURN": {
+    "chord_apex_mm": {
+      "FL": 9.3,
+      "FR": 2.5,
+      "RL": 11.7,
+      "RR": 22.0
+    },
+    "plane_p90_mm": {
+      "FL": 6.6,
+      "FR": null,
+      "RL": 1.7,
+      "RR": 5.3
+    },
+    "chord_median_mm": 10.5,
+    "chord_max_mm": 22.0,
+    "plane_median_mm": 5.3,
+    "n_frames": 45,
+    "swing_frac": 0.328
+  },
+  "JUMP": {
+    "chord_apex_mm": {
+      "FL": 43.1,
+      "FR": 2.3,
+      "RL": 25.2,
+      "RR": 3.6
+    },
+    "plane_p90_mm": {
+      "FL": null,
+      "FR": 4.6,
+      "RL": -1.4,
+      "RR": null
+    },
+    "chord_median_mm": 14.4,
+    "chord_max_mm": 43.1,
+    "plane_median_mm": 1.6,
+    "n_frames": 221,
+    "swing_frac": 0.749
+  }
+}

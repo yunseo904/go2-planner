@@ -351,3 +351,40 @@ The check that caught it is the cheap one and should be run before trusting any 
 channel: take a quantity the channel implies, compute the same quantity from an
 independent signal, and require them to agree. Mean Fz vs `m·g` agreed to 2%; sd(Fx) vs
 `m·sd(a_x)` disagreed by everything.
+
+---
+
+## 11. The traces store quaternions scalar-LAST, and an analysis hand-rolled scalar-first
+
+Every trace in this project stores `root_quat_w` as Isaac hands it over, and in Isaac Lab
+3.0 that array is **`(x, y, z, w)`**. `sim/replay.py` has said so since the beginning:
+
+```python
+QUAT_ORDER = "xyzw"
+def quat_to_rpy_deg(q, order: str = QUAT_ORDER): ...
+```
+
+The lip diagnosis did not call it. It wrote the roll/pitch/yaw formulas out by hand,
+assuming `(w, x, y, z)`, and read four traces that way.
+
+**Why it did not look wrong.** On a settled robot the three small components are all
+~0.01 and the large one is ~1.0, so *either* reading produces small, plausible-looking
+angles at t = 0: the wrong one returned roll −0.8°, pitch +1.3°, yaw 0. The error only
+opens up as the robot rotates, and then it *swaps the axes* — a run that walked a wide
+circle at 15 °/m came back as **roll growing +2° → +55° at near-zero yaw**, which is a
+completely different and completely coherent-sounding mechanism. It was reported as one.
+
+The check that caught it, and would have caught it immediately: **the base height.** A
+robot at 55° of roll is not standing, and `root_pos_w[:, 2]` sat at 0.311–0.316 m — its
+nominal 0.32 — for the whole run. Two channels, one question, and they disagreed.
+
+| what was reported | what the trace says |
+|---|---|
+| swing-lift 60: roll +2 → +55°, "an asymmetric lift is a steering input" | roll median −0.6°, \|roll\| max 5.0°. The +55 was **yaw**. |
+| WALK 0.04 lip: rolls at t = 16.5 | pitch −17.8° max, roll 29.5° max, and it does stall at the lip — that part stands |
+| TROT: \|ψ\| max 30.6°, "leaves the lane" | pre-lip curvature 0.7–6.1 °/m; it drifts, but by 1.1–1.6 m, not out of a 4 m lane |
+
+**Rule, now in CLAUDE.md §6.5:** a quaternion has no self-evident layout and the small-angle
+case hides the mistake. Call the project's converter. If a rotation must be written out by
+hand, assert `argmax(|q|) == 3` first, and check the result against a channel that does not
+come from the quaternion at all.

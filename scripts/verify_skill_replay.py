@@ -466,7 +466,8 @@ def deviation_report(foot_u: np.ndarray, q_meas: np.ndarray, q_orig: np.ndarray,
 
 
 
-def swing_lift_offsets(robot, sim, idx_t, clip, target_m, phys_dt, eps=0.02, sign=None):
+def swing_lift_offsets(robot, sim, idx_t, clip, target_m, phys_dt, eps=0.02, sign=None,
+                       symmetric=True):
     """Per-frame thigh/calf offsets that raise each swing foot to ``target_m`` at its apex.
 
     The real robot's ``classic_walk`` lifts its rear feet about 5 mm and its front ones
@@ -490,6 +491,20 @@ def swing_lift_offsets(robot, sim, idx_t, clip, target_m, phys_dt, eps=0.02, sig
     numerical Jacobian solved per frame for (dz = lift, dx = 0), so the foot goes straight
     up and its fore-aft position is unchanged.  The HIP is not used: that is foot
     placement's and heading hold's joint, and the two must not compete for it.
+
+    Left-right symmetry (``symmetric``, the default).  The amount ADDED is what the robot
+    feels as a change; the recording walks straight with the asymmetry it already has.
+    Choosing the amplitude per leg from that leg's own apex therefore adds a DIFFERENT
+    amount left and right -- measured at 60 mm: FL +39.7 vs FR +28.4, RL +60.0 vs
+    RR +51.4 -- and an asymmetric edit is a roll input.  It showed up as +2 -> +55 deg of
+    roll and 1.5 m of sideways crab over a 3 m flat approach, at under 5 deg of yaw error
+    the whole way, so heading hold never saw it (outputs/swing_lift_symmetry.md).
+
+    So the amplitude is chosen PER MIRROR PAIR, from the pair's worst bout, and added
+    equally to both legs: the added Delta z is identical left and right and the clip's own
+    left-right relationship survives untouched.  Front and rear are free to differ -- that
+    is a pitch-symmetric difference, not a steering one.  ``symmetric=False`` restores the
+    per-leg choice, for the A/B only.
     """
     import torch
     from sim.replay import quat_rotate_inv, snap
@@ -525,27 +540,56 @@ def swing_lift_offsets(robot, sim, idx_t, clip, target_m, phys_dt, eps=0.02, sig
 
     lift = np.zeros((n, 4))
     report = {}
+
+    # --- pass 1: every leg's swing bouts and the apex each one already has
+    leg_bouts, leg_apex = {}, {}
     for j, leg in enumerate(legs):
-        sw = ~contact[:, j]
-        # A cyclic clip can start mid-swing; roll so a bout is not cut at the seam.
-        apexes, added = [], []
-        for a, b in bouts(sw):
+        bl, ap = [], []
+        for a, b in bouts(~contact[:, j]):
             if b - a < 3:
                 continue
             p0, p1 = fpos[a, j], fpos[b - 1, j]
             t = np.linspace(0.0, 1.0, b - a)
             chord_z = p0[2] + (p1[2] - p0[2]) * t
-            h = fpos[a:b, j, 2] - chord_z            # height above the liftoff/touchdown chord
-            apex = float(h.max())
-            apexes.append(apex)
-            need = max(0.0, target_m - apex)
-            added.append(need)
-            lift[a:b, j] = need * np.sin(np.pi * t) ** 2
-        report[leg] = {"apex_existing_mm": [round(a * 1000, 1) for a in apexes],
-                       "added_mm": [round(a * 1000, 1) for a in added]}
+            h = fpos[a:b, j, 2] - chord_z        # height above the liftoff/touchdown chord
+            bl.append((a, b, t))
+            ap.append(float(h.max()))
+        leg_bouts[leg], leg_apex[leg] = bl, ap
+
+    # --- pass 2: how much to add.  Symmetric picks one amplitude per mirror pair, from
+    # the WORST bout in the pair, so the added dz is identical left and right and the
+    # lower leg still reaches the target.  Per-leg is the old, asymmetric choice.
+    added_of = {}
+    for leg in legs:
+        ap = leg_apex[leg]
+        if not ap:
+            added_of[leg] = None
+            continue
+        if symmetric:
+            mate = _MIRROR_LEG[leg]
+            pool = ap + (leg_apex.get(mate) or [])
+            added_of[leg] = max(0.0, target_m - min(pool))
+        else:
+            added_of[leg] = [max(0.0, target_m - a) for a in ap]
+
+    for j, leg in enumerate(legs):
+        need = added_of[leg]
+        if need is None:
+            report[leg] = {"apex_existing_mm": [], "added_mm": []}
+            continue
+        adds = []
+        for k, (a, b, t) in enumerate(leg_bouts[leg]):
+            v = float(need) if symmetric else need[k]
+            adds.append(v)
+            lift[a:b, j] = v * np.sin(np.pi * t) ** 2
+        report[leg] = {"apex_existing_mm": [round(x * 1000, 1) for x in leg_apex[leg]],
+                       "added_mm": [round(x * 1000, 1) for x in adds]}
+    report["_symmetric"] = bool(symmetric)
 
     # --- vertical displacement -> (thigh, calf), per frame, foot straight up
     off = np.zeros((n, 12))
+    jac = {l: [] for l in legs}
+    leg_of = {j: l for j, l in enumerate(legs)}
     for i in range(n):
         if not lift[i].any():
             continue
@@ -565,6 +609,20 @@ def swing_lift_offsets(robot, sim, idx_t, clip, target_m, phys_dt, eps=0.02, sig
                 continue
             off[i, 3 * j + 1] = sol[0]
             off[i, 3 * j + 2] = sol[1]
+            jac[leg_of[j]].append((A, sol / max(lift[i, j], 1e-12)))
+
+    # The Jacobian is a property of the POSE, and the four legs are at different poses at
+    # their own mid-swing, so the rad-per-mm each one needs is not expected to match.
+    # Reported so that difference is a measured number rather than a suspicion.
+    for leg, rows in jac.items():
+        if not rows:
+            continue
+        A = np.mean([r[0] for r in rows], axis=0)
+        g = np.mean([r[1] for r in rows], axis=0)
+        report[leg]["jac_dz_dthigh_dcalf"] = [round(float(x), 4) for x in A[0]]
+        report[leg]["jac_dx_dthigh_dcalf"] = [round(float(x), 4) for x in A[1]]
+        report[leg]["cond"] = round(float(np.linalg.cond(A)), 1)
+        report[leg]["rad_per_mm_thigh_calf"] = [round(float(x) / 1000.0, 6) for x in g]
     return off, report, lift
 
 
@@ -832,16 +890,21 @@ def run_isaac(args, clip: dict, meta: dict, then_clip: dict | None = None,
     lift_report = {}
     if args.swing_lift > 0:
         lift_off, lift_report, lift_z = swing_lift_offsets(
-            robot, sim, idx_t, clip, args.swing_lift / 1000.0, phys_dt, sign=sign)
+            robot, sim, idx_t, clip, args.swing_lift / 1000.0, phys_dt, sign=sign,
+            symmetric=not args.swing_lift_asym)
         q_des_signed = q_des_signed + lift_off
-        print(f"[replay] *** SWING LIFT --swing-lift {args.swing_lift:g} mm: each swing "
+        print(f"[replay] *** SWING LIFT --swing-lift {args.swing_lift:g} mm "
+              f"({'PER-LEG (asymmetric)' if args.swing_lift_asym else 'LEFT-RIGHT SYMMETRIC'}): each swing "
               f"foot's arc is raised to that apex above its own liftoff/touchdown chord, "
               f"as A*sin^2(pi*phase) so both ends and both end SLOPES are unchanged. "
               f"Stance is untouched and so is the hip. This EDITS THE RECORDING and every "
               f"number below is stamped with it. The archive on disk is unchanged. ***")
         for leg, r in lift_report.items():
+            if leg.startswith("_"):
+                continue
             print(f"[replay]   {leg}: apex already {r['apex_existing_mm']} mm, "
-                  f"adding {r['added_mm']} mm")
+                  f"adding {r['added_mm']} mm, dz/dthigh,dcalf "
+                  f"{r.get('jac_dz_dthigh_dcalf')} cond {r.get('cond')}")
         print(f"[replay]   joint offsets: thigh max {np.abs(lift_off[:, 1::3]).max():.4f} rad, "
               f"calf max {np.abs(lift_off[:, 2::3]).max():.4f} rad")
     if args.plant_comp == "height":
@@ -1535,6 +1598,9 @@ def run_isaac(args, clip: dict, meta: dict, then_clip: dict | None = None,
         "foot_cap_hit_frac": (fc_cap_hits / fc_applied) if fc_applied else 0.0,
         "tag": args.tag,
         "swing_lift_mm": args.swing_lift,
+        "swing_lift_sym": int(not args.swing_lift_asym),
+        "swing_lift_added_mm": json.dumps(
+            {k: v.get("added_mm") for k, v in lift_report.items() if not k.startswith("_")}),
         "swing_lift_thigh_max_rad": float(np.abs(lift_off[:, 1::3]).max()),
         "swing_lift_calf_max_rad": float(np.abs(lift_off[:, 2::3]).max()),
         **dev_summ,
@@ -1829,6 +1895,11 @@ def main() -> int:
                          "documented value rather than tuning one. Endpoints and their "
                          "slopes are untouched, so stride and speed are not being edited; "
                          "stance and the hip are untouched too.")
+    ap.add_argument("--swing-lift-asym", action="store_true",
+                    help="choose the lift amplitude PER LEG from that leg's own apex, the "
+                         "original behaviour. The default is per MIRROR PAIR, because an "
+                         "unequal left-right addition is a roll input the heading "
+                         "controller cannot see. For the A/B only.")
     ap.add_argument("--stance-height-json", default="outputs/stance_height.json",
                     help="per-clip stance-height deficit and the solved thigh/calf offset, "
                          "from scripts/check_stance_height.py")

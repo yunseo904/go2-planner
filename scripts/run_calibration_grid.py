@@ -299,10 +299,13 @@ def run_isaac(args) -> list:
         lift_by_clip = {}
         for name, c in clips.items():
             off, rep_, _ = swing_lift_offsets(robot, sim, idx_t, c,
-                                              args.swing_lift / 1000.0, phys_dt)
+                                              args.swing_lift / 1000.0, phys_dt,
+                                              symmetric=not args.swing_lift_asym)
             lift_by_clip[name] = off
             print(f"[grid] swing lift {args.swing_lift:g} mm on {name}: "
-                  + ", ".join(f"{l} +{r['added_mm']}" for l, r in rep_.items()))
+                  + ("PER-LEG " if args.swing_lift_asym else "SYMMETRIC ")
+                  + ", ".join(f"{l} +{r['added_mm']}"
+                              for l, r in rep_.items() if not l.startswith("_")))
         q_seq = [q + lift_by_clip[r[1]] for q, r in zip(q_seq, runs)]
         print(f"[grid] *** SWING LIFT ON: the recording's swing arcs are raised. Stance and "
               f"the hip are untouched; the archive on disk is unchanged. ***")
@@ -501,6 +504,14 @@ def run_isaac(args) -> list:
                              "grid_rows": rows, "grid_cols": cols, "n_probes": n,
                              "foot_comp": args.foot_comp, "steps": step + 1,
                              "swing_lift_mm": args.swing_lift,
+                             "swing_lift_sym": int(not args.swing_lift_asym),
+                             # Stamped because a sweep was once read back without knowing
+                             # whether heading hold had been on, and `heading` (the full
+                             # formula) and `heading-only` (the heading half) are not the
+                             # same controller -- outputs/heading_hold.md measures the full
+                             # one as WORSE in both gaits.  argv carried it; no column did.
+                             "heading": args.heading,
+                             "heading_cap_rad": args.heading_cap,
                              "run_utc": _RUN_UTC, "argv": " ".join(sys.argv[1:])})
         print(f"[grid]   rep {rep+1}: reached {int(reached.sum())}/{n}, "
               f"fell {int(fell.sum())}/{n}, {step+1} steps")
@@ -602,6 +613,9 @@ def main() -> int:
     ap.add_argument("--swing-lift", type=float, default=0.0,
                     help="raise every swing foot's arc to this apex in mm, the same edit "
                          "scripts/verify_skill_replay.py --swing-lift applies")
+    ap.add_argument("--swing-lift-asym", action="store_true",
+                    help="per-leg lift amplitude (the original, asymmetric choice) instead "
+                         "of one amplitude per mirror pair. For the A/B only.")
     ap.add_argument("--heading", choices=("off", "heading", "heading-only"), default="off",
                     help="hold the spawn heading with differential lateral foot placement")
     ap.add_argument("--skip-unsupported", action="store_true",
