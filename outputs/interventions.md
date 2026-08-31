@@ -64,8 +64,20 @@ caps these gaits on a step.**
 
 | Parameter | State | Why |
 |---|---|---|
-| `robot.FOOT_SPAN_X` | **CALIBRATION_NEEDED** | 0.550 m was measured over an invisible floor (A5). WALK cannot cross 0.05 m. |
-| `skill.STEP_TROT_MAX` | **not measurable yet** | TROT holds 3.20 °/m against a 0.565 budget, so it leaves the 4 m lane before the answer is about the step. Its 0/N at every level is a lane-departure score. |
+| `robot.FOOT_SPAN_X` | **CALIBRATION_NEEDED** | 0.550 m was measured over an invisible floor (A5). The 60 gap runs that scored 0 predate heading hold and are being repeated. `unmeasurable.md` |
+| `skill.STEP_TROT_MAX` | **not measurable** | No longer a lane departure: with the step-length bias fed forward TROT crosses the obstacle line and runs to 7.4 m at 1.95 °/m, and arrives **1.64 m beside** a 0.35 m point goal. The residual is cross-track offset, which a heading controller has no term for. `trot_straight.md` |
 | `skill.STEP_WALK_MAX` | measurable; 0.02 passes, 0.04 fails | The mechanism is known: the rear feet swing 4–5 mm and the foot's own radius (23 mm) is what lets a 20 mm riser through. `lip_failure.md` |
-| `skill.STEP_RUN_MAX`, `skill.STEP_JUMP_MAX` | open | RUN has no flight phase in the clip; JUMP is torque-short. `run_collapse.md`, `jump_torque.md` |
-| slope / roughness families | generated, never run | — |
+| `skill.STEP_RUN_MAX`, `skill.STEP_JUMP_MAX` | **not measurable** | RUN collapses in 1.13 s and has no flight phase in the clip; JUMP needs 1.10–1.20× the actuator limit, which is not being raised. `unmeasurable.md` |
+| `skill.SLOPE_WALK_MAX` | **bracketed** | placeholder 35°; measured 4/5 at 5°, 0/5 at 10°. `v2_probes.md` |
+| `skill.ROUGHNESS_TROT_MAX` | **bracketed** | placeholder 0.03 m; WALK 5/5 at 0.005, 3/5 at 0.010, 0/5 at 0.015; TROT 0/5 throughout. `v2_probes.md` |
+| `skill.SLOPE_TROT_MAX`, `SLOPE_RUN_MAX`, `ROUGHNESS_RUN_MAX` | open | blocked on the gaits, not on the probes. |
+| TURN on terrain | **below every ladder floor** | a 0.02 m edge under the footprint is enough to stop a 90° turn. `turn_probes.md` |
+
+The slope and roughness families are no longer "generated, never run": they were never in
+the frozen archive either, and are now, as `data/calibration_probes_v2.npz`. `v2_probes.md`.
+
+### One addition to §B, measured after this table was first written
+
+| # | What | Joints | Authority | Why | Deviation | Status |
+|---|---|---|---|---|---|---|
+| B7 | **Step-length heading half** `--heading-len` | thigh | one-sided, `[-0.04, 0]` rad | The same `ω_target` substitution read in the fore-aft axis; `T_stance` cancels, so it is as parameter-free as B2. One-sided because the open-loop probe measured (b) destroying TROT at +0.02. | 0.0% of swing frames reach its cap | **Default off.** A null result as a *proportional* term (+3% survival, −2% curvature, worse drift). The same mechanism as a **constant feed-forward** gives TROT +72% alive, +92% ground, −43% curvature. `trot_straight.md` |

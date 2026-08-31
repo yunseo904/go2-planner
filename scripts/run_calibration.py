@@ -69,6 +69,14 @@ PARAM_SKILL = {
     "skill.STEP_RUN_MAX": "RUN",
     "skill.STEP_JUMP_MAX": "JUMP",
     "robot.FOOT_SPAN_X": "WALK",
+    # The v2 families.  CALIBRATION_MAP has carried these five since the generator was
+    # written; this table did not, so selecting them raised KeyError in planned_runs and
+    # the slope/roughness half of the plan was unreachable from the command line.
+    "skill.SLOPE_WALK_MAX": "WALK",
+    "skill.SLOPE_TROT_MAX": "TROT",
+    "skill.SLOPE_RUN_MAX": "RUN",
+    "skill.ROUGHNESS_TROT_MAX": "TROT",
+    "skill.ROUGHNESS_RUN_MAX": "RUN",
 }
 
 #: Seconds a repeat gets to reach goal 2 before it counts as a failure.
@@ -79,8 +87,15 @@ FALL_HEIGHT_M = 0.15
 GOAL_RADIUS_M = 0.35
 
 
+#: Set by --probes.  ``None`` means the pinned 42-probe archive; the v2 archive adds the
+#: slope and roughness families after it, so probe INDICES 0-41 are the same terrain in
+#: both and a result measured against one is comparable with a result measured against
+#: the other.  Checked, not assumed: freeze_calibration.build_probes appends.
+PROBES_NPZ = None
+
+
 def load_probes() -> dict:
-    z = np.load(CALIBRATION_NPZ, allow_pickle=False)
+    z = np.load(PROBES_NPZ or CALIBRATION_NPZ, allow_pickle=False)
     return {
         "hf": z["height_fields"],
         "goals": z["goals"],
@@ -94,8 +109,34 @@ def load_probes() -> dict:
     }
 
 
-def planned_runs(probes: dict, params: list, reps: int, max_probes: int | None) -> list:
-    """``[(parameter, skill, family, probe index, level m)]`` in run order."""
+def planned_runs(probes: dict, params: list, reps: int, max_probes: int | None,
+                 families: list | None = None, skill: str | None = None) -> list:
+    """``[(parameter, skill, family, probe index, level m)]`` in run order.
+
+    ``families``/``skill`` are the off-map path: a family run with a skill that no
+    ``CALIBRATION_MAP`` entry pairs it with.  It exists for TURN, which has no terrain
+    parameter at all -- its only CALIBRATION_NEEDED entry is ``HEADING_ERR_TURN_DEG``,
+    a bearing threshold -- so there is nothing in the map to select and no name yet for
+    what the sweep would settle.  Measuring first and naming the parameter afterwards is
+    deliberate: inventing ``skill.STEP_TURN_MAX`` before knowing whether the number
+    exists would put a placeholder in config for a quantity that may not be defined.
+    The parameter column is stamped ``probe.<family>@<SKILL>`` so a row from this path
+    is never mistaken for one that settles a config field.
+    """
+    if families or skill:
+        if not (families and skill):
+            raise ValueError("--families and --skill are used together")
+        runs = []
+        for family in families:
+            idx = [i for i, f in enumerate(probes["families"]) if f == family]
+            if not idx:
+                raise ValueError(f"no probes in family {family!r}")
+            if max_probes:
+                idx = idx[:max_probes]
+            for i in idx:
+                runs.append((f"probe.{family}@{skill}", skill, family, i,
+                             float(probes["params_m"][i])))
+        return runs
     runs = []
     for p in params:
         family = CALIBRATION_MAP[p][0]

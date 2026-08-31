@@ -62,7 +62,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 from sim import heightfield as HF
 from sim import isaac_cfg as IC
-from terrain_toolkit.calibrate import CALIBRATION_MAP
+from terrain_toolkit.calibrate import CALIBRATION_MAP, RAMP_RUN_M, ROUGH_RUN_M
 from terrain_toolkit.paths import CALIBRATION_NPZ, SKILL_CLIPS_META_JSON
 
 from run_calibration import (FALL_HEIGHT_M, GOAL_RADIUS_M, PARAM_SKILL, TIME_BUDGET_S,
@@ -72,6 +72,18 @@ from run_calibration import (FALL_HEIGHT_M, GOAL_RADIUS_M, PARAM_SKILL, TIME_BUD
 SKILL_SPEED = {"WALK": 0.187, "TROT": 0.444, "TURN": 0.008, "RUN": 0.514, "JUMP": 0.006}
 #: Per-skill heading cap, from the open-loop steering probe.
 HEADING_CAP = {"WALK": 0.04, "TROT": 0.02}
+#: Measured yaw rate of the TURN clip, rad/s (planner.config skill.YAW_RATE_TURN, from
+#: session turn_right_20260824_223951).  Used only to size the in-place time budget.
+YAW_RATE = {"TURN": -0.3954}
+#: How much yaw an in-place repeat has to complete to count.  90 deg is a quarter turn:
+#: large enough that a robot cannot pass by wobbling (the TURN clip's own cycle is 20.2
+#: deg, so this is ~4.5 cycles of sustained turning) and small enough to fit a budget.
+#: The full yaw-vs-time curve is written to the CSV as well, so a different threshold
+#: can be read off these runs without repeating them.
+INPLACE_YAW_DEG = 90.0
+#: How far the base may wander from its spawn and still count as having turned IN PLACE.
+#: Deliberately GOAL_RADIUS_M, the same 0.35 m the traversal families score "arrived"
+#: with, rather than a new number.
 
 _SIM_APP = None
 _RUN_UTC = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -85,21 +97,85 @@ def grid_shape(n: int, cols: int | None = None) -> tuple:
     return int(np.ceil(n / c)), c
 
 
-def build_grid(probes: dict, idx: list, gutter_cells: float = 1.0, cols: int | None = None):
+#: Half-length and half-width, m, of the box the local ground height is taken over when a
+#: robot is spawned on top of an obstacle instead of in front of one.  It is the Go2's own
+#: footprint: hips sit at x = +-0.193, y = +-0.11 (measured from the articulation in
+#: outputs/heading_candidates.md 1), plus the foot radius of 0.023 measured at the lip.
+FOOTPRINT_HALF_XY = (0.216, 0.133)
+
+
+def inplace_spawn_x(family: str, level: float, obstacle_x: float) -> float:
+    """Where to stand a turn-in-place skill so the obstacle is UNDER it.
+
+    The traversal families spawn 3 m short of the obstacle and are scored on reaching a
+    goal past it.  A skill that does not translate can never be scored that way -- TURN's
+    measured speed is 0.0075 m/s, so the 3.95 m to goal 2 is 527 s against a 20 s budget,
+    and every level would read 0/N for the same reason regardless of the terrain.  The
+    obstacle has to be brought to the robot instead, and then the question the sweep
+    answers is a different one and has to be named as such: not *what can TURN cross*
+    but **what can TURN turn on**.
+
+    Placement puts the discontinuity under the middle of the footprint, so the feet
+    sweeping through a turn cross it:
+
+    ``step_up``/``step_down``  the edge itself, so two feet are up and two down
+    ``gap``                    the pit's centre, so the hole is inside the footprint
+    ``slope``/``roughness``    the middle of the patch, so the whole robot is on it
+    """
+    if family in ("step_up", "step_down"):
+        return obstacle_x
+    if family == "gap":
+        return obstacle_x + 0.5 * level
+    if family == "slope":
+        return obstacle_x + 0.5 * RAMP_RUN_M
+    if family == "roughness":
+        return obstacle_x + 0.5 * ROUGH_RUN_M
+    raise ValueError(f"no in-place spawn defined for family {family!r}")
+
+
+def ground_z_at(hf: np.ndarray, hs: float, vs: float, x: float, y: float) -> float:
+    """Highest terrain height under a footprint-sized box at ``(x, y)``, metres.
+
+    Needed because ``--spawn-z`` is measured from z = 0 and the in-place spawns stand on
+    top of the obstacle: dropping a robot from 0.42 m onto a 0.30 m step puts it inside
+    the mesh.  MAX rather than mean or nearest -- a robot half on a step has to clear the
+    high side, and starting it interpenetrating the terrain is not a measurement of
+    anything.
+    """
+    dx, dy = FOOTPRINT_HALF_XY
+    i0 = max(0, int(np.floor((x - dx) / hs)))
+    i1 = min(hf.shape[0] - 1, int(np.ceil((x + dx) / hs)))
+    j0 = max(0, int(np.floor((y - dy) / hs)))
+    j1 = min(hf.shape[1] - 1, int(np.ceil((y + dy) / hs)))
+    # Floored at 0, the lane level every family shares.  Without the floor a robot
+    # standing astride a gap wider than its own footprint reads the PIT BOTTOM as its
+    # ground -- the box is entirely inside the hole -- and gets spawned 1 m down it.
+    # Measured: the 42-probe run settled at base z -0.524 m with a hip-to-foot lever of
+    # 0.034 m and FootPlacement refused to build.  A robot standing at the bottom of a
+    # 1 m pit is not a measurement of turning over a gap; the lane surface is.
+    return max(float(hf[i0:i1 + 1, j0:j1 + 1].max()) * vs, 0.0)
+
+
+def build_grid(probes: dict, idx: list, gutter_cells: float = 1.0, cols: int | None = None,
+               inplace: bool = False):
     """One mesh holding every selected probe, plus each probe's world spawn.
 
-    Returns ``(vertices, faces, spawns_xy, cell)``.  Cells are laid out in row
-    major order with a gutter, so cell ``k`` sits at
+    Returns ``(vertices, faces, spawns_xy, offsets, (rows, cols), (Lx, Ly), spawn_z0)``.
+    Cells are laid out in row major order with a gutter, so cell ``k`` sits at
     ``(col * (Lx + gap), row * (Ly + gap))`` and the probe's own spawn/goal
     coordinates are simply offset by that.
+
+    ``inplace`` moves each spawn onto its own obstacle (see ``inplace_spawn_x``) and
+    returns the ground height there, which the caller adds to ``--spawn-z``.
     """
     hs, vs = probes["horizontal_scale"], probes["vertical_scale"]
     hf0 = probes["hf"][idx[0]]
     Lx, Ly = (hf0.shape[0] - 1) * hs, (hf0.shape[1] - 1) * hs
     gap_x, gap_y = Lx * gutter_cells, Ly * gutter_cells
     rows, ncols = grid_shape(len(idx), cols)
+    obstacle_x = float(probes.get("obstacle_x", 4.0))
 
-    V, F, spawns, offsets = [], [], [], []
+    V, F, spawns, offsets, z0 = [], [], [], [], []
     n_v = 0
     for k, i in enumerate(idx):
         r, c = divmod(k, ncols)
@@ -110,19 +186,28 @@ def build_grid(probes: dict, idx: list, gutter_cells: float = 1.0, cols: int | N
         F.append(f + n_v)
         n_v += len(v)
         offsets.append((ox, oy))
-        spawns.append((probes["spawn"][0] + ox, probes["spawn"][1] + oy))
+        sx, sy = probes["spawn"][0], probes["spawn"][1]
+        if inplace:
+            sx = inplace_spawn_x(str(probes["families"][i]), float(probes["params_m"][i]),
+                                 obstacle_x)
+        z0.append(ground_z_at(probes["hf"][i], hs, vs, sx, sy) if inplace else 0.0)
+        spawns.append((sx + ox, sy + oy))
     return (np.concatenate(V), np.concatenate(F), np.asarray(spawns, dtype=float),
-            np.asarray(offsets, dtype=float), (rows, ncols), (Lx, Ly))
+            np.asarray(offsets, dtype=float), (rows, ncols), (Lx, Ly),
+            np.asarray(z0, dtype=float))
 
 
 def plan_report(args) -> str:
     probes = load_probes()
     params = args.params or sorted(PARAM_SKILL)
-    runs = planned_runs(probes, params, 1, args.max_probes)
+    runs = planned_runs(probes, params, 1, args.max_probes,
+                        getattr(args, 'families', None), getattr(args, 'skill', None))
     idx = [r[3] for r in runs]
     if not idx:
         return "no probes selected"
-    _, _, spawns, offsets, (rows, cols), (Lx, Ly) = build_grid(probes, idx, args.gutter, args.cols)
+    _, _, spawns, offsets, (rows, cols), (Lx, Ly), _z0 = build_grid(
+        probes, idx, args.gutter, args.cols,
+        args.score == 'inplace' and args.inplace_at == 'obstacle')
     L = [f"probes in the frozen archive: {len(probes['hf'])}",
          f"selected: {len(idx)} ({', '.join(sorted({r[2] for r in runs}))})",
          f"grid {rows} x {cols}, cell {Lx:.1f} x {Ly:.1f} m, gutter {args.gutter:g} cell(s)",
@@ -150,7 +235,7 @@ def self_test() -> int:
         print(f"  {'ok  ' if cond else 'FAIL'} {label}")
 
     idx = list(range(min(7, len(probes["hf"]))))
-    V, F, spawns, offsets, (rows, cols), (Lx, Ly) = build_grid(probes, idx, 1.0)
+    V, F, spawns, offsets, (rows, cols), (Lx, Ly), _z0 = build_grid(probes, idx, 1.0)
     ok(f"grid {rows}x{cols} holds {len(idx)} probes", rows * cols >= len(idx))
     ok("one mesh, one vertex block per probe",
        len(V) == sum(probes["hf"][i].size for i in idx))
@@ -200,7 +285,7 @@ def run_isaac(args) -> list:
 
     probes = load_probes()
     params = args.params or sorted(PARAM_SKILL)
-    runs = planned_runs(probes, params, 1, args.max_probes)
+    runs = planned_runs(probes, params, 1, args.max_probes, args.families, args.skill)
     runs = [r for r in runs if r[1] in {s.value for s in SUPPORTED}] if args.skip_unsupported else runs
     if not runs:
         raise SystemExit("no probes selected")
@@ -208,7 +293,9 @@ def run_isaac(args) -> list:
     n = len(idx)
     print(plan_report(args))
 
-    V, F, spawns, offsets, (rows, cols), (Lx, Ly) = build_grid(probes, idx, args.gutter, args.cols)
+    V, F, spawns, offsets, (rows, cols), (Lx, Ly), spawn_z0 = build_grid(
+        probes, idx, args.gutter, args.cols,
+        args.score == 'inplace' and args.inplace_at == 'obstacle')
     ucfg = IC.load()
     sys.path.insert(0, str(Path(ucfg.source).parents[3]))
     from legged_gym.envs.base.legged_robot_config import UNITREE_GO2_CFG
@@ -312,8 +399,18 @@ def run_isaac(args) -> list:
 
     # Put every robot at its own cell's spawn, at the env's spawn height.
     root = robot.data.default_root_state.clone()
+    # --spawn-z is measured from z = 0, which is the ground for every traversal probe
+    # (they all spawn on the flat run-up).  The in-place spawns stand ON the obstacle, so
+    # the drop height has to be taken from the terrain under the footprint instead --
+    # otherwise a 0.30 m step spawns the robot 0.30 m inside the mesh and the probe
+    # measures the extraction, not the turn.
     root[:, :3] = torch.as_tensor(origins, device=sim.device, dtype=root.dtype) + \
-        torch.as_tensor([0.0, 0.0, float(args.spawn_z)], device=sim.device, dtype=root.dtype)
+        torch.as_tensor(np.stack([np.zeros(n), np.zeros(n), spawn_z0 + float(args.spawn_z)],
+                                 axis=1), device=sim.device, dtype=root.dtype)
+    if args.score == "inplace":
+        print(f"[grid] in-place spawns stand on the obstacle: ground under the footprint "
+              f"{spawn_z0.min():+.3f} to {spawn_z0.max():+.3f} m, drop {args.spawn_z:g} m "
+              f"above that")
     robot.write_root_state_to_sim(root)
 
     # Settle exactly the way the single-robot path does, because the initial condition
@@ -346,6 +443,7 @@ def run_isaac(args) -> list:
     # ITS clip pose -- the lever differs between clips and between cells, and the
     # single-robot runs showed a 7% spread in it.
     foots = None
+    settle_ok = np.ones(n, dtype=bool)
     if args.foot_comp != "off":
         from verify_skill_replay import _log_motion_for
         from sim.replay import quat_rotate_inv
@@ -358,9 +456,34 @@ def run_isaac(args) -> list:
         bp = snap(robot.data.body_pos_w)
         bq = snap(robot.data.root_quat_w)
         bpos = snap(robot.data.root_pos_w)
+        # A robot whose settle did not produce a stance has no lever to measure.  It
+        # happens on the in-place spawns and only there: standing astride a 0.60 m pit
+        # there is nothing under the feet, and the robot is already falling into the hole
+        # when the levers are read (measured: base z 0.020 m, levers 0.034-0.114 m
+        # against a nominal 0.31).  FootPlacement then refuses to build -- correctly, its
+        # law is linearised about a standing pose -- and took the whole 42-robot run down
+        # with it, including the 40 robots that had settled fine.
+        #
+        # Such a robot is scored a FAILURE, which is the true answer: a gap it falls into
+        # during the settle is a gap it cannot turn over.  The median lever is substituted
+        # only so the object can be constructed and the grid can step; the substitution
+        # is stamped on every one of that robot's rows so a reader can never mistake one
+        # for a measurement.
+        all_lever = np.array([[bp[k, h_by[l], 2] - bp[k, f_by[l], 2] for l in legs]
+                              for k in range(n)])
+        settle_ok = np.all(all_lever > 0.05, axis=1)
+        med_lever = np.median(all_lever[settle_ok], axis=0) if settle_ok.any() \
+            else np.full(len(legs), 0.31)
+        if not settle_ok.all():
+            bad = np.where(~settle_ok)[0]
+            print(f"[grid] {len(bad)} of {n} robots did not settle into a stance and are "
+                  f"scored FAILED at settle: "
+                  + ", ".join(f"{probes['names'][idx[k]]} (worst lever "
+                              f"{all_lever[k].min():.3f} m)" for k in bad[:8])
+                  + (" ..." if len(bad) > 8 else ""))
         foots = []
         for k, c in enumerate(per_robot_clip):
-            lever = np.array([bp[k, h_by[l], 2] - bp[k, f_by[l], 2] for l in legs])
+            lever = all_lever[k] if settle_ok[k] else med_lever
             hxy = np.array([quat_rotate_inv(bq[k][None, :], (bp[k, h_by[l]] - bpos[k])[None, :])[0, :2]
                             for l in legs])
             vy_log, wz_log = _log_motion_for(meta, c["name"])
@@ -373,6 +496,9 @@ def run_isaac(args) -> list:
                 t_stance_s=stance_time_s(c["contact"], c["fs"]), lever_m=lever,
                 hip_x_m=hxy[:, 0], hip_y_m=hxy[:, 1], vy_log=vy_log, wz_log=wz_log,
                 cap_rad=args.foot_clip_rad, yaw_mode=yaw_mode, heading_cap_rad=hcap,
+                heading_len=bool(args.heading_len) and hcap > 0.0,
+                heading_len_cap_rad=args.heading_len_cap,
+                yaw_bias=args.foot_yaw_bias, len_bias=args.foot_len_bias,
                 cycle_len=len(c["q_des"])))
         print(f"[grid] *** FOOT PLACEMENT ON for all {n} robots (cap {args.foot_clip_rad:g} rad). "
               f"This CLOSES A LOOP on base velocity and OVERWRITES the recording. ***")
@@ -385,8 +511,16 @@ def run_isaac(args) -> list:
     # The budget is now distance / speed x a stated slack factor, per robot.
     goal2_pre = np.array([probes["goals"][i][1] for i in idx]) + offsets
     spawn_d = np.linalg.norm(goal2_pre - spawns, axis=1)
-    speed = np.array([SKILL_SPEED[r[1]] for r in runs])
-    budget = spawn_d / speed * args.budget_slack
+    if args.score == "inplace":
+        # The budget is the angle over the clip's own measured yaw rate, for the same
+        # reason the traversal budget is the distance over the clip's own speed: a probe
+        # must not be able to fail for running out of clock.  TURN at 22.66 deg/s needs
+        # 4.0 s for the 90 deg; the slack factor is the same one.
+        rate = np.array([abs(YAW_RATE[r[1]]) for r in runs])
+        budget = np.radians(args.inplace_yaw_deg) / rate * args.budget_slack
+    else:
+        speed = np.array([SKILL_SPEED[r[1]] for r in runs])
+        budget = spawn_d / speed * args.budget_slack
     n_steps = int(np.ceil(budget.max() / dt))
     print(f"[grid] time budget from speed: distance {spawn_d.min():.2f}-{spawn_d.max():.2f} m, "
           f"slack x{args.budget_slack:g} -> {budget.min():.1f}-{budget.max():.1f} s "
@@ -428,9 +562,18 @@ def run_isaac(args) -> list:
 
         # The heading each robot is asked to hold: the one it settled at, per cell.
         yaw0_deg = quat_to_rpy_deg(snap(robot.data.root_quat_w))[2]
+        pos0 = snap(robot.data.root_pos_w)[:, :2].copy()
         reached = np.zeros(n, dtype=bool)
         fell = np.zeros(n, dtype=bool)
         t_reached = np.full(n, np.nan)
+        # In-place bookkeeping.  Yaw is UNWRAPPED against the previous sample so a turn
+        # past 180 deg keeps counting instead of folding back; the traversal path never
+        # needed this because nothing there was supposed to rotate at all.
+        yaw_prev = yaw0_deg.copy()
+        yaw_cum = np.zeros(n)                 # signed, degrees, since the settle
+        yaw_ok = np.zeros(n)                  # the most turned WHILE still legal
+        drift_max = np.zeros(n)               # furthest the base got from its spawn
+        legal = np.ones(n, dtype=bool)        # upright and still in place, so far
         tr = {"root_pos_w": [], "root_quat_w": [], "foot_z": []} if args.trace_npz else None
         if tr is not None and args.trace_full:
             tr.update({k: [] for k in ("body_pos_w", "contact_f_w", "torque", "q",
@@ -464,6 +607,17 @@ def run_isaac(args) -> list:
                 robot.write_data_to_sim(); sim.step(); robot.update(phys_dt)
 
             pos = snap(robot.data.root_pos_w)
+            if args.score == "inplace":
+                yaw_now = quat_to_rpy_deg(snap(robot.data.root_quat_w))[2]
+                yaw_cum += (yaw_now - yaw_prev + 180.0) % 360.0 - 180.0
+                yaw_prev = yaw_now
+                drift = np.linalg.norm(pos[:, :2] - pos0, axis=1)
+                drift_max = np.maximum(drift_max, drift)
+                # "legal" latches off: once a robot has fallen or walked away, the yaw it
+                # racks up afterwards is not a turn it performed, and crediting it would
+                # let a robot that rolls onto its back score a pass.
+                legal &= (pos[:, 2] >= FALL_HEIGHT_M) & (drift <= GOAL_RADIUS_M)
+                yaw_ok = np.where(legal, np.maximum(yaw_ok, np.abs(yaw_cum)), yaw_ok)
             if tr is not None:
                 tr["root_pos_w"].append(pos.copy())
                 tr["root_quat_w"].append(snap(robot.data.root_quat_w))
@@ -480,14 +634,28 @@ def run_isaac(args) -> list:
                 if foots is not None:
                     tr["foot_u"].append(np.stack([f.last_u for f in foots]))
                     tr["raw_hip"].append(np.stack([f.last_raw_hip for f in foots]))
-                    tr["cap_hits"].append(np.array([[f.last_cap_hits, f.last_swing_n]
-                                                    for f in foots]))
+                    # [lateral hits, swing legs, heading-half at its cap, step-length
+                    # half at its cap].  The heading cap is the one lip_failure.md 3
+                    # measured at 84-87% and the one the question "can the saturation be
+                    # reduced without raising the cap" is about, and it was not in the
+                    # trace at all -- only the LATERAL cap was, which is a different cap
+                    # on a different term answering a different question.
+                    tr["cap_hits"].append(np.array(
+                        [[f.last_cap_hits, f.last_swing_n,
+                          int(np.sum(np.abs(f.last_u_head) >= (f.heading_cap_rad or f.cap_rad)
+                                     - 1e-12)),
+                          int(np.sum(np.abs(f.last_u_len) >= f.heading_len_cap_rad - 1e-12))]
+                         for f in foots]))
                 else:
                     tr["foot_u"].append(np.zeros((n, 12)))
                     tr["raw_hip"].append(np.zeros((n, 4)))
-                    tr["cap_hits"].append(np.zeros((n, 2), dtype=int))
-            d = np.linalg.norm(pos[:, :2] - goal2, axis=1)
-            newly = (~reached) & (d < GOAL_RADIUS_M) & (step <= budget_steps)
+                    tr["cap_hits"].append(np.zeros((n, 4), dtype=int))
+            if args.score == "inplace":
+                newly = (~reached) & legal & (yaw_ok >= args.inplace_yaw_deg) \
+                    & (step <= budget_steps)
+            else:
+                d = np.linalg.norm(pos[:, :2] - goal2, axis=1)
+                newly = (~reached) & (d < GOAL_RADIUS_M) & (step <= budget_steps)
             t_reached[newly] = step * dt
             reached |= newly
             fell |= pos[:, 2] < FALL_HEIGHT_M
@@ -499,7 +667,9 @@ def run_isaac(args) -> list:
             rows_out.append({"param": param, "skill": skill, "family": family,
                              "probe": probes["names"][i], "level_m": level, "rep": rep,
                              "entry_frame": ent[k],
-                             "reached": int(reached[k]), "t_reached_s": t_reached[k],
+                             "reached": int(reached[k] and settle_ok[k]),
+                             "settle_ok": int(settle_ok[k]),
+                             "t_reached_s": t_reached[k],
                              "fell": int(fell[k]), "final_dist_m": float(dist[k]),
                              "grid_rows": rows, "grid_cols": cols, "n_probes": n,
                              "foot_comp": args.foot_comp, "steps": step + 1,
@@ -512,6 +682,21 @@ def run_isaac(args) -> list:
                              # one as WORSE in both gaits.  argv carried it; no column did.
                              "heading": args.heading,
                              "heading_cap_rad": args.heading_cap,
+                             "heading_len": int(args.heading_len),
+                             "foot_yaw_bias": args.foot_yaw_bias,
+                             "foot_len_bias": args.foot_len_bias,
+                             "heading_len_cap_rad": args.heading_len_cap,
+                             # The in-place raw measurements, written on every row so the
+                             # 90 deg threshold can be moved afterwards without repeating
+                             # the sweep -- and so a 0/5 column can be told apart from a
+                             # 0/5 that turned 85 deg and ran out of angle.
+                             "score": args.score,
+                             "inplace_at": args.inplace_at,
+                             "yaw_ok_deg": float(yaw_ok[k]) if args.score == "inplace" else "",
+                             "yaw_cum_deg": float(yaw_cum[k]) if args.score == "inplace" else "",
+                             "drift_max_m": float(drift_max[k]) if args.score == "inplace" else "",
+                             "spawn_x": float(spawns[k][0] - offsets[k][0]),
+                             "spawn_z0_m": float(spawn_z0[k]),
                              "run_utc": _RUN_UTC, "argv": " ".join(sys.argv[1:])})
         print(f"[grid]   rep {rep+1}: reached {int(reached.sum())}/{n}, "
               f"fell {int(fell.sum())}/{n}, {step+1} steps")
@@ -538,7 +723,19 @@ def run_isaac(args) -> list:
         got = sum(r["reached"] for r in mine)
         print(f"  {probes['names'][i]:16s} {skill:6s} {level:8.3f} {got:5d}/{len(mine):<4d}  "
               + "".join("R" if r["reached"] else ("F" if r["fell"] else ".") for r in mine))
-    print("\n  R = reached goal 2, F = fell, . = neither inside the time budget")
+    if args.score == "inplace":
+        print(f"\n  R = turned {args.inplace_yaw_deg:g} deg in place, F = fell, "
+              f". = neither inside the time budget")
+        print(f"  {'probe':16s} {'param m':>8s} {'yaw ok deg':>11s} {'drift m':>8s}   "
+              f"(worst repeat)")
+        for k, (param, skill, family, i, level) in enumerate(runs):
+            mine = [r for r in rows_out if r["probe"] == probes["names"][i]
+                    and r["param"] == param]
+            print(f"  {probes['names'][i]:16s} {level:8.3f} "
+                  f"{min(float(r['yaw_ok_deg']) for r in mine):11.1f} "
+                  f"{max(float(r['drift_max_m']) for r in mine):8.3f}")
+    else:
+        print("\n  R = reached goal 2, F = fell, . = neither inside the time budget")
     print(config_patch(rows_out))
     return rows_out
 
@@ -616,6 +813,43 @@ def main() -> int:
     ap.add_argument("--swing-lift-asym", action="store_true",
                     help="per-leg lift amplitude (the original, asymmetric choice) instead "
                          "of one amplitude per mirror pair. For the A/B only.")
+    ap.add_argument("--probes", default=None,
+                    help="probe archive to run (default: the pinned 42-probe one). The v2 "
+                         "archive appends the slope and roughness families AFTER those 42, "
+                         "so probe indices 0-41 are the same terrain in both")
+    ap.add_argument("--families", nargs="*", default=None,
+                    help="run these probe families instead of resolving them from --params; "
+                         "requires --skill. The off-map path, for a skill that no "
+                         "CALIBRATION_MAP entry pairs with a family (TURN has none)")
+    ap.add_argument("--skill", default=None,
+                    help="hold this clip on every selected probe; used with --families")
+    ap.add_argument("--score", choices=("goal", "inplace"), default="goal",
+                    help="'goal' = reach goal 2 past the obstacle (the traversal families' "
+                         "own test, unchanged). 'inplace' = spawn ON the obstacle and score "
+                         "completed yaw without falling or leaving a 0.35 m circle -- the "
+                         "only question a skill that does not translate can be asked")
+    ap.add_argument("--inplace-yaw-deg", type=float, default=INPLACE_YAW_DEG,
+                    help="yaw an --score inplace repeat must complete to pass")
+    ap.add_argument("--inplace-at", choices=("obstacle", "spawn"), default="obstacle",
+                    help="'obstacle' stands the robot on the obstacle. 'spawn' leaves it at "
+                         "the probe's own flat run-up 3 m short of it -- the FLAT CONTROL, "
+                         "identical in every other respect, which is what says whether a "
+                         "failed in-place score is the terrain or the skill")
+    ap.add_argument("--foot-yaw-bias", type=float, default=0.0,
+                    help="CONSTANT differential lateral placement, +front/-rear on the hips "
+                         "(rad). Open loop, added after the feedback term and not clipped by "
+                         "--foot-clip-rad. heading_candidates.md 2 measured -0.02 as the "
+                         "largest TROT survives; WALK takes +-0.04")
+    ap.add_argument("--foot-len-bias", type=float, default=0.0,
+                    help="CONSTANT differential step length, +left/-right on the thighs (rad). "
+                         "Same measurement: -0.04 removes 4.71 of TROT's 5.32 deg/s for 1.2% "
+                         "of speed; -0.06 falls at 2.77 s and +0.02 destroys the gait")
+    ap.add_argument("--heading-len", action="store_true",
+                    help="add the step-length (thigh) half of the heading law alongside the "
+                         "lateral (hip) one. One-sided by construction -- see sim/footcomp.py")
+    ap.add_argument("--heading-len-cap", type=float, default=0.04,
+                    help="magnitude bound on that half (rad). 0.04 is the largest amplitude "
+                         "the open-loop probe survived on TROT; -0.06 fell at 2.77 s")
     ap.add_argument("--heading", choices=("off", "heading", "heading-only"), default="off",
                     help="hold the spawn heading with differential lateral foot placement")
     ap.add_argument("--skip-unsupported", action="store_true",
@@ -642,6 +876,15 @@ def main() -> int:
         ap.add_argument("--headless", action="store_true")
         ap.add_argument("--device", default="cpu")
     args = ap.parse_args()
+    if args.probes:
+        import run_calibration
+        run_calibration.PROBES_NPZ = Path(args.probes)
+        print(f"[grid] probe archive: {args.probes}")
+    if bool(args.families) != bool(args.skill):
+        raise SystemExit("[grid] --families and --skill are used together")
+    if args.score == "inplace" and not args.skill:
+        raise SystemExit("[grid] --score inplace needs --skill (and --families): it is the "
+                         "off-map path, and no CALIBRATION_MAP entry describes it")
 
     if args.plan:
         print(plan_report(args)); return 0

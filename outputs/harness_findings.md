@@ -388,3 +388,58 @@ nominal 0.32 — for the whole run. Two channels, one question, and they disagre
 case hides the mistake. Call the project's converter. If a rotation must be written out by
 hand, assert `argmax(|q|) == 3` first, and check the result against a channel that does not
 come from the quaternion at all.
+
+## 12 · The grid's cells are not replicates: TROT turns 0.3 mm into 1 m
+
+Every probe in the grid sits in its own cell of one big mesh, at a different world position.
+Up to the obstacle line each cell is the *same flat lane*, so 15 robots running the same
+clip on the same flat run-up ought to be 15 copies of one trajectory. They are not.
+
+Measured on `outputs/trace_trot_headA.npz` (TROT, 15 `step_up` cells, cell-local
+coordinates, so the cell offset is subtracted out):
+
+| control step | worst \|cell-local position − cell 0\| |
+|---|---|
+| 0 | **3.3e-4 m** |
+| 10 | 1.4e-3 |
+| 50 | 9.8e-3 |
+| 100 | 2.8e-2 |
+| 200 | **5.3e-2 m** |
+
+It starts at 0.33 mm — the robots are placed by adding a cell offset of up to ~120 m to the
+spawn, and float32 world coordinates do not round the same way at x = 4 and x = 120 — and
+grows by roughly **e^1.3 per second**. By the end of an 18 s run it is metres: in that one
+run the fifteen "identical" approaches gave y-drift from 0.15 m to 1.18 m and curvature from
+1.7 to 48.9 °/m.
+
+**So the cells are independent samples, not repeats.** Three consequences:
+
+- A per-level 0/5 or 4/5 in a multi-cell grid mixes the entry-phase variation the repeats
+  are *designed* to explore with a chaotic spread the harness never intended. WALK on
+  `step_up` 0.02 scores **4/5 in a 42-cell grid and 5/5 in a 2-cell grid** — same clip, same
+  terrain, same controller, different neighbours.
+- **An A/B across cells cannot resolve a small effect.** The first heading A/B compared
+  medians of 11.97 vs 8.30 °/m over 15 cells whose within-condition spread was 1.7–48.9.
+  That is not evidence of anything. Every controlled comparison in `trot_straight.md` was
+  re-run at `--max-probes 1` so both arms sit at the same world coordinates.
+- It is **TROT-specific, and that is itself a measurement.** TURN's nine flat cells agree to
+  within 3° of completed yaw and 0.09 m of drift (`turn_probes.md` §3); WALK holds
+  0.00 °/m over 7.35 m. The trot is the gait with a positive Lyapunov exponent on flat
+  ground, which is consistent with everything else about it.
+
+Not a bug to fix — the physics is right and the divergence is real dynamics, not solver
+noise. It is a property of the instrument that has to be in the reading.
+
+## 13 · `--verify` on the probe freezer *writes*
+
+`scripts/freeze_calibration.py --verify` reads as "check the archive". It means "build the
+archive twice and assert the two agree", and then it **saves**, unconditionally. Run against
+the pinned 42-probe archive after the slope and roughness generators had been added, it
+silently replaced it with a 62-probe one and rewrote the committed `.sha256` to match — so
+the hash check that exists to catch exactly this would have passed forever afterwards.
+
+Caught by `git status`, restored from git, and the new families were frozen to
+`data/calibration_probes_v2.npz` via `--out`, which is what the function's own comment says
+the flag is for. The flag is not renamed here because doing so mid-run would be a change to
+the thing being used; the trap is recorded instead: **a verify that writes is not a verify,
+and the file that would have detected the change is written by the same call.**

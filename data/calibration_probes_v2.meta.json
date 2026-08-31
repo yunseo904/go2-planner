@@ -1,6 +1,6 @@
 {
-  "content_sha256": "7b1a8bcc224c9d64cf179630b670dd231fd9ec38795b38a92eb3b1eac20093ec",
-  "npz_sha256": "8301f16c64a215735b9209a6e765bd4143de62efec98bf70beb2b72b8f1772a3",
+  "content_sha256": "7c9e7ca9b3db879af360a2576c882d2cce0432fb09211cbfe00dfee703cbfe9f",
+  "npz_sha256": "460871bc152cc560390815c3ec2973ba2011b74af9ec5fd94fe39a128c25aa6e",
   "n_probes": 62,
   "shape": [
     62,
@@ -106,18 +106,18 @@
     "slope_30p00",
     "slope_35p00",
     "slope_40p00",
-    "roughness_0p01",
-    "roughness_0p01",
-    "roughness_0p01",
-    "roughness_0p02",
-    "roughness_0p03",
-    "roughness_0p03",
-    "roughness_0p04",
-    "roughness_0p04",
-    "roughness_0p04",
-    "roughness_0p05",
-    "roughness_0p06",
-    "roughness_0p06"
+    "roughness_0p005",
+    "roughness_0p010",
+    "roughness_0p015",
+    "roughness_0p020",
+    "roughness_0p025",
+    "roughness_0p030",
+    "roughness_0p035",
+    "roughness_0p040",
+    "roughness_0p045",
+    "roughness_0p050",
+    "roughness_0p055",
+    "roughness_0p060"
   ],
   "source": "terrain_toolkit/calibrate.py (synthetic; no upstream code, no RNG)"
 }

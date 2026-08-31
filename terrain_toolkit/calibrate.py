@@ -83,9 +83,20 @@ class Probe:
     goals_m: np.ndarray               # (3, 2) metres
     description: str
 
+    #: Decimal places in ``name``.  Two is what the step and gap ladders need and what
+    #: every committed result CSV was written with, so it stays the default; roughness
+    #: steps by 0.005 m and two decimals CANNOT separate its levels -- 0.005, 0.010 and
+    #: 0.015 all render as ``roughness_0p01``.  Measured consequence: the grid harness
+    #: keys its per-level reduction by this name, so three distinct terrains were merged
+    #: into one row and reported as a single 0/15 that no repeat count could explain.
+    #: The per-row ``level_m`` was right the whole time; only the name-keyed summary was
+    #: wrong, which is why it survived a reading of the CSV.
+    NAME_DECIMALS = {"roughness": 3}
+
     @property
     def name(self) -> str:
-        return f"{self.family}_{self.param_m:.2f}".replace(".", "p")
+        d = self.NAME_DECIMALS.get(self.family, 2)
+        return f"{self.family}_{self.param_m:.{d}f}".replace(".", "p")
 
 
 def _blank() -> np.ndarray:
@@ -218,6 +229,13 @@ def build_probes() -> List[Probe]:
     probes += [make_gap_probe(w) for w in GAP_WIDTHS_M]
     probes += [make_slope_probe(a) for a in SLOPE_ANGLES_DEG]
     probes += [make_roughness_probe(a) for a in ROUGHNESS_AMPLITUDES_M]
+    names = [p.name for p in probes]
+    if len(set(names)) != len(names):
+        dup = sorted({n for n in names if names.count(n) > 1})
+        raise ValueError(
+            f"probe names are not unique: {dup}. The name is what results are keyed by "
+            f"downstream, so a collision silently merges distinct terrains into one row "
+            f"-- raise Probe.NAME_DECIMALS for the offending family")
     return probes
 
 

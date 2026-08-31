@@ -68,6 +68,8 @@ class FootPlacement:
     sign: float = 1.0
     yaw_mode: str = "off"               # off | log | log-cycle | heading | heading-only
     heading_cap_rad: float = 0.0        # separate cap for the heading term (0 = same as cap)
+    heading_len: bool = False           # add the fore-aft (step-length) half of the heading law
+    heading_len_cap_rad: float = 0.04   # magnitude bound on it; the window below is one-sided
     axis: str = "y"                     # y | xy
     vy_target: float = 0.0
     cycle_len: int = 0                  # control steps in one clip cycle
@@ -82,6 +84,9 @@ class FootPlacement:
     applied: int = 0
     cap_hits: int = 0
     max_abs: float = 0.0
+    head_cap_hits: int = 0
+    len_cap_hits: int = 0
+    len_engaged: int = 0
 
     def __post_init__(self) -> None:
         self.lever_m = np.asarray(self.lever_m, dtype=float)
@@ -102,10 +107,13 @@ class FootPlacement:
         self._wz_buf = np.zeros(max(self.cycle_len, 1))
         self._wz_sum, self._wz_i, self._wz_n, self._wz = 0.0, 0, 0, 0.0
         self.applied = self.cap_hits = 0
+        self.head_cap_hits = self.len_cap_hits = self.len_engaged = 0
         self.max_abs = 0.0
         self.last_raw_hip = np.zeros(4)
         self.last_u = np.zeros(12)
         self.last_cap_hits = self.last_swing_n = 0
+        self.last_u_head = np.zeros(4)
+        self.last_u_len = np.zeros(4)
 
     # ------------------------------------------------------------------ step
     def step(self, vy: float, wz: float, swing: np.ndarray, vx: float = 0.0,
@@ -141,7 +149,49 @@ class FootPlacement:
             # same way the stage-1 attitude PD's sign was.
             u_head = -psi_err_rad * self.hip_x_m / (2.0 * self.lever_m)
             hcap = self.heading_cap_rad or self.cap_rad
+            self.head_cap_hits += int((swing & (np.abs(u_head) > hcap)).sum())
             u_head = np.clip(u_head, -hcap, hcap)
+            if self.heading_len and self.hip_y_m is not None:
+                # The SAME substitution, read in the other axis.  A base whose yaw error
+                # is psi carries the hip at (x_i, y_i) fore-aft at -(omega - omega_tgt)*y_i,
+                # so the Raibert half-stance-time step-length correction is
+                #
+                #   dx_i     = (T_st/2) * -(psi_err / T_st) * y_i  = -psi_err * y_i / 2
+                #   dq_thigh = -dx_i / lever_i                     = +psi_err * y_i / (2 lever)
+                #
+                # T_stance cancels here too, so this half is as parameter-free as the
+                # lateral one: heading error, the hip's own LATERAL offset, the same
+                # lever.  Left and right get opposite signs -- one side takes longer
+                # steps -- which is mechanism (b) of outputs/heading_candidates.md 2,
+                # measured there at ~199 deg/s per rad on TROT against (a)'s 155-175.
+                #
+                # Sign: flipped, for the same reason the lateral half is flipped, and
+                # confirmed against the same probe -- --foot-len-bias -0.04 (which is
+                # -0.04 on the LEFT thighs) removed 4.71 of TROT's +5.32 deg/s, so a
+                # positive heading error needs a negative coefficient.
+                #
+                # ONE-SIDED, and this is the whole reason it is a separate cap.  The
+                # open-loop probe measured this mechanism's survivable window on TROT as
+                # roughly [-0.05, +0.01] rad: -0.06 falls at 2.77 s, -0.04 and -0.02 run
+                # 60 cycles, +0.02 destroys the gait (yaw swings to -12.98 deg/s, stride
+                # to 1.99 Hz) and +0.04 falls at 2.67 s.  Both bounds below are measured
+                # endpoints of that survivable set, not tuned values.  The consequence is
+                # deliberate and has to be stated: this half can only correct ONE SIGN of
+                # heading error.  It is usable because the drift it is being asked to
+                # remove is a steady one-signed bias (+5.32 deg/s, quarter means +6.18,
+                # +4.74, +5.26, +5.10 -- heading_candidates.md 0); on a clip whose bias
+                # runs the other way it contributes nothing and (a) is alone again.
+                u_len = -psi_err_rad * self.hip_y_m / (2.0 * self.lever_m)
+                lcap = self.heading_len_cap_rad
+                # sign(y) is +1 on the left pair, so the coefficient this is equivalent
+                # to is c = -psi*|y|/(2*lever); the window is c in [-lcap, 0], i.e. the
+                # term is clipped by SIDE rather than by magnitude.
+                lo = np.where(self.hip_y_m >= 0.0, -lcap, 0.0)
+                hi = np.where(self.hip_y_m >= 0.0, 0.0, lcap)
+                self.len_cap_hits += int((swing & ((u_len < lo) | (u_len > hi))).sum())
+                u_len = np.clip(u_len, lo, hi)
+                self.len_engaged += int((swing & (np.abs(u_len) > 0)).sum())
+                self.last_u_len = np.where(swing, u_len, 0.0)
         if self.yaw_mode == "heading-only":
             # The rate half dropped.  Every yaw-RATE loop measured made heading worse
             # (outputs/heading_candidates.md 3), so it is separable here rather than
@@ -178,6 +228,14 @@ class FootPlacement:
         u[0::3] = np.where(swing, np.clip(raw_hip, -cap, cap) + u_head, 0.0)
         if self.axis == "xy":
             u[1::3] = np.where(swing, np.clip(raw_thigh, -cap, cap), 0.0)
+        # The step-length heading half goes on the THIGHS, and it ADDS to whatever the
+        # lateral law put there (nothing, at the default axis="y").  Separate cap, added
+        # after -- same rule as u_head on the hips, and for the same reason: the two
+        # answer different questions and clipping their sum would let one starve the
+        # other.  They also act through different joints, which is why the open-loop
+        # probe found them close to independent (7.33 deg/s combined against 3.10 + 4.71
+        # separately).
+        u[1::3] += np.where(swing, self.last_u_len, 0.0)
 
         self.applied += int(swing.sum())
         self.cap_hits += int((swing & (np.abs(raw_hip) > cap)).sum())
@@ -185,6 +243,7 @@ class FootPlacement:
         # whether saturation changed at a particular moment (a lip, a switch).  These
         # two are read by traces and by nothing else -- they do not feed the law.
         self.last_raw_hip = np.where(swing, raw_hip, 0.0)
+        self.last_u_head = np.where(swing, u_head, 0.0)
         self.last_cap_hits = int((swing & (np.abs(raw_hip) > cap)).sum())
         self.last_swing_n = int(swing.sum())
 
@@ -270,6 +329,42 @@ def _self_test() -> int:
                         heading_cap_rad=0.04)
     ok("T_stance cancels out of the heading term",
        float(fp7.step(0.0, 0.0, np.ones(4, bool), psi_err_rad=0.1)[0]), float(u6[0]), 1e-7)
+
+    # 6. the step-length heading half: same substitution in the other axis, one-sided
+    hip_y = np.array([0.110, -0.110, 0.110, -0.110])
+    fp8 = FootPlacement(t_stance_s=0.484, lever_m=lever, hip_x_m=hip_x, hip_y_m=hip_y,
+                        yaw_mode="heading-only", cycle_len=37, cap_rad=0.05,
+                        heading_cap_rad=0.02, heading_len=True, heading_len_cap_rad=0.04,
+                        vy_log=0.0, wz_log=0.0)
+    u8 = fp8.step(vy=0.0, wz=0.0, swing=np.ones(4, bool), psi_err_rad=0.1)
+    ok("len term = -psi*y/(2*lever), left thigh", float(u8[1]),
+       -0.1 * 0.110 / (2 * 0.306), 1e-7)
+    ok("len term, right thigh is opposite", float(u8[4]), +0.1 * 0.110 / (2 * 0.306), 1e-7)
+    print(f"  {'ok  ' if float(u8[1]) < 0 < float(u8[4]) else 'FAIL'} positive heading error "
+          f"gives the direction the open-loop probe survived (left thighs negative)")
+    fails += 0 if float(u8[1]) < 0 < float(u8[4]) else 1
+    # the destructive sign is refused outright, not merely capped
+    u9 = fp8.step(vy=0.0, wz=0.0, swing=np.ones(4, bool), psi_err_rad=-0.1)
+    ok("negative heading error: the len half is OFF, not reversed",
+       float(np.abs(u9[1::3]).max()), 0.0)
+    # and the working direction is bounded by the measured survivable amplitude
+    u10 = fp8.step(vy=0.0, wz=0.0, swing=np.ones(4, bool), psi_err_rad=2.0)
+    ok("len half respects its own cap", float(u10[1]), -0.04)
+    ok("the lateral half is capped separately and still binds", float(u10[0]), -0.02)
+    # T_stance must not appear in this half either
+    fp9 = FootPlacement(t_stance_s=0.372, lever_m=lever, hip_x_m=hip_x, hip_y_m=hip_y,
+                        yaw_mode="heading-only", cycle_len=32, cap_rad=0.05,
+                        heading_cap_rad=0.02, heading_len=True)
+    ok("T_stance cancels out of the step-length half too",
+       float(fp9.step(0.0, 0.0, np.ones(4, bool), psi_err_rad=0.1)[1]), float(u8[1]), 1e-7)
+    # off by default: every run before this one must be unchanged
+    fp10 = FootPlacement(t_stance_s=0.484, lever_m=lever, hip_x_m=hip_x, hip_y_m=hip_y,
+                         yaw_mode="heading-only", cycle_len=37, cap_rad=0.05,
+                         heading_cap_rad=0.02, vy_log=0.0, wz_log=0.0)
+    ok("heading_len defaults OFF (the thighs stay untouched)",
+       float(np.abs(fp10.step(0.0, 0.0, np.ones(4, bool), psi_err_rad=0.1)[1::3]).max()), 0.0)
+    ok("and the hips are bit-identical to the run without it",
+       float(fp10.step(0.0, 0.0, np.ones(4, bool), psi_err_rad=0.1)[0]), float(u8[0]), 0.0)
 
     print(f"footcomp self-test: {'PASS' if fails == 0 else f'{fails} FAILURES'}")
     return 0 if fails == 0 else 1
