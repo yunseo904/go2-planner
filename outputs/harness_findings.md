@@ -443,3 +443,45 @@ Caught by `git status`, restored from git, and the new families were frozen to
 the flag is for. The flag is not renamed here because doing so mid-run would be a change to
 the thing being used; the trap is recorded instead: **a verify that writes is not a verify,
 and the file that would have detected the change is written by the same call.**
+
+---
+
+## 14 · `steps` in the grid CSV is the REP's loop length, not the robot's
+
+`run_calibration_grid.py` writes one row per (cell, repeat) and every row carries
+`"steps": step + 1`. `step` is the **shared** loop counter: the grid steps all its robots
+together and breaks when `reached.all() or fell.all()`, so every cell in a repeat gets the
+same number.
+
+Read as per-robot survival it produces a very convincing artefact. On the TROT capture-point
+sweep it gave, for entry frame 0, "median 901 steps, min 901, max 901, n = 15" — fifteen
+different step heights from 0.02 m to 0.30 m surviving *identically to the step*. The
+correct reading is that the repeat's loop ran 901 steps. Per-robot survival is `fell`, and
+per-robot progress is `final_dist_m` and `t_reached_s`.
+
+Same shape as §5 and as CLAUDE.md §6.5: a column that is *almost* the quantity being
+reasoned about, with a plausible value.
+
+Not renamed, for the same reason §13's `--verify` was not: this sweep is in flight and the
+column is in every CSV already on disk.
+
+## 15 · A 11.3 M-triangle terrain cooks without error and collides with nothing
+
+The first 200-cell benchmark grid was one `import_mesh` call with 5.76 M vertices and
+11.34 M triangles. PhysX accepted it, the run started, and **every one of the 200 cells
+scored 0 goals on control step 1**. No exception, no warning. The robots had fallen through
+the terrain during the settle.
+
+`settle_ok` did not catch it: it tests the hip-to-foot lever, which is perfectly valid on a
+robot in free fall — the legs keep their geometry all the way down. The quantity that
+separates "standing on the cell" from "inside the cell" is **base height above that cell's
+own ground**, and `run_benchmark.py` now refuses to score if any robot is under 0.15 m of it.
+
+The fix is one collider per task (20 meshes of ~567 k triangles) rather than one for the
+grid. No geometry changes — each cell's vertices are identical either way; only which
+collider owns them differs.
+
+Worth stating plainly because of what the failure looked like: **a benchmark score of 0.00
+across all 200 cells is exactly what a single-skill lower bound might legitimately produce**,
+and it would have been believable.
+

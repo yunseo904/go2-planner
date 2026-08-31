@@ -81,3 +81,23 @@ the frozen archive either, and are now, as `data/calibration_probes_v2.npz`. `v2
 | # | What | Joints | Authority | Why | Deviation | Status |
 |---|---|---|---|---|---|---|
 | B7 | **Step-length heading half** `--heading-len` | thigh | one-sided, `[-0.04, 0]` rad | The same `ω_target` substitution read in the fore-aft axis; `T_stance` cancels, so it is as parameter-free as B2. One-sided because the open-loop probe measured (b) destroying TROT at +0.02. | 0.0% of swing frames reach its cap | **Default off.** A null result as a *proportional* term (+3% survival, −2% curvature, worse drift). The same mechanism as a **constant feed-forward** gives TROT +72% alive, +92% ground, −43% curvature. `trot_straight.md` |
+
+---
+
+## D · Added this session
+
+| # | What | Default | Why | What it bought |
+|---|---|---|---|---|
+| D1 | **Measured entry phase** `--start-phase measured` (verify_skill_replay, run_benchmark) + `planner.config.skill.ENTRY_FRAME_TURN = 6` | off (`first`) | Neither kinematic rule predicts which phase of TURN completes a turn; `level_start` picks frame 24, inside a ten-frame band that never does. | **TURN turns on flat.** 90° in place inside 0.19 m, 9/9 cells in both foot-comp arms, 62 sustained cycles in the second harness. `turn_entry_phase.md` |
+| D2 | **Capture-point rear term** `--foot-gain capture` | `half-stance` | `quadruped_pympc` writes the Raibert term as `sqrt(h/g)·(v_avg − v_ref)`. | **Nothing.** The gain is 4.4% from ours on TROT. `trot_capture_point.md` |
+| D3 | **v_y moving average** `--foot-vy-avg-n` | 0 (off) | The yaw rate has been cycle-averaged since stage 2; the velocity never was. | **Nothing.** 69 of 75 paired runs identical. |
+| D4 | **Foot-offset clip in metres** `--foot-offset-clip-m` | 0 (off) | Their ±0.05 **m** against our ±0.05 **rad** = ±0.0155 m — a 3× authority difference hiding behind the same number. | The only arm with a visible effect (8 fewer falls of 75, p ≈ 0.11) and it is a cap widening, already measured as not helping. |
+| D5 | **Grid side-view video** `--video` (run_calibration_grid) | off | Terrain runs could not be recorded at all; only the flat single-clip harness had a camera. | Renders on demand, never self-schedules, never steps physics. Regression check is the recorded run's termination against the un-recorded one. |
+| D6 | **Benchmark scorer** `scripts/run_benchmark.py` | — | The frozen benchmark had never been simulated. | The single-skill lower bound CLAUDE.md §2 requires: **TROT 0.98 / 8, WALK 1.11 / 8**. `benchmark_harness.md` |
+
+D2, D3 and D4 are kept despite being null because the null is the result: the external
+implementation's form of the rear term is not what this project is missing.
+
+`sim/footcomp.py`'s self-test asserts that with D2–D4 at their defaults the law is
+**bit-identical** to the one that produced every earlier row.
+

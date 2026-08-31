@@ -11,7 +11,7 @@ Sections 1–4 use the reference `STEP_WALK_MAX` = 0.10 m; §5 varies it.
 > upright. What it produces is the **skill sequence** and the **switch count**,
 > and how both respond to the switch delay. Success rates need the simulator.
 
-> **10 parameters are `CALIBRATION_NEEDED` placeholders** (§6). §5 exists
+> **12 parameters are `CALIBRATION_NEEDED` placeholders** (§6). §5 exists
 > precisely because one of them, `STEP_WALK_MAX`, could otherwise be mistaken for
 > the cause of a result that is really the sensor model's doing.
 
@@ -226,6 +226,8 @@ jump would have landed on the step.
 
 | parameter | placeholder | why it is not a measurement |
 | --- | --- | --- |
+| `skill.HEADING_ERR_TURN_DEG` | 12.0 | placeholder. How far off the goal bearing before TURN is worth the switch. It trades the switch cost against t |
+| `skill.SPEED_MATCH_MAX` | 0.25 | placeholder. Transition safety condition: refuse a switch while the body's own speed is further than this from |
 | `skill.STEP_WALK_MAX` | 0.1 | placeholder. The *walking* step limit has never been measured - every curated session is flat floor. It must s |
 | `skill.STEP_TROT_MAX` | 0.08 | placeholder; unmeasured |
 | `skill.STEP_RUN_MAX` | 0.04 | placeholder; unmeasured |
