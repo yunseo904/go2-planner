@@ -362,6 +362,26 @@ def run_isaac(args) -> list:
         contacts = ContactSensor(ContactSensorCfg(
             prim_path="/World/envs/env_.*/Robot/.*", history_length=0,
             track_air_time=False, update_period=0.0))
+    # Side-view recording of ONE cell.  The camera is created before sim.reset() like
+    # every other sensor, renders ON DEMAND (update_period 0.0) and never schedules
+    # itself, and grab_frame() calls sim.render() and nothing else -- the physics substep
+    # loop below is untouched: same phys_dt, same decimation, same order of writes.  The
+    # check that this held is the recorded run's own termination against the unrecorded
+    # one, which is what CLAUDE.md 8 asks a render run to demonstrate.
+    video = None
+    if args.video:
+        from isaaclab.sensors import Camera, CameraCfg
+        if not (0 <= args.video_cell < n):
+            raise SystemExit(f"--video-cell {args.video_cell} is outside 0..{n-1}")
+        video = {"cam": Camera(CameraCfg(
+            prim_path="/World/side_cam", update_period=0.0,
+            height=args.video_height, width=args.video_width, data_types=["rgb"],
+            spawn=sim_utils.PinholeCameraCfg(focal_length=24.0,
+                                             clipping_range=(0.05, 60.0)))),
+            "frames": 0, "k": int(args.video_cell)}
+        print(f"[grid] video: side view of cell {args.video_cell} "
+              f"({probes['names'][idx[args.video_cell]]}, {runs[args.video_cell][1]}), "
+              f"{args.video_width}x{args.video_height} -> {args.video}")
     sim.reset()
     print(f"[grid] articulation instances: {robot.num_instances} (want {n})")
     if robot.num_instances != n:
@@ -481,6 +501,17 @@ def run_isaac(args) -> list:
                   + ", ".join(f"{probes['names'][idx[k]]} (worst lever "
                               f"{all_lever[k].min():.3f} m)" for k in bad[:8])
                   + (" ..." if len(bad) > 8 else ""))
+        # COM height for the capture-point gain, measured per robot from the settle --
+        # sqrt(h/g) is a property of this body at this stance, so a nominal number would
+        # be exactly the kind of "almost the right quantity" CLAUDE.md 6.5 is about.
+        # A robot that failed its settle gets the median, stamped like its levers are.
+        com_h = np.where(settle_ok, bpos[:, 2] - np.array(
+            [np.mean([bp[j, f_by[l], 2] for l in legs]) for j in range(n)]),
+            np.nan)
+        if np.isfinite(com_h).any():
+            com_h = np.where(np.isfinite(com_h), com_h, np.nanmedian(com_h))
+        else:
+            com_h = np.full(n, 0.31)
         foots = []
         for k, c in enumerate(per_robot_clip):
             lever = all_lever[k] if settle_ok[k] else med_lever
@@ -499,9 +530,52 @@ def run_isaac(args) -> list:
                 heading_len=bool(args.heading_len) and hcap > 0.0,
                 heading_len_cap_rad=args.heading_len_cap,
                 yaw_bias=args.foot_yaw_bias, len_bias=args.foot_len_bias,
-                cycle_len=len(c["q_des"])))
+                cycle_len=len(c["q_des"]),
+                gain_mode=args.foot_gain, com_height_m=com_h[k],
+                vy_avg_n=args.foot_vy_avg_n,
+                offset_clip_m=args.foot_offset_clip_m))
         print(f"[grid] *** FOOT PLACEMENT ON for all {n} robots (cap {args.foot_clip_rad:g} rad). "
               f"This CLOSES A LOOP on base velocity and OVERWRITES the recording. ***")
+        if args.foot_gain != "half-stance" or args.foot_vy_avg_n or args.foot_offset_clip_m:
+            print(f"[grid] *** CAPTURE-POINT VARIANT: gain={args.foot_gain}"
+                  + (f" (sqrt(h/g), h measured {com_h.min():.3f}-{com_h.max():.3f} m -> "
+                     f"{float(np.sqrt(com_h.mean()/9.81)):.4f} s against half-stance "
+                     f"{0.5*float(np.mean([stance_time_s(c['contact'], c['fs']) for c in per_robot_clip])):.4f} s)"
+                     if args.foot_gain == "capture" else "")
+                  + (f", v_y averaged over {args.foot_vy_avg_n} control steps "
+                     f"({args.foot_vy_avg_n*dt:.3f} s)" if args.foot_vy_avg_n else
+                     ", v_y unaveraged")
+                  + (f", foot offset clipped to +-{args.foot_offset_clip_m:g} m "
+                     f"(the radian cap would be {args.foot_clip_rad*float(np.mean(med_lever)):.4f} m)"
+                     if args.foot_offset_clip_m else "")
+                  + ". Default is OFF and reproduces every earlier run. ***")
+    if video is not None:
+        import imageio.v2 as imageio
+        fps = args.video_fps if args.video_fps else max(1.0, 1.0 / dt)
+        Path(args.video).parent.mkdir(parents=True, exist_ok=True)
+        video["writer"] = imageio.get_writer(args.video, fps=fps, macro_block_size=None,
+                                             codec="libx264", quality=8)
+        video["fps"] = fps
+        video["y0"] = float(spawns[video["k"]][1])
+        print(f"[grid] video: writing {fps:.1f} fps "
+              f"({'real time' if not args.video_fps else 'forced -- slow motion'})")
+
+    def grab_frame():
+        """Pull one RGB frame of the tracked cell. Renders only; never steps physics."""
+        k = video["k"]
+        p_ = snap(robot.data.root_pos_w)[k]
+        eye = torch.tensor([[float(p_[0]), video["y0"] + args.video_side_m,
+                             max(0.35, float(p_[2]) + 0.12)]],
+                           device=sim.device, dtype=torch.float32)
+        tgt_ = torch.tensor([[float(p_[0]), video["y0"], 0.28]],
+                            device=sim.device, dtype=torch.float32)
+        video["cam"].set_world_poses_from_view(eye, tgt_)
+        sim.render()
+        video["cam"].update(dt, force_recompute=True)
+        rgb = video["cam"].data.output["rgb"][0].detach().cpu().numpy()
+        video["writer"].append_data(np.ascontiguousarray(rgb[..., :3]).astype(np.uint8))
+        video["frames"] += 1
+
     swing = [~np.asarray(c["contact"], dtype=bool) for c in per_robot_clip]
 
     # Time budget from the SKILL's own measured speed, not one number shared across
@@ -618,6 +692,8 @@ def run_isaac(args) -> list:
                 # let a robot that rolls onto its back score a pass.
                 legal &= (pos[:, 2] >= FALL_HEIGHT_M) & (drift <= GOAL_RADIUS_M)
                 yaw_ok = np.where(legal, np.maximum(yaw_ok, np.abs(yaw_cum)), yaw_ok)
+            if video is not None and rep == args.video_rep and step % args.video_stride == 0:
+                grab_frame()
             if tr is not None:
                 tr["root_pos_w"].append(pos.copy())
                 tr["root_quat_w"].append(snap(robot.data.root_quat_w))
@@ -685,6 +761,14 @@ def run_isaac(args) -> list:
                              "heading_len": int(args.heading_len),
                              "foot_yaw_bias": args.foot_yaw_bias,
                              "foot_len_bias": args.foot_len_bias,
+                             # Same reason as `heading` above: a capture-point row and a
+                             # half-stance row are different controllers and the CSV has
+                             # to say which one produced the number.
+                             "foot_gain": args.foot_gain,
+                             "foot_vy_avg_n": args.foot_vy_avg_n,
+                             "foot_offset_clip_m": args.foot_offset_clip_m,
+                             "foot_com_height_m": (float(com_h[k]) if args.foot_comp != "off"
+                                                   and args.foot_gain == "capture" else ""),
                              "heading_len_cap_rad": args.heading_len_cap,
                              # The in-place raw measurements, written on every row so the
                              # 90 deg threshold can be moved afterwards without repeating
@@ -717,6 +801,11 @@ def run_isaac(args) -> list:
             print(f"[grid] trace -> {out}  ({len(tr['root_pos_w'])} steps x {n} robots)")
 
     # -- the protocol's own reduction: a level passes only if EVERY repeat passed ----
+    if video is not None:
+        video["writer"].close()
+        print(f"[grid] video: wrote {video['frames']} frames "
+              f"({video['frames'] / video['fps']:.2f} s at {video['fps']:.1f} fps) "
+              f"-> {args.video}")
     print(f"\n  {'probe':16s} {'skill':6s} {'param m':>8s} {'passed':>10s}  reps")
     for k, (param, skill, family, i, level) in enumerate(runs):
         mine = [r for r in rows_out if r["probe"] == probes["names"][i] and r["param"] == param]
@@ -835,6 +924,24 @@ def main() -> int:
                          "the probe's own flat run-up 3 m short of it -- the FLAT CONTROL, "
                          "identical in every other respect, which is what says whether a "
                          "failed in-place score is the terrain or the skill")
+    ap.add_argument("--foot-gain", choices=("half-stance", "capture"), default="half-stance",
+                    help="the Raibert leading term. half-stance (default, every earlier run): "
+                         "T_stance/2, measured off the clip's own contact channel. capture: "
+                         "sqrt(com_height/g), the LIP time constant quadruped_pympc uses -- a "
+                         "property of the body rather than of the gait. On TROT the two are "
+                         "0.186 s and 0.178 s, so this flag is NOT where the two laws differ; "
+                         "it is separated from the other two so that can be shown rather than "
+                         "assumed")
+    ap.add_argument("--foot-vy-avg-n", type=int, default=0,
+                    help="moving average on the lateral velocity the law reads, in control "
+                         "steps (0 = off, the default). quadruped_pympc averages v over 20 "
+                         "samples before differencing against v_ref; the yaw RATE has been "
+                         "averaged over a cycle here since stage 2 and the velocity never was")
+    ap.add_argument("--foot-offset-clip-m", type=float, default=0.0,
+                    help="clip the foot OFFSET in metres instead of the hip angle in radians "
+                         "(0 = off, the default). quadruped_pympc bounds the offset at "
+                         "+-0.05 m; --foot-clip-rad 0.05 through a 0.31 m lever is +-0.0155 m, "
+                         "a third of the authority for the same-looking number")
     ap.add_argument("--foot-yaw-bias", type=float, default=0.0,
                     help="CONSTANT differential lateral placement, +front/-rear on the hips "
                          "(rad). Open loop, added after the feedback term and not clipped by "
@@ -858,6 +965,21 @@ def main() -> int:
     ap.add_argument("--heading-cap", type=float, default=0.0,
                     help="override the per-skill heading cap (rad) for every skill. 0 = use "
                          "the HEADING_CAP table. For measuring whether a cap is what binds.")
+    ap.add_argument("--video", default=None,
+                    help="write an mp4 side view of ONE cell. NEEDS A GPU (this renders); "
+                         "with GPU=none the run hangs in carb.cudainterop rather than "
+                         "failing. Physics and control rate are unchanged -- the check is "
+                         "that the recorded run terminates where the unrecorded one did.")
+    ap.add_argument("--video-cell", type=int, default=0,
+                    help="which cell of the grid to follow (0-based, plan order)")
+    ap.add_argument("--video-rep", type=int, default=0, help="which repeat to record")
+    ap.add_argument("--video-width", type=int, default=960)
+    ap.add_argument("--video-height", type=int, default=540)
+    ap.add_argument("--video-stride", type=int, default=1)
+    ap.add_argument("--video-fps", type=float, default=None,
+                    help="force the output frame rate. Half of 1/dt gives half speed.")
+    ap.add_argument("--video-side-m", type=float, default=2.4,
+                    help="camera offset from the cell's own centre line, metres")
     ap.add_argument("--trace-full", action="store_true",
                     help="record contact-force VECTORS on every link, joint torques, per-link "
                          "positions and the per-step foot-placement correction, not just the "
