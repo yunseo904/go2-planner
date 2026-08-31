@@ -856,6 +856,28 @@ def run_isaac(args, clip: dict, meta: dict, then_clip: dict | None = None,
             print(f"[replay] WARNING this clip has NO frame with all four feet down "
                   f"(max {ph['feet_down']}), so no phase gives a four-foot initial "
                   f"condition. A flight-phase gait cannot be started from rest.")
+    elif args.start_phase == "measured" and clip["kind"] == "cyclic":
+        # The entry phase as a MEASUREMENT rather than a criterion.  For TURN the two
+        # kinematic rules above both pick badly -- `level` picks frame 24, which is
+        # inside a ten-frame band where the flat control never completes its 90 deg --
+        # so the frame is carried in planner/config.py, derived from a sweep of every
+        # phase in both foot-comp arms (outputs/turn_entry_phase.md).  A clip with no
+        # measurement falls back to `level` and says so.
+        from planner.config import DEFAULT as _CFG
+        k = int(getattr(_CFG.skill, f"ENTRY_FRAME_{clip['name']}", -1))
+        if k < 0:
+            print(f"[replay] start phase: no measured entry frame for {clip['name']} in "
+                  f"planner/config.py -- falling back to the coplanarity rule")
+            k, ph = level_start(clip, robot, sim, idx_t, phys_dt)
+        else:
+            _, ph = quiescent_start(clip)
+            ph["start_frame"] = k
+            print(f"[replay] *** MEASURED ENTRY PHASE: frame {k}/{len(clip['q_des'])} for "
+                  f"{clip['name']}, from planner.config.skill.ENTRY_FRAME_{clip['name']} "
+                  f"(outputs/turn_entry_phase.md, 810 flat runs). This is a choice of WHERE "
+                  f"IN THE LOOP to start; the recording is unchanged. Default is "
+                  f"--start-phase first, which is what every earlier run used. ***")
+        clip = rotate_clip(clip, k)
     elif clip["kind"] == "cyclic":
         _, ph = quiescent_start(clip)
     else:
@@ -1820,11 +1842,15 @@ def main() -> int:
     ap.add_argument("--hip-sign", choices=("keep", "flip"), default="keep",
                     help="negate the hip columns; see --convention for why this is a live question")
     ap.add_argument("--settle-s", type=float, default=0.5)
-    ap.add_argument("--start-phase", choices=("first", "stance", "level"), default="first",
+    ap.add_argument("--start-phase", choices=("first", "stance", "level", "measured"),
+                    default="first",
                     help="Where in the loop to begin. first: frame 0, as recorded. "
                          "stance: the frame with the most feet down per the clip's contact "
                          "channel. level: the frame whose joint angles put the four feet "
                          "closest to a plane, measured from the robot's own kinematics. "
+                         "measured: the frame planner/config.py records for this clip, "
+                         "swept rather than inferred -- neither kinematic rule predicts "
+                         "which phases of TURN complete a turn (outputs/turn_entry_phase.md). "
                          "A cyclic clip is a loop, so this selects an entry point; it does "
                          "not alter the recording. Ignored for one-shot clips.")
     ap.add_argument("--settle-mode", choices=("drop", "stand"), default="drop",

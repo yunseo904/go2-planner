@@ -69,6 +69,14 @@ class SkillLimits:
     YAW_RATE_TURN: float = -0.3954
     HEADING_ERR_TURN_DEG: float = 12.0
 
+    # -- where in the TURN cycle a replay may start -- MEASURED, not a criterion ----
+    # A cyclic clip is a loop and the frame it is entered at is a free choice.  For
+    # WALK and TROT that choice is made by a kinematic rule at run time
+    # (verify_skill_replay.level_start, the most coplanar pose).  For TURN the rule
+    # picks a phase that does not turn, so this skill carries its entry frame as a
+    # measured constant instead.  -1 means "no measurement, use the rule".
+    ENTRY_FRAME_TURN: int = 6
+
     # -- how close the body has to be to the incoming gait's speed to switch ----
     SPEED_MATCH_MAX: float = 0.25
 
@@ -108,6 +116,14 @@ _p("skill.YAW_RATE_TURN", Provenance.MEASURED, "rad/s",
    "skill_profile.csv yaw_rate_steady_mean -0.3954 (-22.66 deg/s) for turn_right_20260824_223951. "
    "This is the MEASURED rate, not the -0.6 rad/s that was commanded to produce it, and it is "
    "the same number the low level uses as its foot-placement target (outputs/turn_target.md)")
+_p("skill.ENTRY_FRAME_TURN", Provenance.MEASURED, "frame",
+   "outputs/turn_entry_phase.md. All 45 phases of the 45-frame TURN clip were run as the "
+   "in-place flat control, 9 identical cells each, in both foot-comp arms -- 810 runs. "
+   "22 of 45 phases complete the 90 deg with --foot-comp on and 5 of 45 with it off; frame 6 "
+   "is the only phase that passes 9/9 in BOTH arms with both its neighbours doing the same, "
+   "so it is robust to a one-frame phase error and to the compensator being on or off. "
+   "This is measured on the CALIBRATION terrain's flat run-up, not on the benchmark "
+   "(CLAUDE.md 2), and it is a property of the skill rather than a threshold on terrain")
 _p("skill.HEADING_ERR_TURN_DEG", Provenance.CALIBRATION_NEEDED, "deg",
    "placeholder. How far off the goal bearing before TURN is worth the switch. It trades the "
    "switch cost against the heading a straight gait would give away, and neither side has been "
