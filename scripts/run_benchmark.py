@@ -172,6 +172,12 @@ def build_grid(z, cells, gutter: float = 1.0):
             bounds)
 
 
+def _frac(held: dict, name: str, k: int) -> float:
+    """Share of the steps robot ``k`` spent upright that it spent in skill ``name``."""
+    tot = sum(held[s][k] for s in held)
+    return (held[name][k] / tot) if tot else 0.0
+
+
 def aggregate(rows: list) -> dict:
     """Per-cell episode mean, then the equal-weight mean over cells."""
     per_cell = {}
@@ -763,7 +769,11 @@ def run_isaac(args) -> tuple:
                   for k in range(n):
                       nm = pl_sk[k].value
                       ph = pl_ph[k] % len(pl_q[nm])
-                      pl_held[nm][k] += 1
+                      # Only while the robot is still up: a fallen robot keeps being commanded
+                      # to the shared step budget, and counting those steps made the three
+                      # fractions sum to more than 1.
+                      if alive[k]:
+                          pl_held[nm][k] += 1
                       cmd[k] = pl_q[nm][ph]
                       if alive[k]:
                           cmd[k] = cmd[k] + pl_foot[k][nm].step(
@@ -845,12 +855,12 @@ def run_isaac(args) -> tuple:
                                "alive_at_end": int(alive[k]),
                                "switches": int(pl_switches[k]) if PLANNER_ARM else "",
                                "refused_ticks": int(pl_refused[k]) if PLANNER_ARM else "",
-                               "frac_WALK": (float(pl_held["WALK"][k]) / max(step + 1, 1)
-                                             if PLANNER_ARM else ""),
-                               "frac_TROT": (float(pl_held["TROT"][k]) / max(step + 1, 1)
-                                             if PLANNER_ARM else ""),
-                               "frac_TURN": (float(pl_held["TURN"][k]) / max(step + 1, 1)
-                                             if PLANNER_ARM else ""),
+                               # Fractions of the steps this robot was UP: they sum to 1.
+                               "steps_alive": (int(sum(pl_held[s_][k] for s_ in pl_held))
+                                               if PLANNER_ARM else ""),
+                               "frac_WALK": _frac(pl_held, "WALK", k) if PLANNER_ARM else "",
+                               "frac_TROT": _frac(pl_held, "TROT", k) if PLANNER_ARM else "",
+                               "frac_TURN": _frac(pl_held, "TURN", k) if PLANNER_ARM else "",
                                "yaw_moment": args.yaw_moment,
                                "yaw_moment_gain": args.yaw_moment_gain,
                                "partial": int(n < full), "skill": args.skill,
