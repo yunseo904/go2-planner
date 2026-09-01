@@ -1,8 +1,15 @@
-# Session state — 2026-09-01 (3), the benchmark moved to legged_eval and the roughness took a third of the score
+# Session state — 2026-09-02 (7), three hypotheses tested: one confirmed, two corrected
 
-**Read this first next session.**  Everything below is committed.  Sections 1–4 are CPU
-only; section 5 used GPU 1 (which was free — the WMP training had been stopped and its
-watchdog paused at 20:28, see §7).
+**Read this first next session.**  Everything below is committed.
+
+**The newest work is §14 (session 7) and the current to-do list is §15.**  Sections 1–13 are
+earlier sessions, kept in order; where a later section corrects an earlier one it says so,
+and §14 corrects §13 on level 2 and the swing-lift mechanism.
+
+Machine notes for session 7: the WMP training was stopped with `~/.wmp_lab_pause` set to
+epoch 1788289200 = **2026-09-02 04:00 KST** (an earlier note in §7 read this as 20:28 and was
+wrong).  GPU 1 was free for the whole session and was used only for the depth runs, which
+RENDER; every other run was `GPU=none` on CPU.  GPU 0 was not touched.
 
 ---
 
@@ -414,14 +421,233 @@ a silhouette), plus the placement law off.  Regression identical on every column
 `yaw_rate_deg_s` to 16 digits.  Not done: the in-air replay of the log's joint angles, and
 the WALK couple on/off pair on a probe step.
 
-## 14. What to do next, in order
+## 14. Session 7 (2026-09-02) — three hypotheses tested, one confirmed, two corrected
 
-1. **Resolve the layer disagreement about level 2** (probe roughness limit falls, benchmark
-   score rises).  Cheapest test: benchmark WALK with the couple at `--no-roughness`.  If the
-   gain survives without roughness, the gain is not about roughness and the probe is right.
-2. **TURN's remaining 57 % → 35 %.**  Candidates left are the per-cell lever, the 0.42 m
-   spawn drop, and the 200-robot scene.  The in-air joint-angle replay is the kinematic
-   control that would separate "the clip cannot do it here" from "the harness is losing it".
-3. `--rate hi` for TURN and TROT only, as a per-clip choice rather than a run-wide flag.
-4. **The library is still the ceiling** — 0.88 against 4.83.
-5. `effort_limit` is the user's decision; the evidence is closed.
+Full detail: `outputs/support_gate.md`, `outputs/level2_verdict.md`, `outputs/cross_track.md`.
+
+**The list from §14 of the previous session is superseded by what follows.**
+
+### The headline
+
+| question | answer |
+|---|---|
+| Is the roll couple's benchmark gain about roughness? | **Yes — entirely.** +0.080 with roughness, −0.005 without. The benchmark is right, the probe's criterion is wrong for this term. **0.83 stands.** |
+| Does WALK hold 3 feet down? | **No, and it cannot.** duty 0.662 → 56.8 % of the cycle on 2 feet. The proposed gate would reject the only skill that works. |
+| Does swing lift remove support? | **No — it ADDS it** (2.374 → 2.512 feet). It was never a support edit; it is a speed edit (+16 to +20 % v_x). |
+| Can the robot go straight? | **No.** 0.53 m of lateral drift per metre travelled, 149/200 cells the same way. |
+| Can foot placement fix that? | **No.** Every gain, either sign, and three times the authority all reproduce the control. The channel does not move lateral position. |
+
+### 1. The support gate had to be written relative, not absolute
+
+`scripts/support_polygon.py`, on our own clips:
+
+| clip | duty | mean feet | min | below 3 feet | benchmark |
+|---|---|---|---|---|---|
+| WALK | 0.662 | 2.65 | 2 | **56.8 %** | 0.76 |
+| TROT | 0.578 | 2.31 | 2 | 78.1 % | 0.29 |
+| **TURN** | 0.672 | **2.69** | 2 | 48.9 % | **0.17** |
+| RUN | 0.344 | 1.38 | 0 | 100 % | 0.00 |
+
+Two things follow. **Mean feet = 4 × duty**, so "3 feet at all times" requires duty ≥ 0.75;
+our `03_slow_walk` recording is 0.66 and therefore *must* spend part of its cycle on two
+feet. And **support does not order the scores** — TURN has the widest support of any clip
+and the worst score. CLAUDE.md 2.5 is therefore a *relative* gate: a foot-moving
+intervention must not reduce support below the unedited clip's own measurement, measured
+paired. Torque-only terms are exempt by construction and still stamped.
+
+The static/dynamic account itself survives and still explains why WALK is the only skill
+that works open loop. What the measurement removes is the number "3", not the idea.
+
+### 2. Swing lift — rejected, for a different reason than proposed
+
+Flat rig, WALK, 60 cycles, contact measured from force:
+
+| lift | mean feet | min | below 3 | v_x |
+|---|---|---|---|---|
+| 0 mm | 2.374 | 2 | 70.8 % | 0.2332 |
+| 20 mm | 2.406 | 2 | 64.1 % | +16 % |
+| 40 mm | 2.421 | **1** | 61.7 % | +20 % |
+| 60 mm | 2.512 | **1** | 54.5 % | +19 % |
+
+Support *rises* monotonically; the rear feet are not being lifted off, the gait is spending
+longer in stance. What appears is single-foot support the reference never has. **Rejected on
+the v_x criterion and on min support, not on mean support.**
+
+**Both adopted foot-moving terms pass and neither is marginal**: foot placement 2.374 →
+2.385 at v_x −0.7 %, plus heading hold 2.438 at −5.7 %, minimum 2 throughout.
+
+### 3. The roll couple: (b), and the description changes
+
+WALK, seed 1, 200 cells, `--heading heading-only`, recommended point:
+
+| | couple off | couple on | Δ | paired |
+|---|---|---|---|---|
+| roughness ON | **0.755** | **0.835** | **+0.080** | 24 b / 12 w / 164 t |
+| roughness OFF | **1.095** | **1.090** | **−0.005** | 3 b / 3 w / 194 t |
+
+**Two regression checks passed exactly** (0.755 and 1.095 are the published arms, reproduced
+by code three sessions newer, with `level2_results.md`'s own 24/12 paired counts). Repeated
+on the `--heading off` arm as a control: +0.080 / +0.000.
+
+So **(a) is refuted, (b) holds, (c) does not apply** — `sim/attitude.py` writes effort
+targets on legs the recording already has down and never writes `q_des`. **0.83 stands, and
+level 2 may now be described as better on rough ground** — the opposite of the caution
+session 6 imposed.
+
+Why the probe disagreed, as far as this goes: its roughness ladder is 0.005–0.015 m and the
+benchmark's is 0.02–0.04 m, above the top of it everywhere; and its rungs are n = 3, so the
+headline 3/3-vs-1/3 is a one-to-two-episode difference against 200 paired cells. **Direction
+and dependence established; mechanism not.** Re-run the probe at 0.02–0.04 m with more
+repeats before claiming it.
+
+### 4. Cross-track: the drift is real, the channel does not touch it
+
+Heading hold fixes the ANGLE (13.26 → 0.24 °/m) and nothing fixes the POSITION. WALK,
+no roughness: forward 1.006 m median, |cross-track| 0.562 m, **0.531 m/m**, and **149/200
+cells drift the same way**. That is a bias, not scatter, and it is a candidate cause for
+`staircase_spiral`'s 0.00 (goal 0 sits 0.30 m to one side). The depth arm carries the same
+drift (|cross-track| 0.551 m).
+
+`--cross-track hold` asks the lateral law for `v_y = −gain × error` against the robot's own
+settle-line datum. Paired against off, gains 0.5 / 1.0 / 2.0 / **−1.0**, caps 0.03 / 0.10 /
+0.30: **every arm lands inside 0.720–0.765 against the control's 0.755**, with peak
+cross-track inside 0.398–0.429. **The sign flip is indistinguishable from off** — the test
+that settled the roll couple's sign, failed here.
+
+Checked offline: `vy_bias = −0.10 m/s` produces exactly **0.0500 rad** of hip command and
+`--foot-clip-rad` is **0.05**, so the term saturates the law's authority at the smallest cap
+tried. **But that is not the explanation.** At `--foot-clip-rad 0.15` — three times the
+authority, run as a pair — the term still moves peak cross-track by **+0.1 %** and final
+|cross-track| by **+1.3 %**, and costs 0.780 → 0.750 with survival 47 → 28.
+
+> **The lateral placement channel does not move lateral position on this terrain, at any
+> gain, either sign, or three times the authority.** Whatever produces the drift is not the
+> body-frame lateral velocity this law regulates.
+
+**Not adopted; flag kept, default off.** An earlier draft blamed the 0.05 rad cap and linked
+it to TURN's 31–36 %; the wider-cap arm refutes that and it is withdrawn.
+
+One measurement worth chasing: `cross_track_m` (0.598) and `cross_track_abs_max_m` (0.408)
+disagree because the first is read at the end of the episode and includes post-mortem
+sliding while the second stops at the last upright step. `final_x_m` and `travelled_m` have
+always had that property too.
+
+### 4b. The by-product: survival and score have decoupled
+
+**`--foot-clip-rad` has been 0.05 since the placement law was written and has never been
+swept.** Swept now, WALK, seed 1, roll couple on — the adopted configuration:
+
+| clip | score | alive at 20 s | v_x |
+|---|---|---|---|
+| **0.05** (the adopted default) | **0.835** | 31 | 0.0875 |
+| 0.10 | 0.800 | 40 | −3.8 % |
+| 0.15 | 0.800 | 49 | −7.4 % |
+| **0.25** | **0.835** | **53** | −6.2 % |
+
+**Survival rises by 22 cells and the score ends exactly where it started**, with the
+intermediate points no better (0.800 at both 0.10 and 0.15). Without the roll couple the
+same widening reads 0.755 → 0.780 / 29 → 47 alive, which is the same effect through a
+different baseline.
+
+> **Survival and score have decoupled.** The roll couple and the placement cap both buy time
+> upright and past a point neither converts it into distance; v_x falls 6–7 %, which costs
+> goals outright.
+
+Consistent with the rest of the grid — median robot dies at 0.79 m, goal 0 sits at 0.50 m in
+180 of 200 cells, and §2 already recorded that nothing past the first metre is being
+measured. **Interventions that buy balance have run out of score to buy.** Same conclusion
+the oracle reached from the other side (0.88 against 4.83).
+
+Worth a proper sweep — a 22-cell survival move from an unexamined default should be
+understood — but it is **not** a lead on the score.
+
+### 5. Results wiring for the review (§8 of the request)
+
+Columns are only ever appended, so older files stay readable and new ones are supersets.
+Per cell: `vy_mean_ms`, `cross_track_m`, `cross_track_abs_max_m`, `curvature_rad_m`, `fell`,
+`episode_s`. Stamped on every row: `terrain_seed`, `measurement_seed`, `episode_length_s`,
+`episodes`, `num_envs`, `rate`, `gutter`, `spawn_z`, `settle_s`, `foot_clip_rad`, `steering`,
+and the commanded-support pair.
+
+**The two condition checks, answered from the data:**
+
+* **Episode length AGREES.** Ours is 20.0 s and `~/eval_out/teacher_lab_*.json` reports
+  `protocol.episode_length_s` 20.0. No change needed.
+* **Env count DOES NOT.** Those runs report `num_envs` **1000** — the same 200 cells with
+  **5 episodes each**. We run 200 with `--episodes 1`. Same protocol, **one fifth the
+  sample**. `--episodes 5` closes it at 5× the cost; until then the stamp makes it visible.
+
+**Steering is a third category and is named as one**: `dead-reckoned-heading-hold`. Heading
+hold remembers the heading the robot settled at and pulls the yaw error back to it; no
+waypoint or velocity command reaches the gait, and the goals are scored against but never
+steered toward. Neither "self" nor "commander" fits.
+
+`scripts/aggregate_benchmark.py` (CPU only) turns any results CSV into the three tables —
+overall, by difficulty, by course — with conditions as a footnote read off the rows. It
+refuses to pool differing terrains and says when it has reconstructed a column.
+`scripts/csv_coverage.py` answers what the existing runs can already fill: **68 results CSVs
+in 9 column sets, and only the two newest have everything.** 50 of 68 can fill tables 1–3
+(they carry `end_cause` + `upright_s`); the 11 earliest legged_eval files cannot produce
+falls or episode length at all.
+
+### 6. The review run
+
+`outputs/bench_le/depth_review_s1.csv` -- the representative arm (Rule-Planner, depth, roll
+couple, heading hold) re-measured in the section-8 format. **It reproduces the published arm
+on 200 of 200 cells, 0.685.** `outputs/aggregate_depth_review.md` is its three-table
+aggregate. Seeds 2 and 3 follow for the error bar.
+
+Cost note for planning: the depth run took **4.7 minutes**, not the ~20 assumed. Depth is
+much cheaper than it has been treated as.
+
+### 7. Asked for and already done before this session
+
+* **§3's transient discovery is already recorded** — SESSION_STATE 13 carries the 4 / 11 /
+  25 / 61-cycle table (57 / 61 / 73 / 75 % of the logged yaw rate) and states that the
+  benchmark gives TURN a 3.4 s median life. The implication the request asks to write down
+  is written down. **Not repeated.**
+* **§5's measurement is already done** — SESSION_STATE 13 has `--rate hi` per clip on flat
+  (TURN 72 → 83 % with stride cv 0.224 → 0.068; TROT +1 % and cv halved; WALK v_x +13 %,
+  outside the band) and the conclusion not to adopt it globally. **What is missing is the
+  per-clip implementation, not the evidence.**
+* **§4's "a hip torque has no vertical component"** was closed in sessions 5 and 6. The
+  leg-extension hypothesis is new and is now partly measured (§4 above, `run_extension.md`).
+
+### 8. Not started this session
+
+§3 (TURN in-air replay and the remaining per-cell-lever / spawn-drop / 200-robot
+candidates), §5 (per-clip `--rate`), §6 (TROT's 4 cm failure mode frame by frame), §7 (the
+fall-after-climb roll divergence), §7-b (WALK+lift against TROT).
+
+**§7-b's premise did not survive a first look and is worth restating before it is run.** It
+assumes swing lift makes WALK's contact pattern resemble TROT's. Measured, WALK+lift goes
+the *other* way — mean feet down 2.374 → 2.512, while TROT's own clip is 2.31 commanded.
+Lift makes WALK's support *wider*, not narrower, so the natural experiment as described does
+not exist. A flat TROT reference was attempted and is unusable: bare `--clip TROT` fell at
+0.60 s on a roll after one cycle, because the default entry phase is not one of the four
+`trot_yaw_moment.md` found TROT survives at.
+
+---
+
+## 15. What to do next, in order
+
+1. **Take the decoupling seriously: measure TRAVEL, not survival.** Two independent terms
+   now buy time upright and neither buys goals (§4b). Before adding a third balance term,
+   establish what stops a robot that stays up from going anywhere — the distance-to-next-goal
+   and cross-track columns are already in the CSV and have never been the target of an
+   intervention. **This reframes items 2–4 below rather than replacing them.**
+2. **Build the in-air replay.** It is the kinematic control for TURN's missing 57 % → 35 %
+   (§3, open since session 6) *and* the only way to settle RUN's posture question (§4). One
+   rig, two open questions.
+3. **Where does the cross-track drift come from?** Not heading, not the lateral placement
+   law at any authority. Candidates: foot slip, yaw-coupled sliding, and post-mortem drift
+   (`cross_track_m` 0.598 against `cross_track_abs_max_m` 0.408 — the gap is the fall).
+4. **Re-run the probe rig at the benchmark's own roughness (0.02–0.04 m) with more repeats**,
+   to close level 2's mechanism. Direction and dependence are settled; mechanism is not.
+5. **`--episodes 5`** to match legged_eval's 1000-env sample, now that a depth run is known
+   to cost 4.7 minutes.
+6. **Sweep `--foot-clip-rad` properly** — three seeds, both skills, support gate. An 18-cell
+   survival move from a never-examined default is worth understanding even though it is not
+   a score lead.
+7. **The library is still the ceiling** — 0.88 against 4.83. Nothing this session moved it.
+8. `effort_limit` is the user's decision; the evidence is closed.

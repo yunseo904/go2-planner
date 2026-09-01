@@ -94,16 +94,40 @@ against 0.408, and that gap is itself worth chasing).
 **An earlier draft of this file blamed the 0.05 rad cap and connected it to TURN's 31-36 %.
 That is withdrawn: the wider-cap arm refutes it.**
 
-## 5. The by-product, which is the most promising thing found this session
+## 5. The by-product: the cap moves SURVIVAL, and survival has stopped paying
 
 `--foot-clip-rad` has been 0.05 since the placement law was written and **has never been
-swept**.  Widening it to 0.15 **with no cross-track term at all** is worth **0.755 -> 0.780**
-and takes WALK from **29 to 47 alive** at 20 s, at a v_x cost of -7 % (inside the +-10 %
-band).  That is a larger survival move than the roll couple's, from a default nobody had
-looked at.
+swept**.  Swept now, WALK, seed 1, roll couple on (the adopted configuration):
 
-It is NOT adopted on this evidence: one seed, one skill, and the support gate has not been
-run on it.  It is the first thing to sweep properly next session.
+| clip | score | alive at 20 s | v_x |
+|---|---|---|---|
+| **0.05** (the adopted default) | **0.835** | 31 | 0.0875 |
+| 0.10 | 0.800 | 40 | -3.8 % |
+| 0.15 | 0.800 | 49 | -7.4 % |
+| **0.25** | **0.835** | **53** | -6.2 % |
+
+**Survival rises by 22 cells, 31 -> 53, and the score ends exactly where it started.**  The
+intermediate points are not better either -- 0.800 at both 0.10 and 0.15.  Without the roll
+couple the same widening reads 0.755 -> 0.780 with alive 29 -> 47, so even the apparent win
+there is the same effect seen through a different baseline.
+
+So the honest reading is not "a promising knob".  It is:
+
+> **Survival and score have decoupled.**  Two independent interventions -- the roll couple
+> and the placement cap -- both buy time upright, and past a point neither converts it into
+> distance.  A robot that stays up 22 cells more often collects nothing extra, and v_x falls
+> 6-7 %, which costs goals outright.
+
+That is consistent with everything else on this grid: the median robot dies at 0.79 m, goal
+0 sits at 0.50 m in 180 of 200 cells, and `benchmark_legged_eval.md` already observed that
+nothing past the first metre of any course is being measured.  **Interventions that buy
+balance have run out of score to buy.**  It is the same conclusion the oracle reached from
+the other direction -- 0.88 against 4.83, with only 0.05 of that between WALK and a perfect
+chooser.
+
+The cap still deserves a proper sweep (three seeds, both skills, support gate), because a
+22-cell survival move from a never-examined default is worth understanding.  But it is
+**not** a lead on the score and must not be written up as one.
 
 ## 6. Status
 
