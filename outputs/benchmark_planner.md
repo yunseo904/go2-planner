@@ -1,5 +1,18 @@
 # The Rule-Planner on the 200-cell benchmark, against its own lower bounds
 
+> **TERRAIN: `data/benchmark_frozen.npz` — no roughness, no border walls.**
+> Superseded 2026-09-01 as the evaluation terrain.  Every number in this file was measured
+> on the frozen archive, which lacks the two things eurekaverse's own `terrain_gpt.py` adds
+> to every patch (uniform noise of amplitude 0.02-0.04 m, and a 0.1 m rim raised 0.5 m), and
+> which draws its courses from upstream's seed rather than the run seed.  It is therefore an
+> **easier** benchmark than the one the E2E numbers come from, and a different draw besides:
+> 180 of its 200 cells differ from legged_eval's.
+>
+> These numbers are kept, not withdrawn — they are the only 200-cell measurement of that
+> terrain, and the ablation in `benchmark_legged_eval.md` needs them as its "neither" corner.
+> **They may not be compared with, or averaged into, a legged_eval score.**  The re-run under
+> the legged_eval protocol is `outputs/benchmark_legged_eval.md`.
+
 The comparison CLAUDE.md §2 asks for, run for the first time with the planner actually
 choosing. All 200 cells, one 20 s episode each, upstream's own goal rule (within 0.20 m
 held for 0.10 s, eight goals in order), equal weight over cells. CPU, no GPU.
