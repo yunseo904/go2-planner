@@ -226,7 +226,64 @@ Falsifiable as specified: excursion must fall monotonically with gain on a flat-
 rig, and stride and forward speed must not move (the yaw couple's claim to be free was
 v_x 0.664 → 0.661 and stride unchanged).
 
-## 11. What to do next, in order
+## 11. Session 4 (2026-09-02) — depth is the arm, the oracle is 0.81, level 2 is built
+
+**One document for the review: `outputs/REPORT_2026-09-02.md`.**
+
+### The rule that changed
+`--skill PLANNER` now defaults to `--perception depth`, and that is the arm's number.
+`--perception optimistic` is the perception UPPER BOUND and has to be asked for by name;
+the single-skill arms carry `perception=n/a` because they read no terrain.  CLAUDE.md §2
+has it as a rule.  Leaving optimistic as the default after a depth path existed would have
+gone on publishing the control as the result.
+
+### The table
+| arm | score / 8 |
+|---|---|
+| E2E teacher | 4.83 |
+| **ORACLE — best single skill per cell** | **0.81** |
+| WALK fixed + roll couple (3-seed mean) | 0.82 |
+| WALK fixed | 0.76 |
+| **Rule-Planner, depth + roll couple** | **0.69** |
+| Rule-Planner, depth | 0.60 |
+| *Rule-Planner, optimistic (control)* | *0.57* |
+| TROT / TURN fixed | 0.29 / 0.17 |
+
+### The two courses at 0.00 — `outputs/zero_courses.md`
+The teacher scores **4.49 and 4.87** there, so it is not the terrain.  They are the only
+two courses that do not put goal 0 at 0.50 m: `staircase_walking_full_width` puts it at
+1.00 m **on top of the first riser** (0.06 m at difficulty 0, already above WALK's limit),
+and `staircase_spiral` puts it **2.6 m ahead and 0.30 m right, over perfectly flat ground**.
+Not a structural limit — the same limits everything else has, against a differently placed
+goal.  What it shows is how much the 0.50 m placement is doing for the other eighteen.
+
+### Level 2, built and measured — `outputs/level2_results.md`
+Roll only: **200 of 200 terminations are roll, none is pitch**, in 400 episodes.  The pitch
+term was dropped before it was written.  `sim/attitude.py` is the exact dual of the yaw
+couple on the same hip joint.
+
+WALK three seeds paired: 0.76→0.83, 0.77→0.82, 0.69→0.81.  **The arm on depth: 0.60→0.69.**
+Sign settled by measurement (+1 → 0.83, −1 → 0.66, i.e. worse than off).  Forward speed
+−6/−5/−1 %, inside the ±10 % criterion; at gain 16/cap 4 it scores 0.85 and costs −19 %,
+so **the recommended point is deliberately not the highest-scoring one.**  WALK-only by
+table: TROT gains but loses 32 % of its speed, TURN is worse.
+
+Design predicted ≈0.98, delivered 0.82.  The estimate assumed the term recovers the 44
+cells that stop surviving when roughness is added; it recovers 6–18.
+
+### The threshold correction
+`STEP_TROT_MAX` 0.08 (config, `CALIBRATION_NEEDED`) vs 0.02–0.04 (measured): overridden by
+run argument only, worth **0.57 → 0.59**, TROT usage 14 cells → 5.  0.02 and 0.03 score the
+same, so the choice inside the bracket does not matter.
+
+### Two harness bugs found this session
+* The depth camera read `PLANNER_ARM` before it was assigned — Kit exits 0 with no
+  traceback (harness_findings §17), **again**.  Resolution order in `run_isaac` is fixed.
+* The roll-couple end-of-run report read `rolls` (built whenever `--foot-comp` is on,
+  including the planner arm where it is never stepped) instead of `pl_roll`, and printed
+  "0 stance-leg-steps driven" for a term that was working.  Scores never affected.
+
+## 12. What to do next, in order
 
 1. **The skill library is the whole question now, and the oracle proves it.**  0.81 is what
    a perfect chooser gets; 4.83 is the teacher.  Nothing in the planner closes that.  What
