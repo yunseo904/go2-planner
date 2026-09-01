@@ -467,7 +467,7 @@ def deviation_report(foot_u: np.ndarray, q_meas: np.ndarray, q_orig: np.ndarray,
 
 
 def swing_lift_offsets(robot, sim, idx_t, clip, target_m, phys_dt, eps=0.02, sign=None,
-                       symmetric=True):
+                       symmetric=True, air_z=1.5):
     """Per-frame thigh/calf offsets that raise each swing foot to ``target_m`` at its apex.
 
     The real robot's ``classic_walk`` lifts its rear feet about 5 mm and its front ones
@@ -518,7 +518,15 @@ def swing_lift_offsets(robot, sim, idx_t, clip, target_m, phys_dt, eps=0.02, sig
     contact = np.asarray(clip["contact"], dtype=bool)
     n = len(q_ach)
     air = robot.data.default_root_state.clone()
-    air[:, 2] = 1.5
+    # FREE-FLOATING, and it has to actually be free.  CLAUDE.md 6.5: the way to measure a
+    # clip's own geometry is to hold the robot in the air and pass q through it, so neither
+    # contact nor ground can intervene.  1.5 m does that on the flat rig and does NOT on the
+    # benchmark grid, where staircase_climbing reaches 3.96 m -- there the robot is measured
+    # INSIDE the terrain, PhysX floods "Reached maximum number of allocated blocks" (271 MB
+    # of it in one run), and the apex being read is a collision response.  Callers with
+    # terrain pass a height above it; the default is unchanged so the flat harness is
+    # bit-identical.
+    air[:, 2] = float(air_z)
 
     def feet_at(qv):
         qj = robot.data.default_joint_pos.clone()

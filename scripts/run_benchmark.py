@@ -792,6 +792,48 @@ def run_isaac(args) -> tuple:
         nlev = int(z["height_fields_before_fix"].shape[1])
         pl_tmaps = [allmaps[t * nlev + l] for (t, l) in cells]
 
+    # ---- swing lift ------------------------------------------------------------------
+    # The hypothesis this exists to test: the earlier ladder found the untouched recording
+    # was the best row at 0/40/60/80 mm, but that was OPEN LOOP -- raising the swing arc
+    # cost balance faster than it bought clearance.  With the roll couple holding the roll,
+    # the trade may land somewhere else.  So the flag is here to be run PAIRED with
+    # --roll-couple, not on its own.
+    #
+    # The edit is verify_skill_replay.swing_lift_offsets, unchanged: A*sin^2(pi*phase) over
+    # each swing bout, zero value AND zero slope at liftoff and touchdown (so stride length
+    # and forward speed, which live at the endpoints, are untouched), per leg per bout,
+    # target minus the apex that leg already has.  Thigh and calf only -- the hip belongs to
+    # foot placement and the two must not compete for it.  The archive is not written.
+    lift_offsets = {}
+    if args.swing_lift > 0:
+        from verify_skill_replay import swing_lift_offsets
+        # Computed from the ROTATED clips, which is what actually plays; offsets from the
+        # unrotated ones would be a phase error, silent and plausible.
+        _names = list(pl_clips) if PLANNER_ARM else [clip["name"]]
+        _srcs = pl_clips if PLANNER_ARM else {clip["name"]: clip}
+        for _nm in _names:
+            # Above the tallest cell in the grid, so the measurement is of the clip and
+            # not of a collision.  z is patch-local here because every cell's datum is 0.
+            _air = float(z["height_fields_before_fix"].max()) * float(z["vertical_scale"]) + 2.0
+            _off, _rep, _ = swing_lift_offsets(robot, sim, idx_t, _srcs[_nm],
+                                               args.swing_lift / 1000.0, phys_dt,
+                                               symmetric=not args.swing_lift_asym,
+                                               air_z=_air)
+            lift_offsets[_nm] = _off
+            print(f"[bench] swing lift {args.swing_lift:g} mm on {_nm}: "
+                  + ("PER-LEG " if args.swing_lift_asym else "SYMMETRIC ")
+                  + ", ".join(f"{l} +{r['added_mm']}"
+                              for l, r in _rep.items() if not l.startswith("_")))
+        print(f"[bench] swing lift measured with the robot held at z = {_air:.2f} m, "
+              f"clear of the grid's tallest cell")
+        print("[bench] *** SWING LIFT ON: the recording's swing arcs are raised. Stance and "
+              "the hip are untouched; the archive on disk is unchanged. Report PAIRED with "
+              "--swing-lift 0. ***")
+
+        if not PLANNER_ARM:
+            q_seq = (q_seq + lift_offsets[clip["name"]]).astype(np.float32)
+
+
     # Isaac Lab's AppLauncher installs an excepthook that SWALLOWS a Python traceback:
     # a NameError in the results-row builder above exited the process with status 0, no
     # message, and no CSV, and cost several runs to localise by bisection.  Anything that
@@ -833,6 +875,12 @@ def run_isaac(args) -> tuple:
             for _ in range(decim):
                 robot.write_data_to_sim(); sim.step(); robot.update(phys_dt)
 
+    if args.turn_target == "goal" and PLANNER_ARM:
+        print("[bench] *** TURN TARGET = GOAL. The planner's heading question is now the "
+              "bearing to the live waypoint, not the drift from the start heading, which "
+              "is what RulePlanner._wants_turn documents. Heading hold is re-baselined "
+              "when a TURN ends so the low level does not undo it. Report PAIRED with "
+              "--turn-target settle. ***")
     if args.roll_couple != "off":
         print(f"[bench] *** LEVEL 2 -- ROLL COUPLE ON. Uniform feed-forward hip torque on "
               f"the stance legs: gain {args.roll_gain:g} N.m/rad, damp {args.roll_damp:g} "
@@ -952,6 +1000,14 @@ def run_isaac(args) -> tuple:
           # speed read off travelled_m without it is a distance divided by 20 s whether the
           # robot lived 20 s or 2.
           upright = np.zeros(n, dtype=int)
+          # Cumulative yaw, unwrapped, while upright: the direct test of whether the sim
+          # reproduces a clip's LOGGED yaw rate.  TURN's log says -22.66 deg/s and nothing
+          # in this harness has ever read the rate back.
+          yaw_cum = np.zeros(n); yaw_prev = None
+          # Peak base height while upright: the direct test of whether a term that pushes
+          # on the stance legs can put the body in the air (the RUN question).  A gait with
+          # a flight phase raises the base above its standing height; one without does not.
+          base_h_max = np.zeros(n)
           robot.write_root_state_to_sim(root0)
           robot.write_joint_state_to_sim(q_stand, torch.zeros_like(q_stand))
           hold(q_stand, n_settle)
@@ -1050,7 +1106,10 @@ def run_isaac(args) -> tuple:
               pl = [RulePlanner(cfg=pcfg, initial=_SID.WALK) for _ in range(n)]
               pl_sk = [_SID.WALK] * n
               pl_ph = np.zeros(n, dtype=int)
-              pl_q = {nm: np.asarray(c["q_des"], np.float32) for nm, c in pl_clips.items()}
+              pl_q = {nm: (np.asarray(c["q_des"], np.float32)
+                           + (lift_offsets[nm] if nm in lift_offsets else 0.0)
+                           ).astype(np.float32)
+                      for nm, c in pl_clips.items()}
               pl_sw = {nm: ~np.asarray(c["contact"], bool) for nm, c in pl_clips.items()}
               pl_foot, pl_yaw, pl_roll = [], [], []
               pl_switches = np.zeros(n, dtype=int)
@@ -1137,8 +1196,35 @@ def run_isaac(args) -> tuple:
                   wb = snap(robot.data.root_ang_vel_b)
                   roll_now, _p_now, yaw_now = quat_to_rpy_deg(snap(robot.data.root_quat_w))
                   roll_now = np.asarray(roll_now, float)
-                  psi = np.radians((np.asarray(yaw_now, float) - yaw_ref + 180.0)
-                                   % 360.0 - 180.0)
+                  yaw_now = np.asarray(yaw_now, float)
+                  # psi: deviation from the heading this robot SETTLED at.  This is the
+                  # low level's quantity and it stays that way -- heading hold is a
+                  # stabiliser and CLAUDE.md 2 keeps terrain and goal information out of it.
+                  psi = np.radians((yaw_now - yaw_ref + 180.0) % 360.0 - 180.0)
+
+                  # WHAT THE PLANNER IS ASKED.  RulePlanner._wants_turn documents its
+                  # argument as "goal bearing minus heading", and this harness was handing
+                  # it psi -- the deviation from the START heading.  Those are different
+                  # questions and the difference is not cosmetic:
+                  #
+                  #   * a goal that is not on the spawn axis is never turned towards.
+                  #     staircase_spiral puts goal 0 at 2.6 m ahead and 0.30 m RIGHT, and
+                  #     the three cells that get far enough in x all miss to the LEFT.
+                  #   * every TURN it did spend was undoing drift that heading hold is
+                  #     already correcting at ~0 cost, which is why all 37 cells the
+                  #     planner loses to WALK are TURN cells.
+                  #
+                  # This is goal POSITION, not terrain, so it belongs to the planner layer;
+                  # legged_eval's protocol hands every policy the same waypoint bearing
+                  # through the command channel, so it is not privileged either.
+                  if args.turn_target == "goal":
+                      gi = np.minimum(tracker.idx, NUM_GOALS - 1)
+                      gxy = goals[np.arange(n), gi]              # world xy of the live goal
+                      brg = np.degrees(np.arctan2(gxy[:, 1] - pos_w[:, 1],
+                                                  gxy[:, 0] - pos_w[:, 0]))
+                      head_err = (brg - yaw_now + 180.0) % 360.0 - 180.0
+                  else:
+                      head_err = np.degrees(psi)
                   # ---- planner tick -------------------------------------------------
                   if step % tick_every == 0:
                       if depth is not None:
@@ -1165,7 +1251,7 @@ def run_isaac(args) -> tuple:
                           except Exception:
                               continue
                           dec = pl[k].step(obs, tick_every * dt, x_m=xk,
-                                           heading_err_deg=float(np.degrees(psi[k])),
+                                           heading_err_deg=float(head_err[k]),
                                            speed_m_s=spd)
                           want = dec.active
                           if want is pl_sk[k]:
@@ -1186,6 +1272,16 @@ def run_isaac(args) -> tuple:
                           cand = np.flatnonzero(agree == agree.max())
                           d_ = np.abs(pl_q[nm][cand] - cur[None, :]).max(axis=1)
                           pl_ph[k] = int(cand[int(np.argmin(d_))])
+                          # Leaving a deliberate TURN: the heading the robot now has IS
+                          # the heading it meant to have, so that becomes what heading hold
+                          # holds.  Without this the low level spends the next seconds
+                          # undoing the turn the planner just paid for -- the two terms
+                          # would be fighting, and the planner would lose because heading
+                          # hold runs every control step and TURN runs once.
+                          if args.turn_target == "goal" and pl_sk[k] is _SID.TURN \
+                                  and want is not _SID.TURN:
+                              yaw_ref[k] = yaw_now[k]
+                              pl_foot[k][want.value].reset()
                           pl_sk[k] = want
                           pl_switches[k] += 1
                           pl_foot[k][nm].reset()
@@ -1259,8 +1355,9 @@ def run_isaac(args) -> tuple:
 
               pos = snap(robot.data.root_pos_w)
               idx = tracker.update(pos[:, :2])
-              roll, pitch, _ = quat_to_rpy_deg(snap(robot.data.root_quat_w))
+              roll, pitch, yaw_t = quat_to_rpy_deg(snap(robot.data.root_quat_w))
               roll = np.asarray(roll, float); pitch = np.asarray(pitch, float)
+              yaw_t = np.asarray(yaw_t, float)
               # WHICH AXIS, and how far it got before the cutoff.  The termination test is
               # an OR of three conditions and the row used to record only that one of them
               # fired, which is not enough to aim a controller: "it fell" does not say
@@ -1268,6 +1365,12 @@ def run_isaac(args) -> tuple:
               # while the robot is alive only -- a fallen robot keeps rolling.
               live = alive
               upright[live] += 1
+              if yaw_prev is None:
+                  yaw_prev = yaw_t.copy()
+              _d = (yaw_t - yaw_prev + 180.0) % 360.0 - 180.0
+              yaw_cum[live] += _d[live]
+              yaw_prev = yaw_t
+              base_h_max[live] = np.maximum(base_h_max[live], pos[live, 2])
               peak_roll[live] = np.maximum(peak_roll[live], np.abs(roll[live]))
               peak_pitch[live] = np.maximum(peak_pitch[live], np.abs(pitch[live]))
               over_r = np.abs(np.radians(roll)) > ROLL_PITCH_CUTOFF_RAD
@@ -1316,6 +1419,9 @@ def run_isaac(args) -> tuple:
                                "alive_at_end": int(alive[k]),
                                "end_cause": end_cause[k],
                                "upright_s": float(upright[k] * dt),
+                               "yaw_cum_deg": float(yaw_cum[k]),
+                               "yaw_rate_deg_s": float(yaw_cum[k] / max(upright[k] * dt, 1e-9)),
+                               "base_h_max_m": float(base_h_max[k]),
                                # Forward speed along the CELL's x, over the time the robot
                                # was actually up.  The gait is an open-loop clip replayed at
                                # a fixed rate, so STRIDE cannot move -- the phase advance is
@@ -1344,6 +1450,8 @@ def run_isaac(args) -> tuple:
                                # after the run has scrolled off.
                                "terrain": terr, "planner_set": planner_stamp,
                                "perception": args.perception,
+                               "turn_target": args.turn_target,
+                               "swing_lift_mm": args.swing_lift,
                                "roll_couple": args.roll_couple,
                                "roll_gain": args.roll_gain if args.roll_couple != "off" else "",
                                "roll_damp": args.roll_damp if args.roll_couple != "off" else "",
@@ -1469,6 +1577,20 @@ def main() -> int:
                          "0.495 m, so the first recording was 20 s of a grey wall. 0.95 m "
                          "puts the crossing at 0.82 m -- clear by 0.33 -- for a 16 deg "
                          "look-down, which still reads as a side view.")
+    ap.add_argument("--swing-lift", type=float, default=0.0, metavar="MM",
+                    help="raise every swing foot's apex to this height, mm. The earlier "
+                         "ladder (0/40/60/80) found the untouched recording best, but that "
+                         "was open loop -- run this PAIRED with --roll-couple.")
+    ap.add_argument("--swing-lift-asym", action="store_true",
+                    help="per-leg rather than mirrored pairs")
+    ap.add_argument("--turn-target", choices=("settle", "goal"), default="settle",
+                    help="what the planner's TURN rule is asked. settle (default, and what "
+                         "every earlier run used): deviation from the heading the robot "
+                         "settled at. goal: bearing to the live waypoint minus heading, "
+                         "which is what RulePlanner._wants_turn documents as its argument. "
+                         "goal also re-baselines heading hold when a TURN ends, so the low "
+                         "level holds the heading the planner just chose instead of "
+                         "undoing it.")
     ap.add_argument("--roll-couple", choices=("off", "hold"), default="off",
                     help="LEVEL 2. The stance-leg roll couple (sim/attitude.py): uniform "
                          "feed-forward hip torque on the legs the recording has down, "
