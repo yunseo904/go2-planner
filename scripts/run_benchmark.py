@@ -68,6 +68,16 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 from sim import heightfield as HF
 from terrain_toolkit.paths import FROZEN_NPZ, SKILL_CLIPS_META_JSON
+# Imported HERE, at module scope, and not lazily inside run_isaac().  Importing
+# planner.features into an already-running Kit process exits the process with status 0,
+# no traceback and no output -- see harness_findings.md.  run_planner_replay.py imports
+# them at module top and has never had the problem.
+from planner.config import DEFAULT as PLANNER_CFG   # NOT _CFG: run_isaac
+                                                    # binds that name locally
+from planner.features import maps_from_archive, extract, lookahead_distance
+from planner.rules import RulePlanner
+from planner.skills import SkillId as _SID
+from sim.yawmoment import YawMoment
 
 _SIM_APP = None
 
@@ -305,6 +315,26 @@ def run_isaac(args) -> tuple:
     global _SIM_APP
     _SIM_APP = AppLauncher(args).app
 
+    # Isaac Lab's AppLauncher leaves the process in a state where an uncaught Python
+    # exception exits with status 0, no message and no traceback.  A NameError in the
+    # results-row builder cost several runs to localise by bisection, and the log looked
+    # exactly like a clean early exit.  Reinstall a hook that says what happened.
+    def _excepthook(et, ev, tb):
+        import traceback
+        sys.stderr.write("\n[bench] UNCAUGHT EXCEPTION "
+                         "(Isaac's default hook would print nothing):\n")
+        traceback.print_exception(et, ev, tb, file=sys.stderr)
+        sys.stderr.flush(); sys.stdout.flush()
+    sys.excepthook = _excepthook
+    # sys.excepthook is NOT called for SystemExit, and every "refusing to run" guard in
+    # this file raises one.  Under Kit those messages are lost, so a deliberate refusal
+    # and a hard crash look identical from the log.  Print it ourselves.
+    def _bye(msg="", code=None):
+        if msg:
+            sys.stderr.write(f"\n{msg}\n"); sys.stderr.flush()
+        raise SystemExit(code if code is not None else 1)
+    globals()["_bye"] = _bye
+
     import torch
     import isaaclab.sim as sim_utils
     from isaaclab.assets import Articulation
@@ -389,14 +419,38 @@ def run_isaac(args) -> tuple:
     if ucfg.ground_friction is not None:
         set_robot_friction(robot, ucfg.ground_friction)
 
-    clip = load_clip(args.skill, args.rate)
+    # ---------------------------------------------------------------- planner arm
+    # --skill PLANNER is the Rule-Planner experimental group: every robot carries its own
+    # RulePlanner, its own clip, its own phase and its own corrections, and the planner
+    # picks the skill.  It is a SEPARATE PATH from the single-skill one below rather than
+    # a generalisation of it, so a single-skill baseline run stays byte-for-byte the run
+    # it always was -- the baselines are what the planner is scored against and they must
+    # not move underneath it.
+    #
+    # What the planner is allowed to see: the frozen archive's own height field, through
+    # planner.features.extract, which applies the SENSOR MODEL (near/far clip, blur by
+    # ground resolution, confidence).  That is terrain information, and CLAUDE.md 2 puts
+    # terrain at the planner and forbids it at the low level -- which is where it stays:
+    # the clip replay, the foot placement and the yaw couple below see base velocity,
+    # heading error and the clip's own contact channel, and nothing else.
+    #
+    # It is still an OPTIMISTIC perception arm and has to be reported as one: the geometry
+    # is ground truth put through a sensor model, not a rendered depth image.
+    PLANNER_ARM = args.skill.upper() == "PLANNER"
+    clip = load_clip("WALK" if PLANNER_ARM else args.skill, args.rate)
     # --heading, resolved once.  The cap is the skill's own, from the open-loop steering
     # probe (outputs/heading_candidates.md 2): WALK took +-0.04 rad with no measurable
     # cost, TROT falls in BOTH directions at +-0.04 and is safe at +-0.02.  TURN is not
     # trying to hold a heading -- it is trying to change one -- so it is 0, and asking
     # for it there is refused rather than silently ignored.
     yaw_mode, hcap, vy_log, wz_log = "off", 0.0, 0.0, 0.0
-    if args.heading != "off":
+    # The PLANNER arm resolves the cap PER CLIP further down (each skill carries its own
+    # measured cap and TURN carries none), so this single-skill guard does not apply to
+    # it.  Applying it anyway is what the first version did: HEADING_CAP.get("PLANNER")
+    # is 0.0, the guard fired, and because SystemExit does not go through sys.excepthook
+    # the process exited with status 0, no message and no CSV -- indistinguishable from a
+    # crash, and it cost most of an hour to localise.
+    if args.heading != "off" and not PLANNER_ARM:
         hcap = (args.heading_cap if args.heading_cap is not None
                 else HEADING_CAP.get(args.skill, 0.0))
         if hcap <= 0.0:
@@ -411,8 +465,29 @@ def run_isaac(args) -> tuple:
             json.loads(SKILL_CLIPS_META_JSON.read_text()), clip["name"])
     idx_by_name = {nm: i for i, nm in enumerate(robot.joint_names)}
     want = [f"{l}_{j}_joint" for l in clip["leg_order"] for j in clip["joint_order"]]
-    idx_t = torch.as_tensor([idx_by_name[w] for w in want], device=sim.device,
-                            dtype=torch.long)
+    jidx = [idx_by_name[w] for w in want]
+    idx_t = torch.as_tensor(jidx, device=sim.device, dtype=torch.long)
+
+    # The hip's effort limit, READ FROM THE ACTUATOR -- not from robot.data, which reports
+    # PhysX's 1e9.  The actuator is an explicit IdealPDActuator, so the clip that binds is
+    # applied in Python against actuator.effort_limit (harness_findings.md, and
+    # isaac_actuator_probe.json measured 23.70 N.m on this config).
+    hip_effort_limit_nm = float("nan")
+    _wh = robot.joint_names[jidx[0]]
+    for _act in robot.actuators.values():
+        _nm = list(getattr(_act, "joint_names", []) or [])
+        _e = getattr(_act, "effort_limit", None)
+        if _e is None or _wh not in _nm:
+            continue
+        _a = np.asarray(snap(_e)).reshape(-1)
+        _v = float(_a[_nm.index(_wh)] if _a.size == len(_nm) else _a.flat[0])
+        if np.isfinite(_v) and 0.0 < _v < 1e4:
+            hip_effort_limit_nm = _v
+            break
+    if args.yaw_moment != "off" and not np.isfinite(hip_effort_limit_nm):
+        raise SystemExit("[bench] REFUSING --yaw-moment: could not read the hip's effort "
+                         "limit off the articulation, so the headroom this term needs "
+                         "cannot be checked.")
     # Entry phase, by the same rules the replay harness offers, so a benchmark row and a
     # flat row are the same configuration.
     if args.start_phase == "measured":
@@ -436,6 +511,52 @@ def run_isaac(args) -> tuple:
     swing_seq = ~np.asarray(clip["contact"], dtype=bool)
     ncyc = len(q_seq)
 
+    # Clip library and per-cell terrain maps for the planner arm.  Entry frames: WALK and
+    # TROT take the rule (level_start), which for TROT happens to pick frame 16 -- one of
+    # the four phases the flat sweep found TROT survives at (trot_yaw_moment.md 5), so no
+    # override is needed and none is applied.  TURN takes its MEASURED frame 6, because
+    # the rule picks 24 and turn_entry_phase.md measured that phase as never turning.
+    pl_clips, pl_tmaps, pl_meta = {}, None, None
+    if PLANNER_ARM:
+        pl_meta = json.loads(SKILL_CLIPS_META_JSON.read_text())
+        # Entry frames, WITHOUT level_start.  That rule re-poses the articulation and
+        # steps the sim to measure coplanarity, which is fine on the single-robot replay
+        # rig and kills this one (200 robots already placed on their own cells); it also
+        # is not the rule the single-skill baselines use, and the arms have to match.
+        #
+        #   WALK, TROT  --start-phase, exactly as the baselines resolve it. Frame 0 (the
+        #               default) is one of the four phases TROT survives at on flat
+        #               (trot_yaw_moment.md 5), so no override is needed.
+        #   TURN        its MEASURED frame 6: the coplanarity rule picks 24 and
+        #               turn_entry_phase.md measured that phase as never turning.
+        for nm in ("WALK", "TROT", "TURN"):
+            c = load_clip(nm, args.rate)
+            kf_, note_ = 0, f"--start-phase {args.start_phase}"
+            m_ = int(getattr(PLANNER_CFG.skill, f"ENTRY_FRAME_{nm}", -1))
+            if nm == "TURN" and m_ >= 0:
+                kf_, note_ = m_ % len(c["q_des"]), "MEASURED, turn_entry_phase.md"
+            elif args.start_phase == "measured" and m_ >= 0:
+                kf_, note_ = m_ % len(c["q_des"]), "MEASURED"
+            elif args.start_phase == "stance":
+                kf_, _u = quiescent_start(c)
+                note_ = "quiescent"
+            pl_clips[nm] = rotate_clip(c, kf_)
+            print(f"[bench]   {nm:5s} entry frame {kf_} ({note_}), "
+                  f"{len(c['q_des'])} frames/cycle")
+        allmaps = maps_from_archive(z)
+        nlev = int(z["height_fields_before_fix"].shape[1])
+        pl_tmaps = [allmaps[t * nlev + l] for (t, l) in cells]
+
+    # Isaac Lab's AppLauncher installs an excepthook that SWALLOWS a Python traceback:
+    # a NameError in the results-row builder above exited the process with status 0, no
+    # message, and no CSV, and cost several runs to localise by bisection.  Anything that
+    # raises inside the episode loop from here on is caught, printed, and re-raised.
+    def _loud(exc: BaseException) -> None:
+        import traceback
+        print("\n[bench] EXCEPTION (Isaac's excepthook would otherwise eat this):",
+              flush=True)
+        traceback.print_exception(type(exc), exc, exc.__traceback__)
+        sys.stdout.flush(); sys.stderr.flush()
     ground_z = np.array([HF.height_at(z["height_fields_before_fix"][t, l],
                                       float(z["horizontal_scale"]),
                                       float(z["vertical_scale"]),
@@ -461,140 +582,296 @@ def run_isaac(args) -> tuple:
     tracker = GoalTracker(goals, dt)
     rows_out = []
     t0 = time.time()
-    for ep in range(args.episodes):
-        robot.write_root_state_to_sim(root0)
-        robot.write_joint_state_to_sim(q_stand, torch.zeros_like(q_stand))
-        hold(q_stand, n_settle)
-        for j in range(1, n_settle + 1):
-            hold(q_stand * (1 - j / n_settle) + q_first * (j / n_settle), 1)
-        tracker.reset()
+    try:
+      for ep in range(args.episodes):
+          robot.write_root_state_to_sim(root0)
+          robot.write_joint_state_to_sim(q_stand, torch.zeros_like(q_stand))
+          hold(q_stand, n_settle)
+          for j in range(1, n_settle + 1):
+              hold(q_stand * (1 - j / n_settle) + q_first * (j / n_settle), 1)
+          tracker.reset()
 
-        bp = snap(robot.data.body_pos_w)
-        foot_ids, foot_names = foot_body_ids(robot)
-        hip_ids, hip_names = robot.find_bodies(".*_hip")
-        f_by = {nm.split("_")[0]: j for j, nm in zip(foot_ids, foot_names)}
-        h_by = {nm.split("_")[0]: j for j, nm in zip(hip_ids, hip_names)}
-        legs = clip["leg_order"]
-        lever = np.array([[bp[k, h_by[l], 2] - bp[k, f_by[l], 2] for l in legs]
-                          for k in range(n)])
-        settle_ok = np.all(lever > 0.05, axis=1)
-        # THE SECOND GUARD.  The hip-to-foot lever stays perfectly valid while a robot is
-        # in free fall -- the legs keep their geometry -- so `settle_ok` alone cannot tell
-        # a robot standing on the terrain from one that went through it.  The 200-cell
-        # mesh did exactly that: 11.34 M triangles cooked without error, collided with
-        # nothing, and every cell scored 0 on the first control step.  Base height above
-        # the cell's own ground is the quantity that separates the two.
-        base_h = snap(robot.data.root_pos_w)[:, 2] - ground_z
-        through = base_h < 0.15
-        if through.any():
-            bad = np.where(through)[0]
-            raise SystemExit(
-                f"[bench] refusing to score: {len(bad)} of {n} robots are below 0.15 m over "
-                f"their own cell's ground after the settle (lowest {base_h.min():+.3f} m, "
-                f"e.g. cell {cells[bad[0]]}). They are inside or under the terrain, not on "
-                f"it, and every one of them would score 0 for a reason that is not the "
-                f"skill's. Check the collider: one mesh per task is what makes 200 cells "
-                f"collide (see build_grid).")
-        med = np.median(lever[settle_ok], axis=0) if settle_ok.any() else np.full(4, 0.31)
-        # The heading each robot is asked to hold: the one IT settled at, per cell.  Not
-        # a shared constant and not the cell's axis -- a robot that settles pointing 3 deg
-        # off would otherwise be handed a 3 deg error at t=0 and asked to correct terrain
-        # it cannot see.  The reference is proprioceptive and per robot, the same rule
-        # run_calibration_grid.py already uses.
-        _, _, yaw0 = quat_to_rpy_deg(snap(robot.data.root_quat_w))
-        yaw_ref = np.asarray(yaw0, dtype=float)
-        foots = None
-        if args.foot_comp != "off":
-            from sim.replay import quat_rotate_inv
-            bq = snap(robot.data.root_quat_w)
-            bpos = snap(robot.data.root_pos_w)
-            foots = []
-            for k in range(n):
-                hxy = np.array([quat_rotate_inv(bq[k][None, :],
-                                                (bp[k, h_by[l]] - bpos[k])[None, :])[0, :2]
-                                for l in legs])
-                foots.append(FootPlacement(
-                    t_stance_s=stance_time_s(clip["contact"], clip["fs"]),
-                    lever_m=lever[k] if settle_ok[k] else med,
-                    hip_x_m=hxy[:, 0], hip_y_m=hxy[:, 1],
-                    cap_rad=args.foot_clip_rad, cycle_len=ncyc,
-                    yaw_mode=yaw_mode, heading_cap_rad=hcap,
-                    vy_log=vy_log, wz_log=wz_log))
-            print(f"[bench] *** FOOT PLACEMENT ON (cap {args.foot_clip_rad:g} rad): closes a "
-                  f"loop on base lateral velocity and overwrites the recording. ***")
-            if yaw_mode != "off":
-                print(f"[bench] *** HEADING HOLD --heading {args.heading} on "
-                      f"{args.skill}, cap {hcap:g} rad: each robot holds the heading it "
-                      f"settled at. omega_target = omega_log - psi_err/T_stance; T_stance "
-                      f"cancels, so the term carries no constant. The 0.98/1.11 scores in "
-                      f"outputs/benchmark_harness.md were measured WITHOUT this and are "
-                      f"not comparable to a run with it. ***")
+          bp = snap(robot.data.body_pos_w)
+          foot_ids, foot_names = foot_body_ids(robot)
+          hip_ids, hip_names = robot.find_bodies(".*_hip")
+          f_by = {nm.split("_")[0]: j for j, nm in zip(foot_ids, foot_names)}
+          h_by = {nm.split("_")[0]: j for j, nm in zip(hip_ids, hip_names)}
+          legs = clip["leg_order"]
+          lever = np.array([[bp[k, h_by[l], 2] - bp[k, f_by[l], 2] for l in legs]
+                            for k in range(n)])
+          settle_ok = np.all(lever > 0.05, axis=1)
+          # THE SECOND GUARD.  The hip-to-foot lever stays perfectly valid while a robot is
+          # in free fall -- the legs keep their geometry -- so `settle_ok` alone cannot tell
+          # a robot standing on the terrain from one that went through it.  The 200-cell
+          # mesh did exactly that: 11.34 M triangles cooked without error, collided with
+          # nothing, and every cell scored 0 on the first control step.  Base height above
+          # the cell's own ground is the quantity that separates the two.
+          base_h = snap(robot.data.root_pos_w)[:, 2] - ground_z
+          through = base_h < 0.15
+          if through.any():
+              bad = np.where(through)[0]
+              raise SystemExit(
+                  f"[bench] refusing to score: {len(bad)} of {n} robots are below 0.15 m over "
+                  f"their own cell's ground after the settle (lowest {base_h.min():+.3f} m, "
+                  f"e.g. cell {cells[bad[0]]}). They are inside or under the terrain, not on "
+                  f"it, and every one of them would score 0 for a reason that is not the "
+                  f"skill's. Check the collider: one mesh per task is what makes 200 cells "
+                  f"collide (see build_grid).")
+          med = np.median(lever[settle_ok], axis=0) if settle_ok.any() else np.full(4, 0.31)
+          # The heading each robot is asked to hold: the one IT settled at, per cell.  Not
+          # a shared constant and not the cell's axis -- a robot that settles pointing 3 deg
+          # off would otherwise be handed a 3 deg error at t=0 and asked to correct terrain
+          # it cannot see.  The reference is proprioceptive and per robot, the same rule
+          # run_calibration_grid.py already uses.
+          _, _, yaw0 = quat_to_rpy_deg(snap(robot.data.root_quat_w))
+          yaw_ref = np.asarray(yaw0, dtype=float)
+          foots = None
+          if args.foot_comp != "off":
+              from sim.replay import quat_rotate_inv
+              bq = snap(robot.data.root_quat_w)
+              bpos = snap(robot.data.root_pos_w)
+              foots = []
+              for k in range(n):
+                  hxy = np.array([quat_rotate_inv(bq[k][None, :],
+                                                  (bp[k, h_by[l]] - bpos[k])[None, :])[0, :2]
+                                  for l in legs])
+                  foots.append(FootPlacement(
+                      t_stance_s=stance_time_s(clip["contact"], clip["fs"]),
+                      lever_m=lever[k] if settle_ok[k] else med,
+                      hip_x_m=hxy[:, 0], hip_y_m=hxy[:, 1],
+                      cap_rad=args.foot_clip_rad, cycle_len=ncyc,
+                      yaw_mode=yaw_mode, heading_cap_rad=hcap,
+                      vy_log=vy_log, wz_log=wz_log))
+              print(f"[bench] *** FOOT PLACEMENT ON (cap {args.foot_clip_rad:g} rad): closes a "
+                    f"loop on base lateral velocity and overwrites the recording. ***")
+              if yaw_mode != "off":
+                  print(f"[bench] *** HEADING HOLD --heading {args.heading} on "
+                        f"{args.skill}, cap {hcap:g} rad: each robot holds the heading it "
+                        f"settled at. omega_target = omega_log - psi_err/T_stance; T_stance "
+                        f"cancels, so the term carries no constant. The 0.98/1.11 scores in "
+                        f"outputs/benchmark_harness.md were measured WITHOUT this and are "
+                        f"not comparable to a run with it. ***")
 
-        alive = np.ones(n, dtype=bool)
-        ended = np.zeros(n, dtype=int)          # goal index at the moment it ended
-        for step in range(ep_steps):
-            frame = step % ncyc
-            cmd = np.tile(q_seq[frame], (n, 1))
-            if foots is not None:
-                vb = snap(robot.data.root_lin_vel_b)
-                wb = snap(robot.data.root_ang_vel_b)
-                # Heading error per robot against ITS OWN settle heading, wrapped to
-                # (-180, 180].  Omitting this is not a small mistake: psi_err defaults to
-                # 0, which makes the heading term identically zero and --heading a flag
-                # that changes a CSV column and nothing else.  run_calibration_grid.py
-                # carries the same comment for the same reason.
-                if yaw_mode != "off":
-                    _, _, yaw_now = quat_to_rpy_deg(snap(robot.data.root_quat_w))
-                    psi = np.radians((np.asarray(yaw_now, float) - yaw_ref + 180.0)
-                                     % 360.0 - 180.0)
-                else:
-                    psi = np.zeros(n)
-                for k in range(n):
-                    if alive[k]:
-                        cmd[k] = cmd[k] + foots[k].step(float(vb[k, 1]), float(wb[k, 2]),
-                                                        swing_seq[frame], vx=float(vb[k, 0]),
-                                                        psi_err_rad=float(psi[k]))
-            tgt = robot.data.default_joint_pos.clone()
-            tgt[:, idx_t] = torch.as_tensor(cmd, device=sim.device, dtype=torch.float32)
-            robot.set_joint_position_target(tgt)
-            for _ in range(decim):
-                robot.write_data_to_sim(); sim.step(); robot.update(phys_dt)
+          alive = np.ones(n, dtype=bool)
+          ended = np.zeros(n, dtype=int)          # goal index at the moment it ended
 
-            pos = snap(robot.data.root_pos_w)
-            idx = tracker.update(pos[:, :2])
-            roll, pitch, _ = quat_to_rpy_deg(snap(robot.data.root_quat_w))
-            dead = ((np.abs(np.radians(roll)) > ROLL_PITCH_CUTOFF_RAD)
-                    | (np.abs(np.radians(pitch)) > ROLL_PITCH_CUTOFF_RAD)
-                    | (pos[:, 2] - ground_z < HEIGHT_CUTOFF_M)
-                    | (idx >= NUM_GOALS))
-            newly = alive & dead
-            ended[newly] = idx[newly]
-            alive &= ~newly
-            if not alive.any():
-                break
-        ended[alive] = tracker.idx[alive]        # the rest time out, upstream's way
-        for k, (t, l) in enumerate(cells):
-            rows_out.append({"task": t, "task_name": names[t], "level": l, "episode": ep,
-                             "goals": int(ended[k]), "settle_ok": int(settle_ok[k]),
-                             # Which arm this row is.  A results file whose rows do not
-                             # say whether heading hold was on is one that gets read wrong
-                             # once: `heading` and `heading-only` are not the same
-                             # controller, and neither is `off`.
-                             "heading": args.heading, "heading_cap_rad": hcap,
-                             "partial": int(n < full), "skill": args.skill,
-                             "start_phase": args.start_phase, "foot_comp": args.foot_comp,
-                             "steps": step + 1})
-        print(f"[bench] episode {ep+1}/{args.episodes}: goals reached "
-              f"min {ended.min()} median {np.median(ended):.1f} max {ended.max()}, "
-              f"{int((ended >= NUM_GOALS).sum())}/{n} cells completed the course "
-              f"({time.time()-t0:.0f}s)")
+          # ---- planner arm: one planner, one clip, one phase, one couple per robot ----
+          if PLANNER_ARM:
+              from sim.replay import quat_rotate_inv as _qri
+              bq_ = snap(robot.data.root_quat_w)
+              bpos_ = snap(robot.data.root_pos_w)
+              bp_ = snap(robot.data.body_pos_w)
+              pl = [RulePlanner(cfg=PLANNER_CFG, initial=_SID.WALK) for _ in range(n)]
+              pl_sk = [_SID.WALK] * n
+              pl_ph = np.zeros(n, dtype=int)
+              pl_q = {nm: np.asarray(c["q_des"], np.float32) for nm, c in pl_clips.items()}
+              pl_sw = {nm: ~np.asarray(c["contact"], bool) for nm, c in pl_clips.items()}
+              pl_foot, pl_yaw = [], []
+              pl_switches = np.zeros(n, dtype=int)
+              pl_refused = np.zeros(n, dtype=int)
+              pl_held = {nm: np.zeros(n, dtype=int) for nm in pl_clips}
+              for k in range(n):
+                  hxy = np.array([_qri(bq_[k][None, :],
+                                       (bp_[k, h_by[l]] - bpos_[k])[None, :])[0, :2]
+                                  for l in legs])
+                  lev = lever[k] if settle_ok[k] else med
+                  fp, ym = {}, {}
+                  for nm in pl_clips:
+                      vyl, wzl = _log_motion_for(pl_meta, pl_clips[nm]["name"])
+                      ymode = "log-cycle" if nm == "TURN" else (
+                          args.heading if args.heading != "off" else "off")
+                      hc = 0.0 if nm == "TURN" else (
+                          HEADING_CAP.get(nm, 0.0) if args.heading != "off" else 0.0)
+                      fp[nm] = FootPlacement(
+                          t_stance_s=stance_time_s(pl_clips[nm]["contact"], pl_clips[nm]["fs"]),
+                          lever_m=lev, hip_x_m=hxy[:, 0], hip_y_m=hxy[:, 1],
+                          cap_rad=args.foot_clip_rad, cycle_len=len(pl_q[nm]),
+                          yaw_mode=ymode, heading_cap_rad=hc, vy_log=vyl, wz_log=wzl)
+                      ycap = (args.yaw_moment_cap_nm if nm == "TROT"
+                              and args.yaw_moment != "off" else 0.0)
+                      ym[nm] = (YawMoment(lever_m=lev, hip_x_m=hxy[:, 0], hip_y_m=hxy[:, 1],
+                                          gain_nm_per_rad=args.yaw_moment_gain,
+                                          bias_nm=args.yaw_moment_nm, cap_nm=ycap,
+                                          effort_limit_nm=hip_effort_limit_nm)
+                                if ycap > 0 else None)
+                  pl_foot.append(fp); pl_yaw.append(ym)
+              print(f"[bench] *** RULE-PLANNER ARM: {n} independent planners, "
+                    f"tick {PLANNER_CFG.feature.TICK_HZ:.0f} Hz. The planner reads the frozen "
+                    f"archive's height field THROUGH THE SENSOR MODEL "
+                    f"(planner.features.extract); the low level sees base velocity, heading "
+                    f"error and the clip's contact channel only. This is an OPTIMISTIC "
+                    f"perception arm: ground-truth geometry put through a sensor model, not "
+                    f"a rendered depth image. ***")
+
+          tick_every = (max(int(round((1.0 / PLANNER_CFG.feature.TICK_HZ) / dt)), 1)
+                      if PLANNER_ARM else 0)
+          for step in range(ep_steps):
+              frame = step % ncyc
+              cmd = np.tile(q_seq[frame], (n, 1))
+
+              if PLANNER_ARM:
+                  pos_w = snap(robot.data.root_pos_w)
+                  vb = snap(robot.data.root_lin_vel_b)
+                  wb = snap(robot.data.root_ang_vel_b)
+                  _, _, yaw_now = quat_to_rpy_deg(snap(robot.data.root_quat_w))
+                  psi = np.radians((np.asarray(yaw_now, float) - yaw_ref + 180.0)
+                                   % 360.0 - 180.0)
+                  # ---- planner tick -------------------------------------------------
+                  if step % tick_every == 0:
+                      for k in range(n):
+                          if not alive[k]:
+                              continue
+                          spd = float(abs(vb[k, 0]))
+                          la = lookahead_distance(spd, PLANNER_CFG)
+                          # x,y in the CELL's own frame: the archive's maps are per cell and
+                          # each robot sits at its own world offset.
+                          xk = float(pos_w[k, 0] - offs[k, 0])
+                          yk = float(pos_w[k, 1] - offs[k, 1])
+                          try:
+                              obs = extract(pl_tmaps[k], xk, yk, la, PLANNER_CFG)
+                          except Exception:
+                              continue
+                          dec = pl[k].step(obs, tick_every * dt, x_m=xk,
+                                           heading_err_deg=float(np.degrees(psi[k])),
+                                           speed_m_s=spd)
+                          want = dec.active
+                          if want is pl_sk[k]:
+                              continue
+                          if want.value not in pl_clips:
+                              # No exception path: CLAUDE.md 2 forbids removing a task the
+                              # library cannot serve, so an unserviceable request holds the
+                              # current skill and is counted.
+                              pl_refused[k] += 1
+                              continue
+                          # Land in the new clip at a phase whose stance/swing assignment
+                          # agrees with the feet actually loaded -- proprioception only, the
+                          # same rule run_planner_replay.py uses.
+                          nm = want.value
+                          cl = pl_sw[nm]
+                          cur = pl_q[pl_sk[k].value][pl_ph[k]]
+                          agree = (cl == pl_sw[pl_sk[k].value][pl_ph[k]][None, :]).sum(axis=1)
+                          cand = np.flatnonzero(agree == agree.max())
+                          d_ = np.abs(pl_q[nm][cand] - cur[None, :]).max(axis=1)
+                          pl_ph[k] = int(cand[int(np.argmin(d_))])
+                          pl_sk[k] = want
+                          pl_switches[k] += 1
+                          pl_foot[k][nm].reset()
+                          if pl_yaw[k][nm] is not None:
+                              pl_yaw[k][nm].reset()
+                  # ---- one control step of whatever is playing -----------------------
+                  tau_pl = np.zeros((n, 12))
+                  for k in range(n):
+                      nm = pl_sk[k].value
+                      ph = pl_ph[k] % len(pl_q[nm])
+                      pl_held[nm][k] += 1
+                      cmd[k] = pl_q[nm][ph]
+                      if alive[k]:
+                          cmd[k] = cmd[k] + pl_foot[k][nm].step(
+                              float(vb[k, 1]), float(wb[k, 2]), pl_sw[nm][ph],
+                              vx=float(vb[k, 0]), psi_err_rad=float(psi[k]))
+                          if pl_yaw[k][nm] is not None:
+                              tau_pl[k] = pl_yaw[k][nm].step(pl_sw[nm][ph],
+                                                             psi_err_rad=float(psi[k]))
+                      pl_ph[k] = (pl_ph[k] + 1) % len(pl_q[nm])
+              elif foots is not None:
+                  vb = snap(robot.data.root_lin_vel_b)
+                  wb = snap(robot.data.root_ang_vel_b)
+                  # Heading error per robot against ITS OWN settle heading, wrapped to
+                  # (-180, 180].  Omitting this is not a small mistake: psi_err defaults to
+                  # 0, which makes the heading term identically zero and --heading a flag
+                  # that changes a CSV column and nothing else.  run_calibration_grid.py
+                  # carries the same comment for the same reason.
+                  if yaw_mode != "off":
+                      _, _, yaw_now = quat_to_rpy_deg(snap(robot.data.root_quat_w))
+                      psi = np.radians((np.asarray(yaw_now, float) - yaw_ref + 180.0)
+                                       % 360.0 - 180.0)
+                  else:
+                      psi = np.zeros(n)
+                  for k in range(n):
+                      if alive[k]:
+                          cmd[k] = cmd[k] + foots[k].step(float(vb[k, 1]), float(wb[k, 2]),
+                                                          swing_seq[frame], vx=float(vb[k, 0]),
+                                                          psi_err_rad=float(psi[k]))
+              tgt = robot.data.default_joint_pos.clone()
+              tgt[:, idx_t] = torch.as_tensor(cmd, device=sim.device, dtype=torch.float32)
+              robot.set_joint_position_target(tgt)
+              if PLANNER_ARM and args.yaw_moment != "off":
+                  # Written EVERY step including the all-zero ones: an effort target is
+                  # sticky, so skipping the write leaves the last non-zero torque applied.
+                  eff = torch.zeros_like(tgt)
+                  eff[:, idx_t] = torch.as_tensor(tau_pl, device=sim.device,
+                                                  dtype=torch.float32)
+                  robot.set_joint_effort_target(eff)
+              for _ in range(decim):
+                  robot.write_data_to_sim(); sim.step(); robot.update(phys_dt)
+
+              pos = snap(robot.data.root_pos_w)
+              idx = tracker.update(pos[:, :2])
+              roll, pitch, _ = quat_to_rpy_deg(snap(robot.data.root_quat_w))
+              dead = ((np.abs(np.radians(roll)) > ROLL_PITCH_CUTOFF_RAD)
+                      | (np.abs(np.radians(pitch)) > ROLL_PITCH_CUTOFF_RAD)
+                      | (pos[:, 2] - ground_z < HEIGHT_CUTOFF_M)
+                      | (idx >= NUM_GOALS))
+              newly = alive & dead
+              ended[newly] = idx[newly]
+              alive &= ~newly
+              if not alive.any():
+                  break
+          ended[alive] = tracker.idx[alive]        # the rest time out, upstream's way
+          # Where each robot finished, and how far it still had to go.  Recorded because the
+          # integer goal count has about three and a half units of usable range.
+          fin_xy = snap(robot.data.root_pos_w)[:, :2]
+          dist_next = np.array([np.linalg.norm(fin_xy[k] - goals[k, min(ended[k], NUM_GOALS - 1)])
+                                for k in range(n)])
+          dist_last = np.array([np.linalg.norm(fin_xy[k] - goals[k, NUM_GOALS - 1])
+                                for k in range(n)])
+          for k, (t, l) in enumerate(cells):
+              rows_out.append({"task": t, "task_name": names[t], "level": l, "episode": ep,
+                               "goals": int(ended[k]), "settle_ok": int(settle_ok[k]),
+                               # Which arm this row is.  A results file whose rows do not
+                               # say whether heading hold was on is one that gets read wrong
+                               # once: `heading` and `heading-only` are not the same
+                               # controller, and neither is `off`.
+                               "heading": args.heading, "heading_cap_rad": hcap,
+                               # The user asked for resolution beyond the goal count: the
+                               # benchmark's useful range is about 1 to 4.5 of 8 (goal 0 sits
+                               # 0.50 m from the spawn in 180 of the 200 cells), so a whole
+                               # arm can move and the integer score not notice.
+                               "final_x_m": float(fin_xy[k, 0] - offs[k, 0]),
+                               "final_y_m": float(fin_xy[k, 1] - offs[k, 1]),
+                               "travelled_m": float(np.linalg.norm(fin_xy[k] - spawns[k])),
+                               "dist_to_next_goal_m": float(dist_next[k]),
+                               "dist_to_last_goal_m": float(dist_last[k]),
+                               "alive_at_end": int(alive[k]),
+                               "switches": int(pl_switches[k]) if PLANNER_ARM else "",
+                               "refused_ticks": int(pl_refused[k]) if PLANNER_ARM else "",
+                               "frac_WALK": (float(pl_held["WALK"][k]) / max(step + 1, 1)
+                                             if PLANNER_ARM else ""),
+                               "frac_TROT": (float(pl_held["TROT"][k]) / max(step + 1, 1)
+                                             if PLANNER_ARM else ""),
+                               "frac_TURN": (float(pl_held["TURN"][k]) / max(step + 1, 1)
+                                             if PLANNER_ARM else ""),
+                               "yaw_moment": args.yaw_moment,
+                               "yaw_moment_gain": args.yaw_moment_gain,
+                               "partial": int(n < full), "skill": args.skill,
+                               "start_phase": args.start_phase, "foot_comp": args.foot_comp,
+                               "steps": step + 1})
+          print(f"[bench] episode {ep+1}/{args.episodes}: goals reached "
+                f"min {ended.min()} median {np.median(ended):.1f} max {ended.max()}, "
+                f"{int((ended >= NUM_GOALS).sum())}/{n} cells completed the course "
+                f"({time.time()-t0:.0f}s)")
+    except Exception as _exc:
+        _loud(_exc)
+        raise
     return rows_out, aggregate(rows_out), n < full
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--skill", default="TROT", help="clip to hold on every cell")
+    ap.add_argument("--skill", default="TROT",
+                    help="clip to hold on every cell, or PLANNER for the "
+                         "Rule-Planner arm (each robot picks its own)")
     ap.add_argument("--rate", choices=("hi", "lo"), default="lo")
     ap.add_argument("--tasks", type=int, nargs="*", default=None)
     ap.add_argument("--levels", type=int, nargs="*", default=None)
@@ -605,6 +882,14 @@ def main() -> int:
     ap.add_argument("--start-phase", choices=("first", "stance", "level", "measured"),
                     default="first")
     ap.add_argument("--foot-comp", choices=("off", "on"), default="on")
+    ap.add_argument("--yaw-moment", choices=("off", "hold"), default="off",
+                    help="TROT's stance-leg yaw couple (sim/yawmoment.py), planner arm only. "
+                         "off (default) is every earlier benchmark run.")
+    ap.add_argument("--yaw-moment-gain", type=float, default=5.0,
+                    help="N.m of hip torque per rad of heading error; 5 is the measured "
+                         "operating point (trot_yaw_moment.md 3)")
+    ap.add_argument("--yaw-moment-nm", type=float, default=0.0)
+    ap.add_argument("--yaw-moment-cap-nm", type=float, default=2.0)
     ap.add_argument("--heading", choices=("off", "heading", "heading-only"), default="off",
                     help="off (default, and what the 0.98 / 1.11 scores in "
                          "outputs/benchmark_harness.md were measured with): the bare "
