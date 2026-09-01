@@ -401,13 +401,20 @@ def run_isaac(args) -> dict:
             note = (f"  <- MEASURED (turn_entry_phase.md), overriding the rule's "
                     f"{ph['start_frame']}")
             ph = dict(ph, start_frame=k, spread_at_start=float("nan"))
-        # A MEASUREMENT knob, not an intervention: it shifts where in its own cycle a
-        # clip is entered and changes no controller.  It exists because a result on one
-        # entry phase is one draw from a chaotic plant -- trot_straight.md 4b is what
-        # happens when that is believed -- and this rig had no way to take another.
-        if args.entry_offset:
-            k = (k + int(args.entry_offset)) % len(clips[sid]["q_des"])
-            note += f"  (+{int(args.entry_offset)} entry offset -> {k})"
+        # A MEASUREMENT knob, not an intervention: it names where in its own cycle a clip
+        # is entered and changes no controller.  It exists because a result on one entry
+        # phase is one draw from a chaotic plant -- trot_straight.md 4b is what happens
+        # when that is believed -- and this rig had no way to take another.
+        #
+        # ABSOLUTE, and that is a fix rather than a preference.  The first version was a
+        # RELATIVE offset from whatever level_start chose, which for TROT is frame 16,
+        # while run_calibration_grid.py's schedule counts from frame 0.  The same number
+        # then named a different frame in the two harnesses, and a ladder re-run "at the
+        # surviving phases" was done at a phase that was not one of them
+        # (harness_findings.md 16).  Both now take a clip frame and mean it.
+        if args.entry_frame is not None:
+            k = int(args.entry_frame) % len(clips[sid]["q_des"])
+            note += f"  <- --entry-frame (the rule wanted {ph['start_frame']})"
         clips[sid] = rotate_clip(clips[sid], k)
         print(f"[planner]   {sid.value:5s} entry frame {k}, "
               f"foot spread {ph['spread_at_start']*1000:.1f} mm{note}")
@@ -797,6 +804,7 @@ def summarise(args, a, dt, sched, planner, events, refused, meta, clips,
            "speed_gate": args.speed_gate, "speed_refusals": planner.speed_refusals,
            "switch_gate": args.switch_gate, "gate_deferrals": gate_defer,
            "heading": args.heading, "entry_turn": args.entry_turn,
+           "entry_frame": ("" if args.entry_frame is None else args.entry_frame),
            "planner_switches": planner.switches, "executed_switches": len(switches),
            "refused_ticks": sum(refused.values()),
            "refused_skills": "|".join(sorted(s.value for s in refused)),
@@ -892,17 +900,16 @@ def main() -> int:
                     help="which skill carries the term (default TROT, the only one whose "
                          "heading authority is spent; WALK already meets the budget). "
                          "'all' puts it on every supported skill.")
-    ap.add_argument("--entry-offset", type=int, default=0,
-                    help="shift EVERY clip's entry frame by this many frames FROM WHATEVER "
-                         "THE RULE CHOSE -- which for TROT is frame 16, not 0. This is NOT "
-                         "the same origin as run_calibration_grid.py --entry-offset, whose "
-                         "rep-0 schedule starts at frame 0, so the same number means a "
-                         "different frame in the two harnesses (harness_findings.md 16). "
-                         "Both print the RESOLVED frame; read that, not the offset. "
-                         "0 (default) is the rule's own answer and every earlier result. A "
-                         "measurement knob: one entry phase is one draw from a chaotic "
-                         "plant, and a claim that only holds at one phase is not a claim "
-                         "(outputs/trot_straight.md 4b).")
+    ap.add_argument("--entry-frame", type=int, default=None,
+                    help="enter EVERY clip at this ABSOLUTE frame of its own cycle. Unset "
+                         "(default) uses the rule, verify_skill_replay.level_start, and is "
+                         "every earlier result. The number is a clip frame and means the "
+                         "same thing here as in run_calibration_grid.py --entry-frame; an "
+                         "earlier version of this flag was a relative offset from the "
+                         "rule's choice and the two harnesses disagreed about what a given "
+                         "number meant (harness_findings.md 16). A measurement knob: one "
+                         "entry phase is one draw from a chaotic plant, and a claim that "
+                         "holds at only one phase is not a claim (trot_straight.md 4b).")
     ap.add_argument("--entry-turn", choices=("rule", "measured"), default="rule",
                     help="where a TURN replay starts in its cycle. rule (default, and what "
                          "every earlier result used): verify_skill_replay.level_start, the "

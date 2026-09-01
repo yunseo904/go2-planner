@@ -9,7 +9,7 @@ measurable"; the other two are the same shape and belong beside them.
 |---|---|---|---|
 | `skill.STEP_RUN_MAX` | RUN | **not measurable** | the gait collapses in 1.13 s on flat |
 | `skill.STEP_JUMP_MAX` | JUMP | **not measurable** | the clip needs 1.10–1.20× the actuator's torque limit |
-| `skill.STEP_TROT_MAX` | TROT | **not measurable** | arrives past the obstacle, 1.6 m beside the goal |
+| `skill.STEP_TROT_MAX` | TROT | **partly measured — see the note below** | as a GOAL score, still not measurable; as a crossing, 0.04–0.06 m |
 | `robot.FOOT_SPAN_X` | WALK | **not measurable** | WALK does not fall on any gap and never arrives either |
 
 ---
@@ -77,3 +77,69 @@ produced those 60 rows predate heading hold.
 **This one is the cheapest to fix and has not been re-run.** WALK holds a line; the gap
 family should be repeated with `--heading heading-only` before `FOOT_SPAN_X` is called
 unmeasurable.
+
+
+---
+
+## Closing status, 2026-09-01
+
+Decided with the user: **RUN and JUMP are closed as unresolved and not carried further.**
+Both causes are established, neither is a missing measurement, and neither is fixable
+inside the constraints this project runs under.
+
+### RUN — the clip has no ballistic phase, and that is upstream of everything else
+
+`run_collapse.md`, `run_swing_gate.md`. The base never becomes ballistic, and the three
+downstream candidates have each been excluded on their own:
+
+- **the swing gate** (`--foot-swing-source sim`) moves the correction (cap-hit 26.5% →
+  36.8%) and changes the collapse time by **fourteen decimal places of nothing**;
+- **the loop seam** is not it either — the uncut full-session replay already on disk
+  survives 10.28 s, but at duty 0.96 and 0.035 m/s, i.e. by standing rather than running;
+- **collapse time is 0.93–1.64 s across three entry phases**, so the 1.13 s quoted
+  everywhere is one draw, and no arrangement of the remaining knobs moves the distribution.
+
+What is missing is in the recording: the clip is a duty-0.31 gait whose *body* never leaves
+a ballistic arc in replay. That is a re-recording, not a control fix, and re-recording is
+not available here.
+
+### JUMP — the sim's torque limit is the spec sheet, and the real robot exceeded it in bursts
+
+`jump_torque.md`. `effort_limit` 23.70 / 45.43 N·m **is the Go2 spec sheet**, and the ratio
+proves it: 45.43/23.70 = 1.9169 against the motor's 30.1/15.7 = 1.9172, the same motor
+behind a 1.917:1 knee reduction. The actuator is an `IdealPDActuatorCfg`, a static clip
+chosen *over* `DCMotorCfg` precisely to avoid torque–speed derating, so the sim robot is
+already more permissive at speed than a real one.
+
+The log's 54.67 N·m is **LowState's measured torque, not a command** — the calf's peak
+*command* is 38.2, inside the limit — and it reproduces on all five takes. Time above the
+limit is **7–51 ms per jump, longest single bout 11–23 ms**: a momentary peak, not the
+shape of the push-off.
+
+So the sim robot is torque-short by 1.10–1.20× for a few tens of milliseconds per jump, and
+closing that gap means raising `effort_limit` above the spec sheet — which changes the E2E
+arm too and is the user's decision, not a measurement. **Not taken. JUMP stays unresolved.**
+
+### STEP_TROT_MAX — the row above changed, and the distinction matters
+
+The original entry said "arrives past the obstacle, 1.6 m beside the goal". That reading was
+built on `--foot-len-bias`, which `trot_straight.md` §4b later showed does not replicate.
+What is now measured (`trot_yaw_moment.md` §6) is narrower and firmer:
+
+- as a **crossing** — does the base get past the riser — TROT is **6/6 at 0.02 m, 4/6 at
+  0.04 m, 0/6 at 0.06 m and above**. A bracket of **0.04–0.06 m**, monotone, over three
+  entry phases and both intervention arms.
+- as a **goal-2 score** it remains **not measurable**: one cell of ninety reaches goal 2,
+  and what stops the rest is the rear pair against a riser taller than the 23 mm foot
+  radius (`lip_failure.md` §1's mechanism, now measured on TROT).
+
+**The bracket is not in `planner/config.py`.** `STEP_TROT_MAX` stays 0.08 m with provenance
+`CALIBRATION_NEEDED`, by the user's decision: three entry phases is a bracket, not a
+calibration, and a threshold becoming a planner guarantee is a decision rather than a
+measurement.
+
+### Frame 13 — an open question, deliberately parked
+
+TROT clip frame 13 survives 40 s on the flat rig and **never leaves the spawn on the grid**
+(0 of 15 cells travel more than 0.6 m). The two harnesses disagree about the same phase.
+Parked, not chased.

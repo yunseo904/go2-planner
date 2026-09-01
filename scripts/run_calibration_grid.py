@@ -680,7 +680,7 @@ def run_isaac(args) -> list:
     # every five STEP_TROT_MAX repeats this project has run started at a phase where TROT
     # falls on FLAT GROUND in under three seconds, and the ladder was scoring that.
     def entry_frames(rep: int) -> list:
-        return [(int(round(rep * len(q) / max(args.reps, 1))) + int(args.entry_offset))
+        return [(int(round(rep * len(q) / max(args.reps, 1))) + int(args.entry_frame))
                 % len(q) for q in q_seq]
     goal2 = np.array([probes["goals"][i][1] for i in idx]) + offsets     # world frame
     foot_ids_t, _foot_names_t = robot.find_bodies(".*_foot")
@@ -840,7 +840,7 @@ def run_isaac(args) -> list:
         for k, (param, skill, family, i, level) in enumerate(runs):
             rows_out.append({"param": param, "skill": skill, "family": family,
                              "probe": probes["names"][i], "level_m": level, "rep": rep,
-                             "entry_frame": ent[k], "entry_offset": args.entry_offset,
+                             "entry_frame": ent[k], "entry_frame_arg": args.entry_frame,
                              # Which arm this row is, and what the actuator actually did.
                              # A row that does not say whether the yaw couple was on gets
                              # read wrong once; a peak hip torque at the limit means the
@@ -1068,15 +1068,12 @@ def main() -> int:
     ap.add_argument("--heading-len-cap", type=float, default=0.04,
                     help="magnitude bound on that half (rad). 0.04 is the largest amplitude "
                          "the open-loop probe survived on TROT; -0.06 fell at 2.77 s")
-    ap.add_argument("--entry-offset", type=int, default=0,
-                    help="shift every repeat's entry frame by this many frames. At --reps 1 "
-                         "the offset IS the clip frame, because this schedule starts at "
-                         "frame 0 -- which is NOT the origin run_planner_replay.py "
-                         "--entry-offset uses (it offsets from level_start's choice, frame "
-                         "16 for TROT), so the same number means a different frame in the "
-                         "two harnesses (harness_findings.md 16). Both print the RESOLVED "
-                         "frame; read that. 0 (default) is the schedule every earlier grid "
-                         "run used. A MEASUREMENT knob: it changes no controller.")
+    ap.add_argument("--entry-frame", type=int, default=0,
+                    help="the clip frame repeat 0 enters at; later repeats keep their own "
+                         "spacing above it. At --reps 1 this IS the clip frame, and it is "
+                         "the same number run_planner_replay.py --entry-frame takes. 0 "
+                         "(default) is the schedule every earlier grid run used. A "
+                         "MEASUREMENT knob: it changes no controller.")
     ap.add_argument("--yaw-moment", choices=("off", "probe", "hold"), default="off",
                     help="off (default): position targets only, bit-identical to a run from "
                          "before this flag existed. probe: a CONSTANT feed-forward hip "

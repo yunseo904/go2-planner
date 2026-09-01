@@ -526,6 +526,13 @@ what "the limit is below the smallest level" looks like (`turn_probes.md` §4 is
 instance of the latter). The defence is the one that worked here: open the trace and ask
 where the robot actually was, which is a second frame for the same quantity.
 
-**Guard.** Both help strings now state their origin and point here. Nothing in the code
-changed — the trap is in reading, and the harnesses were already printing enough to avoid
-it.
+**Fixed, not just documented.** Both harnesses now take `--entry-frame`, an **absolute
+clip frame**, and the same number means the same frame in both. The planner rig's flag was
+the relative one and it is the one that changed; its default (unset) is still
+`level_start`'s choice, so nothing earlier moves. The surviving TROT phases are recorded
+everywhere as **clip frames 16, 0, 1, 13** from here on.
+
+The reading lesson survives the fix, because it is the more general one: **a column that
+does not respond to the ladder parameter looks identical to a real "the limit is below the
+smallest level" result** (`turn_probes.md` §4 is a genuine instance of the latter). Both
+times the defence is the same — open the trace and ask where the robot actually was.
