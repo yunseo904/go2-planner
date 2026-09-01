@@ -1005,12 +1005,16 @@ def run_isaac(args) -> tuple:
                   hxy = np.array([quat_rotate_inv(bq[k][None, :],
                                                   (bp[k, h_by[l]] - bpos[k])[None, :])[0, :2]
                                   for l in legs])
-                  # The roll couple, one per robot, for the single-skill arms.  WALK is
+                  # The roll couple, one per robot, for the SINGLE-SKILL arms only -- the
+                  # planner arm carries its own per-clip couples in pl_roll and never reads
+                  # these.  Built as None here rather than as unused objects, because an
+                  # unused object beside a used one is what made the first report wrong.
+                  # WALK is
                   # the arm this term is aimed at (every fall on the grid is a roll fall,
                   # sim/attitude.py) and TROT/TURN are the controls the user requires: a
                   # term that helps one gait and is silent or harmful in the others is a
                   # different finding from one that helps the robot.
-                  rolls.append(RollCouple(
+                  rolls.append(None if PLANNER_ARM else RollCouple(
                       lever_m=lever[k] if settle_ok[k] else med,
                       hip_x_m=hxy[:, 0], hip_y_m=hxy[:, 1],
                       bias_nm=args.roll_couple_nm,
@@ -1349,8 +1353,15 @@ def run_isaac(args) -> tuple:
                                "start_phase": args.start_phase, "foot_comp": args.foot_comp,
                                "steps": step + 1})
           if args.roll_couple != "off":
-              _rcs = ([rolls[k] for k in range(n)] if rolls is not None
-                      else [pl_roll[k][pl_sk[k].value] for k in range(n)])
+              # Key off the ARM, not off `rolls is not None`.  `rolls` is built whenever
+              # --foot-comp is on, which includes the planner arm, where it is never
+              # stepped -- reading it there reported "0 stance-leg-steps driven" for a term
+              # that was working, which is the shape of failure this project keeps hitting:
+              # a plausible number about the wrong object.  And count EVERY per-clip
+              # object, not the final skill's: a robot that ends on TURN did not spend the
+              # episode there.
+              _rcs = ([v for d in pl_roll for v in d.values()] if PLANNER_ARM
+                      else [rolls[k] for k in range(n)])
               _ap = sum(r.applied for r in _rcs)
               _ch = sum(r.cap_hits for r in _rcs)
               _mx = max((r.max_abs_nm for r in _rcs), default=0.0)
