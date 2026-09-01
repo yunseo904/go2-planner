@@ -283,19 +283,91 @@ same, so the choice inside the bracket does not matter.
   including the planner arm where it is never stepped) instead of `pl_roll`, and printed
   "0 stance-leg-steps driven" for a term that was working.  Scores never affected.
 
-## 12. What to do next, in order
+## 12. Session 5 (2026-09-02) — skills pushed, four hypotheses closed
 
-1. **The skill library is the whole question now, and the oracle proves it.**  0.81 is what
-   a perfect chooser gets; 4.83 is the teacher.  Nothing in the planner closes that.  What
-   is missing is concrete: a gait that holds on 40 mm of noise, and a forward-travelling
-   jump (`front_jump` moves 26 mm horizontally; the narrowest gap on the grid is 0.10 m).
-2. **Level 2 (§10) is the first piece of item 1** and is designed and costed.  It needs a
-   decision, not more measurement.
-3. **TURN costs more than it buys in its current form** (§9).  It is 1.5 s of a 3.4 s life
-   at 0.0075 m/s.  Either a faster re-aim, or cross-track correction inside WALK instead —
-   `SESSION_STATE` (2) §3 already measured the yaw couple taking WALK's curvature to
-   0.24 °/m, so the heading may not need TURN at all on this terrain.
-4. **`effort_limit`** — closed as far as evidence goes (§4); the decision is the user's and
-   45.43 is confirmed to be the published peak.  Recorded, not acted on.
-5. `staircase_walking_full_width` and `staircase_spiral` score **0.00 in every arm**,
-   including the oracle.  Two courses of twenty that nothing in the library touches at all.
+Full detail: `outputs/skill_push_2026-09-02.md`.
+
+### The table now
+
+| arm | score / 8 |
+|---|---|
+| E2E teacher | 4.83 |
+| **ORACLE on the improved skills** | **0.88** (was 0.81) |
+| WALK + roll couple | 0.83 |
+| WALK | 0.76 |
+| **Rule-Planner, depth + roll couple** | **0.63** (3-seed mean; seed 1 alone was 0.69) |
+| Rule-Planner, depth | 0.55 (3-seed mean) |
+| TROT / TURN + couple | 0.34 / 0.14 |
+
+**Level 2 on depth, three seeds: 0.60→0.69, 0.54→0.62, 0.52→0.59.**  Positive in all three,
+better-than-worse in all three.  **Quote 0.63, not 0.69** — seed 1 was the top of the spread.
+
+### What was tried and what it cost
+
+* **WALK swing lift — refuted, with a new reason.**  Score flat (0.83/0.76/0.82/0.83 at
+  0/20/40/60 mm) while survival collapses (31→25→20→12) and **v_x rises +10/+19/+32 %**.  It
+  is a *speed* edit, which is exactly what the `sin²` shape with zero slope at both endpoints
+  was built not to be.  Fails the v_x criterion, so rejected on the criterion.  The
+  hypothesis that the roll couple would change the trade is **wrong** — with the couple on
+  it costs survival at the same rate.
+* **TURN — the clip is genuine, the replay is not.**  `SPEED_TURN = 0.0075 m/s` is the real
+  robot's own logged value.  But the sim delivers **31–36 % of the logged −22.66 °/s** and
+  **translates backwards at 10× the logged forward speed**.  Foot placement excluded (off is
+  worse), entry phase excluded (36 % vs 34 %) — it is the open-loop replay itself.  A 90°
+  re-aim costs 4.0 s logged and **11.6 s replayed**, against a 3.4 s median life.
+  **This is now the largest single unexplained gap in the library.**
+* **RUN — one more route excluded.**  The roll couple cannot lift the body: peak base height
+  0.313 → 0.311 m against WALK's 0.330 m standing.  A hip torque makes a force perpendicular
+  to the hip→foot vector, which on a near-vertical leg is horizontal.  No vertical component
+  exists to give.
+* **JUMP** — unchanged, recorded.
+
+### The planner's cross-track problem: diagnosed right, fix is a null
+
+`RulePlanner._wants_turn` documents *"goal bearing minus heading"* and the harness was
+handing it the drift from the **start** heading.  So the planner has been restoring its
+launch heading, never aiming at a goal.  `--turn-target goal` fixes the wiring — and
+measures **0.63 → 0.42 over three seeds**, worse in 45–50 cells of 200, and it does not
+help either course it was diagnosed on.
+
+The two findings interlock: aiming correctly makes the planner turn **more** (TURN share
+0.24 → 0.39), and each turn costs 11.6 s.  **A better aim is worthless while the aiming
+mechanism is 3× too slow.**  Kept, default `settle`; re-run it when the replay gap closes.
+
+### The oracle, on the improved skills
+
+| | WALK | ORACLE | headroom | cells where a non-WALK skill wins |
+|---|---|---|---|---|
+| couple off | 0.76 | **0.81** | +0.06 | 12 / 200 (TROT 7, TURN 5) |
+| couple on | 0.83 | **0.88** | +0.05 | **9 / 200** (TROT 8, TURN 1) |
+
+**Improving a skill raised the ceiling by 0.07 and left the planner's room where it was** —
+and the cells where choosing matters *fell*, because the couple helps WALK more than the
+alternatives.  Same conclusion as §8, now demonstrated by an intervention that worked.
+
+### Three more harness bugs, all in `swing_lift_offsets`' free-floating measurement
+
+1. It held the robot at a hard-coded **z = 1.5 m**, which is above the flat rig and *inside*
+   this grid (staircase_climbing reaches 3.96 m).  The measurement was a collision response
+   and returned 21.1 mm where the free measurement says 19.8.  `air_z` added.
+2. It wrote every instance to `default_root_state`'s x-y — **the same point for all of
+   them** — so a 200-robot fleet measured itself.  PhysX ran out of contact blocks and the
+   run sat at 121 % CPU emitting nothing for twenty minutes.  `spread` added; both defaults
+   preserve the one-robot rig bit-for-bit.
+3. Between them they wrote **11.5 GB** of one repeated PhysX warning.
+   `isaac_docker_run.sh` now drops that line at the source (`LOGCAP=0` restores it).
+
+## 13. What to do next, in order
+
+1. **TURN's replay gap is the highest-value open question.**  31-36 % of the logged yaw
+   rate, and backwards.  It gates the planner's only aiming mechanism, it is why
+   `--turn-target goal` is a null, and it is a *fidelity* question -- the clip is genuine, so
+   something between the clip and the robot is wrong.  Excluded already: foot placement,
+   entry phase.  Candidates left: the hip-sign convention (`convention_verified: False` in
+   the clip metadata), the contact/duty relationship at 0.715 duty, and the settle pose.
+2. **The library is still the ceiling** -- 0.88 against 4.83.  Two concrete gaps: a gait that
+   holds on 40 mm of noise, and a forward-travelling jump.
+3. `effort_limit` is the user's decision; the evidence is closed.
+4. `staircase_walking_full_width` and `staircase_spiral` remain 0.00 in every arm.  Neither
+   is a terrain problem (the teacher gets 4.49 / 4.87); both need travel distance, and one
+   needs a >=0.06 m step.
