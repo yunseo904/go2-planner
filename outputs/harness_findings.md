@@ -536,3 +536,31 @@ The reading lesson survives the fix, because it is the more general one: **a col
 does not respond to the ladder parameter looks identical to a real "the limit is below the
 smallest level" result** (`turn_probes.md` §4 is a genuine instance of the latter). Both
 times the defence is the same — open the trace and ask where the robot actually was.
+
+---
+
+## 17. Under Kit, a Python error exits with status 0, no message and no traceback
+
+Three separate bugs in one session, each of which produced an identical log: setup lines,
+then nothing, then the container's own exit banner. No traceback, no CSV, `$?` of 0. Each
+cost a bisection to localise, and each was a one-line mistake.
+
+| | error | what made it invisible |
+|---|---|---|
+| 1 | `NameError` — the grid's per-cell offset is `offs`, the new row builder said `offsets` | ran the whole 20 s episode, then died building rows |
+| 2 | `SystemExit` — a `--heading` guard fired on `HEADING_CAP.get("PLANNER") == 0.0` | **`sys.excepthook` is not called for `SystemExit`**, so even the hook added for (1) printed nothing |
+| 3 | `UnboundLocalError` — `run_isaac` has `from planner.config import DEFAULT as _CFG` inside an `if`, which makes `_CFG` a **local for the whole function**, shadowing a new module-level `_CFG` | looked exactly like (1) |
+
+**(3) is the subtle one and worth stating on its own:** a function-local `import ... as X`
+anywhere in a function makes `X` local *everywhere* in it, including lines that run before
+the import. A module-level alias of the same name is then unbound, not shadowed-but-usable.
+The fix is the name: the module-level one is `PLANNER_CFG`, with a comment saying why.
+
+**Guards now in place.** `run_benchmark.py` installs a `sys.excepthook` after `AppLauncher`
+that prints and flushes. That covers (1) and (3). It does **not** cover (2) — nothing does,
+short of not raising `SystemExit` — so the refusal guards carry a note.
+
+**How to localise one of these fast**, since the guards cannot catch everything: print with
+`flush=True` at each setup stage and bisect. Four staged prints found (3) in one run after
+an hour of guessing. `PYTHONFAULTHANDLER=1` is *not* useful here — none of these are
+segfaults, and it printed nothing in all three cases.

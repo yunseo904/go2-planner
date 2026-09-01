@@ -159,20 +159,76 @@ which made the two rows at the 23.70 clip unreadable. With the control column ad
 hip torque is **higher with the couple off** (23.66 / 22.77) than on (18.03 / 20.31) — the
 terrain puts the hips near their clip, not the couple.
 
-## 7. What to do next, in order
+## 7. Session 3 (same day, later) — the deliverable, and two nulls
 
-1. **The rear feet, not the heading.** §3b says both TROT's and WALK's step limit is the
-   rear pair against a riser taller than the 23 mm foot radius. `swing_lift.md` and
-   `swing_height_basis.md` already measured WALK's rear apex at 0.0 mm above lift-off
-   while the front pair manages 44–50; `--swing-lift` exists and has never been run
-   against the step ladder. That is the next lever and it is already built.
-2. **The full 200-cell benchmark with `--heading heading-only`**, paired with off. The
-   flag is wired and smoke-tested; the run has not been done.
-3b. **`effort_limit`** (`jump_torque.md`, three options) is still the user's call and still
+### The benchmark, all 200 cells — `outputs/benchmark_planner.md`
+
+All three arms under identical conditions (heading hold on, foot placement on, same entry
+frames), which is why the baselines were re-measured rather than quoted.
+
+| arm | score / 8 | alive at 20 s |
+|---|---|---|
+| **Rule-Planner** | **1.07** | 64/200 |
+| **WALK fixed** (lower bound) | **1.11** | 64/200 |
+| TROT fixed | 0.97 | 9/200 |
+| *upstream `walk_pretrain` / E2E teacher* | *1.05 / 4.48* | |
+
+**The planner scores below its own lower bound**: paired per cell, better in 0, worse in 6,
+tied in 194. It is WALK with occasional TURN detours — upright-time share WALK 0.898, TURN
+0.098, **TROT 0.004** (4 of 200 cells). It does switch (median 1, max 13) and refuses
+unserviceable skills correctly. Read the floor first: goal 0 sits 0.50 m from the spawn in
+180 of 200 cells, so 1.0 means the robot moved half a metre.
+
+**Heading hold does not move this benchmark.** WALK is 1.11 with it and 1.11 without, TROT
+0.97 against 0.98 — at a median travel of 1.1 m nothing gets far enough for curvature to
+matter. The heading work is still correct; it just does not reach this score.
+
+### Swing lift on the ladder — null — `outputs/swing_lift_ladder.md`
+
+`swing_lift.md`'s ladder table predates the symmetry fix, so it was re-run with the
+symmetric edit. Rear-only lift is automatic (`max(0, target − apex)` per mirror pair; TROT
+at 60 mm gives front +7.0, rear +55.0). It still does not raise the passable step: the
+untouched recording is the best row in both gaits, and TROT dies in 1.1–2.0 s at 60 and
+70 mm. `--swing-lift` stays off.
+
+### The step brackets, corrected
+
+The criterion mattered more than the intervention. "Base past the riser" admits a base
+leaning over the lip; replaced with **base ≥0.30 m past AND risen ≥60% of the step, held
+0.5 s**, stable across margin 0.20–0.30 m.
+
+| | climbs | does not | bracket |
+|---|---|---|---|
+| TROT | 0.02 m | 0.04 m | **0.02–0.04 m** (was reported 0.04–0.06) |
+| WALK | 0.04 m | 0.06 m | **0.04–0.06 m** |
+
+TROT's is `lip_failure.md` §1's foot-radius prediction exactly (loaded foot centre at
+23 mm). **Neither is in `planner/config.py`** — 0.08 / 0.10 stay `CALIBRATION_NEEDED`, by
+the user's decision.
+
+### Closed, by decision — `outputs/unmeasurable.md`
+
+**RUN** (the clip has no ballistic phase; swing gate, loop seam and entry phase each
+excluded separately) and **JUMP** (`effort_limit` is the spec sheet; the real robot's
+excursion is a 11–23 ms burst, and raising the limit is a decision that changes the E2E arm
+too). Both unresolved, not carried further.
+
+### Harness — `harness_findings.md` §16, §17
+
+`--entry-frame` is now an **absolute clip frame in both harnesses** (the planner rig used
+to offset from `level_start`'s frame 16 and the grid from 0, which put a "ladder at the
+surviving phases" run on a dead phase). And under Kit a Python error exits with status 0,
+no message and no traceback — a `NameError`, a `SystemExit` and an `UnboundLocalError` each
+cost a bisection this session; an excepthook is installed and the causes are recorded.
+
+## 8. What to do next, in order
+
+1. **The library is the ceiling, not the rules.** The planner has one usable locomotion
+   skill. Everything else on this list is downstream of that.
+2. **`effort_limit`** (`jump_torque.md`, three options) — still the user's call, still
    gates JUMP entirely.
-5. RUN, JUMP and WALK-4cm were **not touched this session** — deferred by the priority
-   order, not by a finding.
-
-## 8. Untouched
-
-`--effort_limit` unchanged. No clip was edited. GPU 0 never touched, GPU 1 never touched.
+3. **The 21 zero-scoring cells** are the same 21 in all three arms, so they are a property
+   of the terrain and nobody has looked at which 21.
+4. **Frame 13**: survives 40 s on the flat rig, never leaves the spawn on the grid. Parked.
+5. **TROT's lateral offset** at gain 5 + 0.49 N·m FF is 1.25 m over 26.6 m. Cross-track
+   error would close it and only the planner has one.
