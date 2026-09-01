@@ -671,8 +671,17 @@ def run_isaac(args) -> list:
     # frame 0 -- so rep r enters every clip at frame round(r * n / reps).  A step limit
     # that only holds at one entry phase is not a limit, which is exactly what a repeat
     # is supposed to find out.
+    #
+    # --entry-offset shifts the whole schedule.  It exists because the schedule above is
+    # a uniform sweep of a cycle and TROT is not uniform in it: swept on flat, all 32 of
+    # TROT's entry phases with heading hold on, only **4 survive 40 s** (0, 16, 17, 29 --
+    # outputs/trot_yaw_moment.md 5).  The five frames this rule picks at --reps 5 are
+    # 0, 6, 13, 19, 26, and the only one of those in the surviving set is 0.  So four of
+    # every five STEP_TROT_MAX repeats this project has run started at a phase where TROT
+    # falls on FLAT GROUND in under three seconds, and the ladder was scoring that.
     def entry_frames(rep: int) -> list:
-        return [int(round(rep * len(q) / max(args.reps, 1))) % len(q) for q in q_seq]
+        return [(int(round(rep * len(q) / max(args.reps, 1))) + int(args.entry_offset))
+                % len(q) for q in q_seq]
     goal2 = np.array([probes["goals"][i][1] for i in idx]) + offsets     # world frame
     foot_ids_t, _foot_names_t = robot.find_bodies(".*_foot")
     rows_out = []
@@ -831,7 +840,7 @@ def run_isaac(args) -> list:
         for k, (param, skill, family, i, level) in enumerate(runs):
             rows_out.append({"param": param, "skill": skill, "family": family,
                              "probe": probes["names"][i], "level_m": level, "rep": rep,
-                             "entry_frame": ent[k],
+                             "entry_frame": ent[k], "entry_offset": args.entry_offset,
                              # Which arm this row is, and what the actuator actually did.
                              # A row that does not say whether the yaw couple was on gets
                              # read wrong once; a peak hip torque at the limit means the
@@ -1059,6 +1068,10 @@ def main() -> int:
     ap.add_argument("--heading-len-cap", type=float, default=0.04,
                     help="magnitude bound on that half (rad). 0.04 is the largest amplitude "
                          "the open-loop probe survived on TROT; -0.06 fell at 2.77 s")
+    ap.add_argument("--entry-offset", type=int, default=0,
+                    help="shift every repeat's entry frame by this many frames. 0 (default) "
+                         "is the schedule every earlier grid run used. A MEASUREMENT knob: "
+                         "it changes no controller. See entry_frames() for why it exists.")
     ap.add_argument("--yaw-moment", choices=("off", "probe", "hold"), default="off",
                     help="off (default): position targets only, bit-identical to a run from "
                          "before this flag existed. probe: a CONSTANT feed-forward hip "

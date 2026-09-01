@@ -149,7 +149,32 @@ tracking that produces the gait.
 
 ---
 
-## 4. Regressions and the control group
+## 4. The paired 15-cell ladder: a null, and the null explains itself
+
+`trot_straight.md` §4b killed this term's predecessor on the `step_up` ladder, so the
+same design was run: `--params skill.STEP_TROT_MAX`, 15 cells at **identical world
+coordinates** in both arms, five entry phases, `--heading heading-only` throughout.
+Measured with `analyze_heading_ab.py`, over the **approach** — spawn to the obstacle line
+— which is the heading question.
+
+| | A, `--yaw-moment off` | B, gain 5 |
+|---|---|---|
+| curvature, median | 11.97 °/m | 12.06 °/m |
+| y drift at the lip, median | 0.77 m | 0.81 m |
+| fell | 11 / 15 | 11 / 15 |
+| reached the lip | 1 / 15 | 2 / 15 |
+
+**A null, and it should be read next to A's own 11.97 °/m against the flat rig's 3.20 for
+the same controller.** On this ladder TROT is being knocked over and the curvature is
+measuring the collapse, not the drift — `trot_straight.md` §0's trap, at a different
+scale. A heading term cannot help a robot falling off a step, and this one does not.
+
+§5 adds the other half of why: four of the five entry phases this grid uses are phases at
+which TROT falls on flat ground in under three seconds.
+
+---
+
+## 4b. Regressions and the control group
 
 - **`--yaw-moment off` reproduces the baseline exactly**: 3.20 °/m, yaw +2.12 °/s,
   v_x 0.663, stride 1.56 — every column of `heading_hold.md`'s TROT row.
@@ -160,7 +185,119 @@ tracking that produces the gait.
 
 ---
 
-## 5. Flags
+## 5. Entry phases: TROT walks at 4 of its 32, and the couple works at every one of them
+
+`trot_straight.md` §4b is the standing warning here: a controlled A/B at one realisation
+is a draw from a wide distribution of differences, not a small version of a controlled
+A/B at fifteen. So the flat rig gained `--entry-offset` (a measurement knob — it shifts
+where in its own cycle a clip is entered and changes no controller) and **all 32 of
+TROT's entry phases were run in both arms**, 64 runs, 40 s each.
+
+**The first result is not about the couple at all.**
+
+| | phases surviving the full 40 s, of 32 |
+|---|---|
+| `--yaw-moment off` | **4** — 0, 16, 17, 29 |
+| `--yaw-moment hold` | **3** — 0, 16, 17 |
+
+**TROT falls at 28 of its 32 entry phases on FLAT GROUND**, with heading hold on and
+nothing else, in 0.9–2.9 s. This is SESSION_STATE §7's item 1 ("the cheapest untried
+thing left") and it is a larger number than anything the heading work has produced.
+
+It also reframes everything scored on the `step_up` ladder. `entry_frames(rep)` sweeps
+the cycle uniformly, so at `--reps 5` it picks **0, 6, 13, 19, 26** — and the only one of
+those in the surviving set is **0**. Four of every five `STEP_TROT_MAX` repeats this
+project has ever run **started at a phase where TROT falls on flat ground in under three
+seconds**, and the ladder was scoring that. It is visible in the old CSV once you know
+to look: `steps` is 901 for rep 0 and 68 / 146 / 84 / 57 for reps 1–4, at every level.
+
+### Where the question is askable, the answer is 3 for 3
+
+Comparing the arms at a phase where the robot dies at 1 s is comparing two corpses —
+`trot_straight.md` §0's trap, where the whole-run curvature was reading the fall. On the
+three phases that survive in both arms:
+
+| entry phase | curvature off | curvature hold | v_x off → hold | stride off → hold |
+|---|---|---|---|---|
+| 0 | 3.204 | **0.014** | 0.663 → 0.664 | 1.56 → 1.56 |
+| 16 | 2.720 | **0.170** | 0.665 → 0.664 | 1.56 → 1.56 |
+| 17 | 2.814 | **0.004** | 0.665 → 0.665 | 1.56 → 1.56 |
+
+**0 of 3 inside the budget without it, 3 of 3 with it**, better at every phase, and
+forward speed and stride do not move at any of them.
+
+### The run it cost, and why that one is legible
+
+**Phase 29 survives 40 s with the term off (1.83 °/m) and rolls at 2.54 s with it on.**
+That is one run lost of the four the baseline had, and it is reported rather than
+dropped. The cap-hit column says what happened: on phases 0/16/17 the loop reaches its
+2.0 N·m cap on **0.0%** of stance-leg steps, and on phase 29 it reaches it on **19.9%**.
+The failure is the loop saturating, which is the same shape of failure `lip_failure.md`
+§3 found when the placement cap was widened — a saturated corrector is not a corrector.
+A lower cap or a rate limit is the obvious next thing and neither was tried.
+
+---
+
+## 6. What this does NOT do, and it is a different quantity
+
+**It does not fix the ladder.** §4's paired 15-cell null stands: on `step_up`, curvature
+is 11.97 °/m with the term off against the flat rig's 3.20 for the same controller,
+because there TROT is being knocked over at ~7 s and the curvature is the collapse. A
+heading term cannot help a robot falling off a step.
+
+**It does not remove the lateral offset.** On flat at gain 5 the robot ends 3.49 m to the
+side over a 26.6 m path — down from 19.09 m, but not gone. The reason is exactly
+`trot_straight.md` §3's, now working in the project's favour instead of against it: a P
+law holds a standing error, and here that error is small enough to sit inside the cap
+rather than pin it. Nulling the drift costs 0.49 N·m, so at gain 5 the equilibrium is
+0.49/5 = 0.098 rad ≈ 5.6°, and 26 m at a standing 5.6° is about 2.5 m of offset. The
+measured heading excursion is 15.4° and the measured offset 3.49 m, which is the same
+story.
+
+Two untried things follow directly and neither is a new mechanism: **feed the measured
+open-loop zero (0.49 N·m) forward underneath the loop**, so the loop only carries the
+residual and the standing error goes toward zero — this is `trot_straight.md` §4's idea,
+which failed there because the constant was in placement space and the loop fought it,
+and here the constant and the loop are the *same channel* and compose — or simply raise
+the gain, which §3 measures at a cost of 2.9% of forward speed by gain 40.
+
+**It does not make `STEP_TROT_MAX` measurable, and that is now established rather than
+suspected.** The obvious follow-up to §5 was to re-run the ladder at the phases TROT can
+actually walk at, since the grid had been sampling four dead ones out of five. Done — the
+15-cell ladder at entry phases 0, 16 and 17, both arms, 90 runs:
+
+| phase | arm | fell | reached goal 2 | median final dist | peak hip torque | saturated |
+|---|---|---|---|---|---|---|
+| 0 | off | 11/15 | 0 | 1.59 m | 23.66 N·m | 0 |
+| 0 | hold | 11/15 | 0 | 1.90 m | 18.03 N·m | 0 |
+| 16 | off | 10/15 | 0 | 1.79 m | 22.77 N·m | 0 |
+| 16 | hold | 12/15 | **1** | 1.60 m | 20.31 N·m | 0 |
+| 17 | off | 15/15 | 0 | 3.88 m | 16.40 N·m | 0 |
+| 17 | hold | 15/15 | 0 | 3.85 m | 12.56 N·m | 0 |
+
+**One cell of ninety reaches goal 2.** A phase at which TROT holds a line for 40 s on flat
+still does not get it past a 2 cm step, so the ladder's failure was never the entry phase
+either — it is upstream of both. `STEP_TROT_MAX` stays unmeasurable and the reason is now
+narrower: not the lane departure (`lip_failure.md` §4), not the heading (§3–5 here), and
+not the entry phase.
+
+Phase 17 is the one worth keeping: it reaches **3.85–3.88 m at every one of the fifteen
+levels**, the same distance on a 0.02 m step as on a 0.30 m one. A distance that does not
+respond to the level is not a step limit — it is something at a fixed place, and it is
+about 0.1 m short of goal 2.
+
+**The saturation question from §4 is also settled, by the control column that was missing
+there.** Peak hip torque on this terrain is **higher with the couple off** (23.66 / 22.77
+N·m) than with it on (18.03 / 20.31), and nothing saturated in any of the 90 runs. The
+terrain, not the couple, is what puts the hips near their clip.
+
+**Cross-track error is still not available to this controller**, by construction, and
+`trot_straight.md` §5 is still right that it is what closes the last of the gap. What has
+changed is that heading is no longer the binding one.
+
+---
+
+## 7. Flags
 
 `--yaw-moment off|probe|hold`, `--yaw-moment-nm`, `--yaw-moment-gain`,
 `--yaw-moment-cap-nm`, `--yaw-moment-skill`, on `run_planner_replay.py` and
