@@ -72,6 +72,16 @@ class FootPlacement:
     heading_len_cap_rad: float = 0.04   # magnitude bound on it; the window below is one-sided
     axis: str = "y"                     # y | xy
     vy_target: float = 0.0
+    #: Lateral velocity the CALLER wants on top of whatever this mode's target already is,
+    #: m/s, rewritten every control step.  It exists for cross-track hold: heading hold
+    #: pulls the yaw ANGLE back to the settle heading and nothing pulls the lateral
+    #: POSITION back, so a robot holds its heading and leaves the lane sideways anyway
+    #: (measured: WALK drifts 0.53 m sideways per metre forward, 149 of 200 cells to the
+    #: same side).  Added as a BIAS rather than by overwriting ``vy_target`` because the
+    #: yaw modes do not read ``vy_target`` at all -- they track the recording's own
+    #: ``vy_log`` -- so a target-only knob would have been silently dead in exactly the
+    #: arm that needs it.  0.0 reproduces every earlier run bit for bit.
+    vy_bias: float = 0.0
     cycle_len: int = 0                  # control steps in one clip cycle
     yaw_bias: float = 0.0               # open-loop steering probe, hips
     len_bias: float = 0.0               # open-loop steering probe, thighs
@@ -230,7 +240,7 @@ class FootPlacement:
             # (outputs/heading_candidates.md 3), so it is separable here rather than
             # carried on faith: `heading` is the full substitution, `heading-only` is
             # the half the evidence supports.
-            dvy = np.full(4, vy - self.vy_log)
+            dvy = np.full(4, vy - self.vy_log - self.vy_bias)
             dvx = np.zeros(4)
         elif self.yaw_mode != "off":
             if self.yaw_mode in ("log-cycle", "heading"):
@@ -241,12 +251,12 @@ class FootPlacement:
                 self._wz = self._wz_sum / self._wz_n        # warms up over one cycle
             else:
                 self._wz = wz
-            dvy = (vy - self.vy_log) + (self._wz - self.wz_log) * self.hip_x_m
+            dvy = (vy - self.vy_log - self.vy_bias) + (self._wz - self.wz_log) * self.hip_x_m
             dvx = ((vx - self.vx_log) - (self._wz - self.wz_log) * (self.hip_y_m
                    if self.hip_y_m is not None else 0.0)
                    if self.axis == "xy" and np.isfinite(self.vx_log) else np.zeros(4))
         else:
-            dvy = np.full(4, vy - self.vy_target)
+            dvy = np.full(4, vy - self.vy_target - self.vy_bias)
             dvx = (np.full(4, vx - self.vx_log)
                    if self.axis == "xy" and np.isfinite(self.vx_log) else np.zeros(4))
 

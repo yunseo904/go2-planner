@@ -215,6 +215,18 @@ def _frac(held: dict, name: str, k: int) -> float:
     return (held[name][k] / tot) if tot else 0.0
 
 
+def support_stats(contact) -> tuple:
+    """(mean feet down, fraction of the cycle below 3 feet) for a clip's contact channel.
+
+    The CLAUDE.md 2.5 gate is about the COMMANDED support pattern, which is a property of
+    the clip -- these arms replay it open loop, so nothing downstream chooses it.  See
+    scripts/support_polygon.py for the standalone reading and what the numbers mean.
+    """
+    c = np.asarray(contact, dtype=bool)
+    n = c.sum(axis=1)
+    return float(n.mean()), float((n < 3).mean())
+
+
 def aggregate(rows: list) -> dict:
     """Per-cell episode mean, then the equal-weight mean over cells."""
     per_cell = {}
@@ -1073,6 +1085,16 @@ def run_isaac(args) -> tuple:
           # run_calibration_grid.py already uses.
           _, _, yaw0 = quat_to_rpy_deg(snap(robot.data.root_quat_w))
           yaw_ref = np.asarray(yaw0, dtype=float)
+          # CROSS-TRACK datum, by exactly the same rule and for the same reason: the y each
+          # robot is asked to hold is the one IT settled at, read after the settle and per
+          # robot.  Proprioceptive -- it is the robot's own start line, not the lane's
+          # centre and not a goal, so this term has the same standing as heading hold and
+          # the planner never touches it.
+          y_ref = snap(robot.data.root_pos_w)[:, 1].astype(float).copy()
+          x_ref = snap(robot.data.root_pos_w)[:, 0].astype(float).copy()
+          ct_err = np.zeros(n)
+          ct_abs_max = np.zeros(n)
+          vy_b = np.zeros(n)
           foots = None
           rolls = None
           if args.foot_comp != "off":
@@ -1110,6 +1132,14 @@ def run_isaac(args) -> tuple:
                       vy_log=vy_log, wz_log=wz_log))
               print(f"[bench] *** FOOT PLACEMENT ON (cap {args.foot_clip_rad:g} rad): closes a "
                     f"loop on base lateral velocity and overwrites the recording. ***")
+              if args.cross_track != "off":
+                  print(f"[bench] *** CROSS-TRACK HOLD ON: gain {args.cross_track_gain:g} /s, "
+                        f"cap {args.cross_track_cap:g} m/s, datum = the y each robot SETTLED "
+                        f"at. Heading hold holds the ANGLE and nothing held the POSITION; "
+                        f"WALK drifts 0.53 m sideways per metre forward, 149/200 cells the "
+                        f"same way. This asks the lateral law for v_y = -gain * cross-track "
+                        f"error. Report PAIRED with --cross-track off, and check v_x and "
+                        f"the support count did not move. ***")
               if yaw_mode != "off":
                   print(f"[bench] *** HEADING HOLD --heading {args.heading} on "
                         f"{args.skill}, cap {hcap:g} rad: each robot holds the heading it "
@@ -1353,8 +1383,31 @@ def run_isaac(args) -> tuple:
                       psi = np.zeros(n)
                   roll_now, _pitch_now, _ = quat_to_rpy_deg(snap(robot.data.root_quat_w))
                   roll_now = np.asarray(roll_now, float)
+                  # CROSS-TRACK HOLD.  Heading hold closes a loop on the yaw ANGLE and
+                  # measures 13.26 -> 0.24 deg/m; nothing closes one on lateral POSITION,
+                  # and the robot drifts 0.53 m sideways per metre forward with 149 of 200
+                  # cells going the same way.  This asks the lateral law for a velocity
+                  # that returns to the start line: v_y,target = -gain * (y - y_ref),
+                  # bounded.  Body frame, so the error is rotated by the current yaw.
+                  # Measured on EVERY run, applied only when the flag is on, so the
+                  # paired off-arm reports its own excursion instead of a column of zeros.
+                  pw = snap(robot.data.root_pos_w)
+                  _, _, _yaw = quat_to_rpy_deg(snap(robot.data.root_quat_w))
+                  _yr = np.radians(np.asarray(_yaw, float))
+                  ex = pw[:, 0].astype(float) - x_ref
+                  ey = pw[:, 1].astype(float) - y_ref
+                  # cross-track error expressed in the body's lateral axis
+                  ect = -np.sin(_yr) * ex + np.cos(_yr) * ey
+                  ct_err[:] = ect
+                  ct_abs_max[:] = np.where(alive, np.maximum(ct_abs_max, np.abs(ect)),
+                                           ct_abs_max)
+                  if args.cross_track != "off":
+                      vy_b = np.clip(-args.cross_track_gain * ect,
+                                     -args.cross_track_cap, args.cross_track_cap)
                   for k in range(n):
                       if alive[k]:
+                          if args.cross_track != "off":
+                              foots[k].vy_bias = float(vy_b[k])
                           cmd[k] = cmd[k] + foots[k].step(float(vb[k, 1]), float(wb[k, 2]),
                                                           swing_seq[frame], vx=float(vb[k, 0]),
                                                           psi_err_rad=float(psi[k]))
@@ -1423,6 +1476,19 @@ def run_isaac(args) -> tuple:
                                 for k in range(n)])
           dist_last = np.array([np.linalg.norm(fin_xy[k] - goals[k, NUM_GOALS - 1])
                                 for k in range(n)])
+          # The commanded support pattern each robot actually ran (CLAUDE.md 2.5).  A
+          # single-skill arm holds one clip for the whole episode; a planner robot holds
+          # its own mixture, so it is weighted by the time that robot spent in each.
+          if PLANNER_ARM:
+              _sup = {nm: support_stats(c["contact"]) for nm, c in pl_clips.items()}
+              cmd_feet = [sum(_frac(pl_held, nm, k) * _sup[nm][0]
+                              for nm in pl_held if nm in _sup) for k in range(n)]
+              cmd_b3 = [sum(_frac(pl_held, nm, k) * _sup[nm][1]
+                            for nm in pl_held if nm in _sup) for k in range(n)]
+          else:
+              _m, _b = support_stats(clip["contact"])
+              cmd_feet = [_m] * n
+              cmd_b3 = [_b] * n
           for k, (t, l) in enumerate(cells):
               rows_out.append({"task": t, "task_name": names[t], "level": l, "episode": ep,
                                "goals": int(ended[k]), "settle_ok": int(settle_ok[k]),
@@ -1454,6 +1520,32 @@ def run_isaac(args) -> tuple:
                                # nothing, so this is the column that says it did not.
                                "vx_mean_ms": (float((fin_xy[k, 0] - spawns[k][0])
                                                     / max(upright[k] * dt, 1e-9))),
+                               # LATERAL speed, the companion to vx.  Heading hold pulls
+                               # the yaw angle back to the settle heading and nothing pulls
+                               # the lateral POSITION back, so a robot can face straight
+                               # down the lane and still leave it sideways.  vx alone
+                               # cannot show that; vy and the cross-track column below can.
+                               "vy_mean_ms": (float((fin_xy[k, 1] - spawns[k][1])
+                                                    / max(upright[k] * dt, 1e-9))),
+                               "cross_track_m": float(fin_xy[k, 1] - y_ref[k]),
+                               "cross_track_abs_max_m": float(ct_abs_max[k]),
+                               # Path curvature, rad per metre travelled: the yaw rate
+                               # divided by the forward speed.  A gait that turns because
+                               # it is slow and a gait that turns because it is curving
+                               # have the same yaw rate and different curvature.
+                               "curvature_rad_m": (
+                                   float(np.radians(yaw_cum[k])
+                                         / (fin_xy[k, 0] - spawns[k][0]))
+                                   if abs(fin_xy[k, 0] - spawns[k][0]) > 1e-3 else ""),
+                               # Did this robot fall?  end_cause carries the detail; this
+                               # is the column a falls-per-minute aggregate divides by, and
+                               # a timeout is not a fall.
+                               "fell": int(end_cause[k] in ("roll", "pitch", "below")),
+                               # This robot's own episode length in seconds -- the time it
+                               # was up, which is the episode for everything but a timeout.
+                               # mean(episode_s) is the "average episode length" and
+                               # sum(episode_s) is the denominator of falls per minute.
+                               "episode_s": float(upright[k] * dt),
                                "end_roll_deg": float(end_roll[k]),
                                "end_pitch_deg": float(end_pitch[k]),
                                "peak_roll_deg": float(peak_roll[k]),
@@ -1484,7 +1576,49 @@ def run_isaac(args) -> tuple:
                                "roll_sign": args.roll_sign if args.roll_couple != "off" else "",
                                "partial": int(n < full), "skill": args.skill,
                                "start_phase": args.start_phase, "foot_comp": args.foot_comp,
-                               "steps": step + 1})
+                               "steps": step + 1,
+                               # ---- run conditions, stamped on EVERY row -----------------
+                               # so that a results file can be aggregated months later
+                               # without the log beside it, and so that two files cannot be
+                               # pooled without the difference being visible in the data.
+                               "terrain_seed": args.terrain_seed,
+                               # There is no separate MEASUREMENT seed.  The arms replay a
+                               # recorded clip open loop with no sampling anywhere, which is
+                               # why the recorded and unrecorded runs of the same settings
+                               # come out bit-identical on every column (SESSION_STATE 5).
+                               # The terrain seed is the only randomness in a run.
+                               "measurement_seed": "deterministic",
+                               "episode_length_s": EPISODE_LENGTH_S,
+                               "episodes": args.episodes,
+                               # Robots in the scene = cells x episodes-per-batch.  We run
+                               # 200 (one per cell); legged_eval's own teacher runs report
+                               # num_envs 1000, which is the same 200 cells with 5 episodes
+                               # each.  Same protocol, five times the sample.
+                               "num_envs": n,
+                               "rate": args.rate,
+                               "gutter": args.gutter,
+                               "spawn_z": args.spawn_z,
+                               "settle_s": args.settle_s,
+                               "foot_clip_rad": args.foot_clip_rad,
+                               # HOW THE ROBOT IS STEERED.  Not "self" (nothing chooses a
+                               # direction from what it senses) and not "commander" (no
+                               # waypoint or velocity command reaches the gait).  Heading
+                               # hold remembers the heading the robot settled at and pulls
+                               # the yaw error back to it; the goals are scored against but
+                               # never steered toward.  That is a third category and it is
+                               # named rather than forced into one of the other two.
+                               "steering": ("dead-reckoned-heading-hold"
+                                            if args.heading != "off" else "open-loop"),
+                               "cross_track": args.cross_track,
+                               "cross_track_gain": (args.cross_track_gain
+                                                    if args.cross_track != "off" else ""),
+                               "cross_track_cap": (args.cross_track_cap
+                                                   if args.cross_track != "off" else ""),
+                               # The commanded support pattern this clip carries, from
+                               # scripts/support_polygon.py.  The CLAUDE.md 2.5 gate is
+                               # about this quantity, so it travels with the row.
+                               "cmd_mean_feet_down": round(float(cmd_feet[k]), 3),
+                               "cmd_frac_below_3_feet": round(float(cmd_b3[k]), 4)})
           if args.roll_couple != "off":
               # Key off the ARM, not off `rolls is not None`.  `rolls` is built whenever
               # --foot-comp is on, which includes the planner arm, where it is never
@@ -1574,6 +1708,23 @@ def main() -> int:
                     help="override the per-skill heading cap in rad. The default is the "
                          "HEADING_CAP table, measured by the open-loop steering probe.")
     ap.add_argument("--foot-clip-rad", type=float, default=0.05)
+    ap.add_argument("--cross-track", choices=("off", "hold"), default="off",
+                    help="CROSS-TRACK HOLD. off (default) reproduces every earlier run bit "
+                         "for bit. hold: ask the lateral placement law for a velocity that "
+                         "returns to the y the robot SETTLED at. Heading hold closes a loop "
+                         "on the yaw ANGLE (13.26 -> 0.24 deg/m) and nothing closes one on "
+                         "lateral POSITION, so a robot faces straight down the lane and "
+                         "leaves it sideways: measured 0.53 m of drift per metre forward, "
+                         "149 of 200 cells the same way. Same standing as heading hold -- "
+                         "the datum is the robot's own start line, no goal and no terrain "
+                         "is read, and the planner never sees it.")
+    ap.add_argument("--cross-track-gain", type=float, default=0.5, metavar="PER_S",
+                    help="m/s of lateral velocity target per metre of cross-track error. "
+                         "Sign and value are to be settled by measurement, not derivation.")
+    ap.add_argument("--cross-track-cap", type=float, default=0.10, metavar="MS",
+                    help="bound on the requested lateral velocity, m/s. WALK's own logged "
+                         "v_y is a few cm/s, so a cap well above that is asking the gait "
+                         "for something it has never done.")
     ap.add_argument("--allow-partial", action="store_true",
                     help="run fewer than all 200 cells. The printed mean is then a wiring "
                          "check and NOT a benchmark score; every row is stamped partial=1")
