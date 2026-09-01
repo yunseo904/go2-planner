@@ -170,6 +170,17 @@ def gait_from_contact(contact: np.ndarray, dt: float) -> dict:
         out.update(stride_hz=np.nan, stride_cv=np.nan, n_cycles=int(max(td.size - 1, 0)))
     airborne = (~c).all(axis=1)
     out["flight_frac"] = float(airborne.mean())
+    # SUPPORT POLYGON -- the CLAUDE.md 2.5 gate, measured on the feet the SIMULATOR has
+    # loaded rather than on the clip's commanded pattern.  The distinction is the whole
+    # point: an edit like --swing-lift does not touch the clip's contact channel at all,
+    # so a commanded-support reading cannot see it, and the actual feet are where the
+    # effect lives.  Reported here so every flat-rig row carries it and no intervention
+    # has to be trusted to measure its own side effect.
+    n_down = c.sum(axis=1)
+    out["feet_down_mean"] = float(n_down.mean())
+    out["feet_down_min"] = int(n_down.min())
+    out["frac_below_3_feet"] = float((n_down < 3).mean())
+    out["feet_down_hist"] = [int((n_down == k).sum()) for k in range(5)]
     return out
 
 
