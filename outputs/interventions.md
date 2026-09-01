@@ -101,3 +101,24 @@ implementation's form of the rear term is not what this project is missing.
 `sim/footcomp.py`'s self-test asserts that with D2–D4 at their defaults the law is
 **bit-identical** to the one that produced every earlier row.
 
+
+---
+
+## E · Added 2026-09-01/02
+
+| # | What | Default | Why | What it bought |
+|---|---|---|---|---|
+| E1 | **Terrain from `legged_eval`** `--terrain legged_eval` (`sim/legged_eval_terrain.py`) | **on** — this is the benchmark now | The frozen archive lacked eurekaverse's roughness (±0.02–0.04 m) and its 0.1 m / 0.5 m rim, so it was an easier course than the one the E2E numbers come from, and a different draw besides (180 of 200 cells differ). | The scores fell to their honest values: WALK 1.11 → 0.76, planner 1.07 → 0.57. Ablation: the roughness is **all** of it, the rim is **exactly 0.00**, the draw 0.02. `benchmark_legged_eval.md` |
+| E2 | **Depth perception** `--perception depth` | **on for the planner arm** (2026-09-02) | The experiment's premise is a robot that reads terrain from its own camera. Ground truth through a sensor model is the perception UPPER BOUND, not the result. | 0.60 against the optimistic control's 0.57 — the real sensor is not worse, because it never selects TROT (0 cells against 14). `oracle_and_depth.md` |
+| E3 | **Planner threshold override** `--planner-set skill.X=v` | none | `STEP_TROT_MAX` is 0.08 in the config and 0.02–0.04 measured, so the planner was choosing TROT under a belief 2–4× too generous. Overridden at run time only; the config keeps its `CALIBRATION_NEEDED` mark. | 0.57 → 0.59, better in 5 cells worse in 1, TROT usage 14 cells → 5. Real and small. |
+| E4 | **Roll couple** `--roll-couple hold` (`sim/attitude.py`) | **off** | Every termination on this grid is a roll termination — 200 of 200 in both roughness arms, not one pitch. Uniform feed-forward hip torque on the stance legs: the exact dual of B-series yaw couple on the same joint (uniform c → roll, `c·sign(x)` → yaw). | **WALK 0.73 → 0.82** (mean of 3 seeds, positive in all 3); **the arm, on depth, 0.60 → 0.69**. Authority used: peak 2.00 N·m of a 23.70 limit, at the cap on 14% of stance-leg-steps. `level2_results.md` |
+| E5 | **Benchmark side-view video** `--video` (run_benchmark) | off | D5's camera existed only in the calibration harness. | Regression check passed in its strongest form: the recorded run is the full 200 cells and its CSV is **identical to the unrecorded one on all 200 rows × 27 columns**. |
+
+**E4's authority, stated the way B-series is.**  Sign +1, settled by measurement and not by
+derivation (−1 scores 0.66 against off's 0.76 — the wrong sign is worse than off).  Gain 8
+N·m/rad, damp 0.8, cap 2.0 N·m, which is 2.0 of the hip's 23.70 and sits beside the yaw
+couple's 2.0 inside a stated half-limit budget.  Forward speed moves −6 / −5 / −1 % across
+three seeds, inside the ±10 % the falsification test allows; at gain 16 / cap 4 it scores
+higher (0.85) and moves **−19 %**, which is why the recommended point is not the
+highest-scoring one.  **WALK-only by table**: TROT gains 0.05 but loses 32 % of its speed,
+and TURN is worse with it on (0.17 → 0.14).
