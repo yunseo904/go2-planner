@@ -1161,6 +1161,22 @@ def run_isaac(args, clip: dict, meta: dict, then_clip: dict | None = None,
         cam = video["cam"]
         bx = float(robot.data.root_pos_w[0, 0].item())
         bz = float(robot.data.root_pos_w[0, 2].item())
+        # --video-view top puts the camera overhead looking down, which is the view an
+        # in-place turn actually needs: from the side a 90 deg rotation is a silhouette
+        # change and from above it is the motion itself.  Side stays the default so every
+        # earlier recording is reproduced.
+        if args.video_view == "top":
+            eye = torch.tensor([[bx, 0.0, args.video_top_m]],
+                               device=sim.device, dtype=torch.float32)
+            tgt = torch.tensor([[bx + 1e-3, 0.0, 0.0]], device=sim.device,
+                               dtype=torch.float32)
+            cam.set_world_poses_from_view(eye, tgt)
+            sim.render()
+            cam.update(dt, force_recompute=True)
+            _rgb = cam.data.output["rgb"][0].detach().cpu().numpy()
+            video["writer"].append_data(np.ascontiguousarray(_rgb[..., :3]).astype(np.uint8))
+            video["frames"] += 1
+            return
         eye = torch.tensor([[bx, args.video_side_m, max(0.35, bz + 0.12)]],
                            device=sim.device, dtype=torch.float32)
         tgt = torch.tensor([[bx, 0.0, 0.28]], device=sim.device, dtype=torch.float32)
@@ -1904,6 +1920,12 @@ def main() -> int:
                     help="capture every Nth control step (1 = every step, real time)")
     ap.add_argument("--video-fps", type=float, default=None,
                     help="force a frame rate; default is real time for the stride")
+    ap.add_argument("--video-view", choices=("side", "top"), default="side",
+                    help="side (default, and every earlier recording): a side elevation "
+                         "tracking the base. top: straight down from --video-top-m, which "
+                         "is the view an in-place turn needs.")
+    ap.add_argument("--video-top-m", type=float, default=3.0,
+                    help="camera height for --video-view top")
     ap.add_argument("--video-side-m", type=float, default=2.4,
                     help="camera distance abeam the robot, metres (+y side)")
     ap.add_argument("--then-clip", default=None,

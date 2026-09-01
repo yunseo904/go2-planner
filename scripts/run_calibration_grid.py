@@ -287,6 +287,7 @@ def run_isaac(args) -> list:
     from sim.replay import ground_material_cfg, quat_to_rpy_deg, set_robot_friction, snap
     from sim.footcomp import FootPlacement, stance_time_s
     from sim.yawmoment import YawMoment
+    from sim.attitude import RollCouple
     from planner.skills import SkillId, SUPPORTED  # noqa: F401
 
     probes = load_probes()
@@ -497,6 +498,7 @@ def run_isaac(args) -> list:
     # ITS clip pose -- the lever differs between clips and between cells, and the
     # single-robot runs showed a 7% spread in it.
     foots = None
+    rolls = None
     settle_ok = np.ones(n, dtype=bool)
     if args.foot_comp != "off":
         from verify_skill_replay import _log_motion_for
@@ -546,7 +548,8 @@ def run_isaac(args) -> list:
             com_h = np.where(np.isfinite(com_h), com_h, np.nanmedian(com_h))
         else:
             com_h = np.full(n, 0.31)
-        foots, yaws = [], []
+        foots, yaws, hxy_all = [], [], []
+        rolls = None
         for k, c in enumerate(per_robot_clip):
             lever = all_lever[k] if settle_ok[k] else med_lever
             hxy = np.array([quat_rotate_inv(bq[k][None, :], (bp[k, h_by[l]] - bpos[k])[None, :])[0, :2]
@@ -557,6 +560,7 @@ def run_isaac(args) -> list:
             if args.heading != "off" and c["name"] != "TURN":
                 yaw_mode = args.heading
                 hcap = args.heading_cap or HEADING_CAP.get(c["name"], 0.0)
+            hxy_all.append(hxy)
             foots.append(FootPlacement(
                 t_stance_s=stance_time_s(c["contact"], c["fs"]), lever_m=lever,
                 hip_x_m=hxy[:, 0], hip_y_m=hxy[:, 1], vy_log=vy_log, wz_log=wz_log,
@@ -583,6 +587,30 @@ def run_isaac(args) -> list:
                                                         if args.yaw_moment == "hold" else 0.0),
                                        cap_nm=ycap,
                                        effort_limit_nm=hip_effort_limit_nm))
+        # The roll couple, per robot, on the same joint as the yaw couple and disjoint
+        # from it by construction (uniform c gives roll, c*sign(x) gives yaw).  This is the
+        # PROBE layer for level 2: the benchmark says +0.09, and a score is a mixture --
+        # the question here is whether the STEP and GAP limits move.
+        rolls = [None] * n
+        if args.roll_couple != "off":
+            rolls = [None if (args.roll_couple_skill != "all"
+                              and c["name"] != args.roll_couple_skill)
+                     else RollCouple(lever_m=lever, hip_x_m=hxy_all[k][:, 0],
+                                     hip_y_m=hxy_all[k][:, 1],
+                                     bias_nm=args.roll_couple_nm,
+                                     kp_nm_per_rad=args.roll_gain,
+                                     kd_nm_per_rad_s=args.roll_damp,
+                                     cap_nm=args.roll_cap_nm, sign=args.roll_sign,
+                                     effort_limit_nm=hip_effort_limit_nm,
+                                     shared_with_nm=(yaws[k].cap_nm if yaws[k] else 0.0))
+                     for k, c in enumerate(per_robot_clip)]
+            print(f"[grid] *** ROLL COUPLE on {args.roll_couple_skill}: gain "
+                  f"{args.roll_gain:g} Nm/rad, damp {args.roll_damp:g}, cap "
+                  f"{args.roll_cap_nm:g} Nm, sign {args.roll_sign:+g} "
+                  f"({sum(r is not None for r in rolls)}/{n} robots). Report paired with "
+                  f"--roll-couple off. ***")
+        if not any(r is not None for r in rolls):
+            rolls = None
         if not any(y is not None for y in yaws):
             yaws = None
         else:
@@ -744,7 +772,8 @@ def run_isaac(args) -> list:
                 # at its default the heading term is identically zero and --heading
                 # silently does nothing, which is how the first re-run came back
                 # unimproved and looked like the controller had failed.
-                yaw_now = quat_to_rpy_deg(snap(robot.data.root_quat_w))[2]
+                roll_now_deg, _p_now, yaw_now = quat_to_rpy_deg(snap(robot.data.root_quat_w))
+                roll_now_deg = np.asarray(roll_now_deg, float)
                 psi = np.radians((yaw_now - yaw0_deg + 180.0) % 360.0 - 180.0)
                 for k in range(n):
                     cmd[k] = cmd[k] + foots[k].step(float(vb[k, 1]), float(wb[k, 2]),
@@ -752,7 +781,7 @@ def run_isaac(args) -> list:
                                                     psi_err_rad=float(psi[k]))
             tgt[:, idx_t] = torch.as_tensor(cmd, device=sim.device, dtype=torch.float32)
             robot.set_joint_position_target(tgt)
-            if yaws is not None:
+            if yaws is not None or rolls is not None:
                 # A separate call from the position target, and written EVERY step
                 # including the all-zero ones: an effort target is sticky, so skipping
                 # the write would leave the last non-zero torque applied for the rest of
@@ -761,8 +790,14 @@ def run_isaac(args) -> list:
                 eff = torch.zeros_like(tgt)
                 tau = np.zeros((n, 12))
                 for k in range(n):
-                    if yaws[k] is not None:
+                    if yaws is not None and yaws[k] is not None:
                         tau[k] = yaws[k].step(swing[k][frames[k]], psi_err_rad=float(psi[k]))
+                    if rolls is not None and rolls[k] is not None:
+                        # ADDED, not replacing: duals on one joint, so they superpose.
+                        tau[k] = tau[k] + rolls[k].step(
+                            swing[k][frames[k]],
+                            roll_rad=float(np.radians(roll_now_deg[k])),
+                            roll_rate_rad_s=float(wb[k, 0]))
                 eff[:, idx_t] = torch.as_tensor(tau, device=sim.device, dtype=torch.float32)
                 robot.set_joint_effort_target(eff)
             for _ in range(decim):
@@ -846,6 +881,9 @@ def run_isaac(args) -> list:
                              # read wrong once; a peak hip torque at the limit means the
                              # gait was being starved to pay for the couple, and that must
                              # not have to be inferred from the outcome.
+                             "roll_couple": args.roll_couple,
+                             "roll_gain": args.roll_gain if args.roll_couple != "off" else "",
+                             "roll_cap_nm": args.roll_cap_nm if args.roll_couple != "off" else "",
                              "yaw_moment": args.yaw_moment,
                              "yaw_moment_nm": args.yaw_moment_nm,
                              "yaw_moment_gain": args.yaw_moment_gain,
@@ -1074,6 +1112,17 @@ def main() -> int:
                          "the same number run_planner_replay.py --entry-frame takes. 0 "
                          "(default) is the schedule every earlier grid run used. A "
                          "MEASUREMENT knob: it changes no controller.")
+    ap.add_argument("--roll-couple", choices=("off", "hold"), default="off",
+                    help="the level-2 roll couple (sim/attitude.py), measured HERE rather "
+                         "than on the benchmark: a score is a mixture, a step limit is not. "
+                         "Default off; report paired.")
+    ap.add_argument("--roll-couple-skill", default="WALK",
+                    help="which clip gets it, or 'all'")
+    ap.add_argument("--roll-gain", type=float, default=8.0)
+    ap.add_argument("--roll-damp", type=float, default=0.8)
+    ap.add_argument("--roll-cap-nm", type=float, default=2.0)
+    ap.add_argument("--roll-couple-nm", type=float, default=0.0)
+    ap.add_argument("--roll-sign", type=float, default=1.0, choices=(1.0, -1.0))
     ap.add_argument("--yaw-moment", choices=("off", "probe", "hold"), default="off",
                     help="off (default): position targets only, bit-identical to a run from "
                          "before this flag existed. probe: a CONSTANT feed-forward hip "

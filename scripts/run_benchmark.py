@@ -703,6 +703,30 @@ def run_isaac(args) -> tuple:
         yaw_mode = args.heading
         vy_log, wz_log = _log_motion_for(
             json.loads(SKILL_CLIPS_META_JSON.read_text()), clip["name"])
+    # AN IN-PLACE TURN NEEDS ITS OWN LOGGED YAW RATE, whatever --heading says.
+    #
+    # outputs/turn_target.md: the placement law drives every foot toward v_y = 0, and for a
+    # turn a lateral foot velocity is not an error, it is the motion.  The fix was to give
+    # the law the log's own omega.  The PLANNER arm has had it since (ymode = "log-cycle"
+    # if nm == "TURN"); the SINGLE-SKILL arm never did, because the only way to run TURN is
+    # --heading off (HEADING_CAP has no TURN entry and a cap of 0 is refused), and that
+    # skips the block above -- leaving wz_log at 0.0.  So the TURN baseline has been
+    # measured with its placement law told the robot is not turning.
+    #
+    # Measured: flat rig with the yaw term  -16.3 to -18.9 deg/s (72-83% of the log)
+    #           benchmark without it         -7.8 to  -8.7 deg/s (34-38%)
+    #
+    # This is not a new intervention -- it is the law turn_target.md already established,
+    # applied to the arm that was denied it.  --foot-yaw-turn off reproduces the old rows.
+    if clip["name"] == "TURN" and args.foot_yaw_turn == "auto" and args.foot_comp != "off":
+        yaw_mode = "log-cycle"
+        hcap = 0.0
+        vy_log, wz_log = _log_motion_for(
+            json.loads(SKILL_CLIPS_META_JSON.read_text()), clip["name"])
+        print(f"[bench] *** TURN gets its LOGGED yaw rate ({wz_log:+.4f} rad/s) in the "
+              f"placement law. Without it the law targets zero rotation and fights the "
+              f"turn -- that is outputs/turn_target.md, and this arm had never had the "
+              f"fix. --foot-yaw-turn off reproduces the earlier TURN rows. ***")
     idx_by_name = {nm: i for i, nm in enumerate(robot.joint_names)}
     want = [f"{l}_{j}_joint" for l in clip["leg_order"] for j in clip["joint_order"]]
     jidx = [idx_by_name[w] for w in want]
@@ -1452,6 +1476,7 @@ def run_isaac(args) -> tuple:
                                "perception": args.perception,
                                "turn_target": args.turn_target,
                                "swing_lift_mm": args.swing_lift,
+                               "foot_yaw_turn": args.foot_yaw_turn,
                                "roll_couple": args.roll_couple,
                                "roll_gain": args.roll_gain if args.roll_couple != "off" else "",
                                "roll_damp": args.roll_damp if args.roll_couple != "off" else "",
@@ -1577,6 +1602,11 @@ def main() -> int:
                          "0.495 m, so the first recording was 20 s of a grey wall. 0.95 m "
                          "puts the crossing at 0.82 m -- clear by 0.33 -- for a 16 deg "
                          "look-down, which still reads as a side view.")
+    ap.add_argument("--foot-yaw-turn", choices=("auto", "off"), default="auto",
+                    help="auto (default): a TURN clip's placement law is given the log's own "
+                         "yaw rate, which is what turn_target.md established and what the "
+                         "planner arm already does. off: reproduces the single-skill TURN "
+                         "rows measured before 2026-09-02, which had it at zero.")
     ap.add_argument("--swing-lift", type=float, default=0.0, metavar="MM",
                     help="raise every swing foot's apex to this height, mm. The earlier "
                          "ladder (0/40/60/80) found the untouched recording best, but that "
