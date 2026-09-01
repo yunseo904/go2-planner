@@ -184,6 +184,15 @@ Go2 파쿠르: 룰베이스 스킬 플래너 vs E2E 학습 정책 비교 (Isaac 
 - `.npz` 등 대용량은 gitignore, 해시 파일과 CSV 요약은 커밋한다 (임계값 근거 자료).
 - **커밋 메시지에 `Co-Authored-By:` 나 "Generated with Claude Code" 류의 서명을 넣지 않는다.**
   도구 이름은 이 리포의 기록이 아니다. 무엇을 왜 바꿨는지만 남긴다.
+  이유는 취향이 아니다: `Co-Authored-By:` 트레일러는 GitHub 이 **기여자(contributor)
+  목록에 실제 계정으로 띄운다.** 한 번 올라가면 지우는 데 히스토리 재작성과 강제 푸시가
+  필요하다 (2026-09-01 에 한 번 했다). 예외 없다 — 커밋마다, 스쿼시마다, 리베이스마다.
+  커밋 전 확인:
+
+  ```bash
+  git log --all --grep='Co-Authored-By' --oneline   # 0 줄이어야 한다
+  git log --all --grep='Generated with' --oneline   # 0 줄이어야 한다
+  ```
 - **작성자는 `user.name = yunseo904`, `user.email = yunseotwo@gmail.com` 으로 고정한다.**
   전역 `~/.gitconfig` 에는 사용자 정보가 없으므로 리포 로컬 설정이 정본이다. 새로 클론하면
   가장 먼저 다음을 실행한다:
