@@ -84,6 +84,15 @@ if [ "$GPU" = "none" ]; then
   [ "${LIVE:-0}" = "1" ] && echo "[docker] WARNING LIVE=1 needs a GPU; see above." >&2
 fi
 
+# PhysX can flood one warning line per contact per step. One run wrote 271 MB of
+# "Reached maximum number of allocated blocks", two orphaned ones wrote 11.5 GB between
+# them, and none of it was information. Drop that one line at the source; everything else
+# passes through untouched. Set LOGCAP=0 to see it.
+FILTER=cat
+if [ "${LOGCAP:-1}" = "1" ]; then
+  FILTER='grep --line-buffered -v "Reached maximum number of allocated blocks"'
+fi
+
 exec docker run --rm --name "$NAME" ${GPUARG} \
   --entrypoint bash --user "$(id -u):$(id -g)" \
   ${NET} \
@@ -100,4 +109,4 @@ exec docker run --rm --name "$NAME" ${GPUARG} \
   -v "$HERE/_isaac_docker_inside.sh":/opt/inside.sh:ro \
   -v "$IHOME":/ihome \
   -v "$HOME/isaaclab_cache/kit":/isaac-sim/kit/cache \
-  "$IMG" /opt/inside.sh "$@"
+  "$IMG" /opt/inside.sh "$@" 2>&1 | eval $FILTER
