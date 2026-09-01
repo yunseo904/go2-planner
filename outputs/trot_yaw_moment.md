@@ -291,6 +291,28 @@ there.** Peak hip torque on this terrain is **higher with the couple off** (23.6
 N·m) than with it on (18.03 / 20.31), and nothing saturated in any of the 90 runs. The
 terrain, not the couple, is what puts the hips near their clip.
 
+### The feed-forward under the loop — run, and it works
+
+The first of those two was one flag combination away, so it was run:
+`--yaw-moment hold --yaw-moment-gain 5 --yaw-moment-nm 0.49`, at all three surviving
+phases.
+
+| | off | gain 5 | gain 5 + 0.49 N·m FF |
+|---|---|---|---|
+| curvature (net) | 3.175 | **0.035** | 0.111 °/m |
+| heading excursion | 89.9° | 15.4° | **13.4°** |
+| **lateral drift** | **19.09 m** | **3.49 m** | **1.25 m** |
+| along the launch heading | 15.00 | 26.31 | **26.38** m (of a 26.45 m path) |
+| v_x | 0.663 | 0.664 | 0.662 |
+| curvature at phases 0 / 16 / 17 | — | 0.014 / 0.170 / 0.004 | 0.07 / 0.19 / 0.13 |
+
+**The lateral offset falls by another factor of 2.8**, and it survives all three phases.
+Net curvature goes slightly *up* (0.035 → 0.111) and both are far inside the 0.565 budget,
+so the trade is a metric that is already met against the one `trot_straight.md` §5 says
+actually fails the goals. **This is `trot_straight.md` §4's idea working**, and the
+difference is that there the constant was in placement space and the P loop fought it
+(arm D, 9.10 °/m), while here the constant and the loop are the *same channel* and add.
+
 **Cross-track error is still not available to this controller**, by construction, and
 `trot_straight.md` §5 is still right that it is what closes the last of the gap. What has
 changed is that heading is no longer the binding one.

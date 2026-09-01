@@ -85,11 +85,15 @@ on the surviving phases, **19.9%** on phase 29.
   **3.85–3.88 m at every one of the fifteen levels**, the same on a 0.02 m step as on a
   0.30 m one, which is not a step limit but something at a fixed place ~0.1 m short of
   goal 2. **That is the next thing to look at.**
-- **It does not remove the lateral offset** (3.49 m over 26.6 m on flat). That is the P
-  law's standing error, ≈5.6° at gain 5, and two untried things follow directly: feed the
-  measured 0.49 N·m forward underneath the loop (same channel as the loop, so unlike
-  `trot_straight.md` §4 they compose rather than fight), or raise the gain, which costs
-  2.9% of forward speed by gain 40.
+- **It does not remove the lateral offset entirely**, though the feed-forward takes most
+  of what was left. At gain 5 the robot ends 3.49 m to the side of a 26.6 m path (down
+  from 19.09); adding the measured open-loop zero underneath the loop
+  (`--yaw-moment-nm 0.49`) takes it to **1.25 m**, with the heading excursion 15.4° → 13.4°
+  and net curvature 0.035 → 0.111 °/m — both far inside the 0.565 budget, so the trade is
+  on a metric already met against the one that actually fails goals. Survives all three
+  phases (0.07 / 0.19 / 0.13 °/m). **This is `trot_straight.md` §4's idea working**: there
+  the constant was in placement space and the P loop fought it; here they are the same
+  channel and add.
 
 ## 4. Control group
 
@@ -127,11 +131,9 @@ terrain puts the hips near their clip, not the couple.
 1. **Phase 17's 3.85–3.88 m**, identical at all fifteen levels. A distance that does not
    respond to the level is not a step limit. That is where `STEP_TROT_MAX` actually dies
    and nothing has looked at it.
-2. **Feed 0.49 N·m forward underneath the loop** and re-measure the lateral offset. One
-   flag combination, already built (`--yaw-moment hold --yaw-moment-nm 0.49`), not run.
-3. **The full 200-cell benchmark with `--heading heading-only`**, paired with off. The
+2. **The full 200-cell benchmark with `--heading heading-only`**, paired with off. The
    flag is wired and smoke-tested; the run has not been done.
-4. **`effort_limit`** (`jump_torque.md`, three options) is still the user's call and still
+3b. **`effort_limit`** (`jump_torque.md`, three options) is still the user's call and still
    gates JUMP entirely.
 5. RUN, JUMP and WALK-4cm were **not touched this session** — deferred by the priority
    order, not by a finding.
