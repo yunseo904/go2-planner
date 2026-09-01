@@ -242,3 +242,97 @@ def compare_pose(clip_pose, cfg: Go2Config, legs: List[str], joints: List[str]) 
         }
     return ConventionCheck(names, d.tolist(), a.tolist(), (a - d).tolist(),
                            best, float(np.abs(a - d).mean()), best_err, per)
+
+
+def _fold(node):
+    """literal_eval, plus the constant arithmetic this config is written in.
+
+    ``ast.literal_eval`` refuses ``0.245 + 0.027`` and ``int(640 / 6)``, and CustomDepthCfg
+    writes its mount and its resolution exactly that way -- as the sum of the two offsets
+    that make it up, and as the D435's resolution over the scale factor.  Those spellings
+    are the documentation, so they are folded here rather than transcribed as 0.272 and 106.
+    Numbers, the four arithmetic operators, unary minus and ``int()`` only; anything else
+    raises and the field is skipped.
+    """
+    if isinstance(node, ast.Constant):
+        return node.value
+    if isinstance(node, (ast.List, ast.Tuple)):
+        return [_fold(e) for e in node.elts]
+    if isinstance(node, ast.Dict):
+        return {_fold(k): _fold(v) for k, v in zip(node.keys, node.values)}
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+        v = _fold(node.operand)
+        return v if isinstance(node.op, ast.UAdd) else -v
+    if isinstance(node, ast.BinOp):
+        a, b = _fold(node.left), _fold(node.right)
+        for op, fn in ((ast.Add, lambda x, y: x + y), (ast.Sub, lambda x, y: x - y),
+                       (ast.Mult, lambda x, y: x * y), (ast.Div, lambda x, y: x / y)):
+            if isinstance(node.op, op):
+                return fn(a, b)
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
+            and node.func.id == "int" and len(node.args) == 1:
+        return int(_fold(node.args[0]))
+    raise ValueError(f"not a constant expression: {ast.dump(node)[:60]}")
+
+
+def depth_cfg(root: Path | None = None) -> Dict[str, object]:
+    """``CustomDepthCfg`` out of the same read-only upstream file.
+
+    The depth arm has to be the fork's camera or it is not measuring the fork's robot:
+    the mount, the field of view, the resolution, the crop, the two noises, the update
+    rate and the one-step latency are all things a policy is trained against.  Parsed with
+    ``ast`` for the same reason as ``load()`` -- the file imports ``isaaclab`` and cannot be
+    imported here, and a copy of these numbers would drift silently.
+
+    ``blur_prob`` and ``erase_prob`` are read but are 0.0 upstream; the caller applies only
+    what is non-zero, and a future non-zero value shows up here rather than being ignored.
+    """
+    src_path = (root or paths.require_upstream()) / CONFIG_REL
+    tree = ast.parse(src_path.read_text())
+    node = None
+    for n in ast.walk(tree):
+        if isinstance(n, ast.ClassDef) and n.name == "CustomDepthCfg":
+            node = n
+    if node is None:
+        raise KeyError(f"CustomDepthCfg not found in {src_path}")
+
+    vals: Dict[str, object] = {}
+    for stmt in node.body:
+        if not isinstance(stmt, ast.Assign) or len(stmt.targets) != 1:
+            continue
+        tgt = stmt.targets[0]
+        try:
+            val = _fold(stmt.value)
+        except (ValueError, KeyError, TypeError):
+            continue          # e.g. processed_resolution, which names other fields
+        if isinstance(tgt, ast.Name):
+            vals[tgt.id] = val
+        elif isinstance(tgt, ast.Tuple):
+            # `crop_top, crop_bottom, crop_left, crop_right = 0, 0, 8, 8` -- the crop is
+            # written as one line and it is the field this parser most needs.
+            names = [e.id for e in tgt.elts if isinstance(e, ast.Name)]
+            if len(names) == len(tgt.elts) and isinstance(val, list) \
+                    and len(val) == len(names):
+                vals.update(dict(zip(names, val)))
+
+    pos = tuple(float(v) for v in vals["position"]["mean"])
+    res = tuple(int(v) for v in vals["original_resolution"])
+    cl, cr = int(vals["crop_left"]), int(vals["crop_right"])
+    ct, cb = int(vals["crop_top"]), int(vals["crop_bottom"])
+    return {
+        "pos": pos,
+        "pitch_rad": float(vals["rotation"]["mean"][1]),
+        "horizontal_fov": float(vals["horizontal_fov"]),
+        "resolution": res,                                   # (w, h) as rendered
+        "processed": (res[0] - cl - cr, res[1] - ct - cb),   # (w, h) after the crop
+        "crop_left": cl, "crop_right": cr, "crop_top": ct, "crop_bottom": cb,
+        "near_clip": float(vals["near_clip"]),
+        "far_clip": float(vals["far_clip"]),
+        "bias_noise": float(vals["bias_noise"]),
+        "granular_noise": float(vals["granular_noise"]),
+        "blackout_noise": float(vals["blackout_noise"]),
+        "blur_prob": float(vals["blur_prob"]),
+        "erase_prob": float(vals["erase_prob"]),
+        "update_interval": int(vals["update_interval"]),
+        "delay_steps": int(vals["depth_delay_steps"]),
+    }

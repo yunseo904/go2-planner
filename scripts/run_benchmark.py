@@ -346,8 +346,28 @@ def self_test() -> int:
     ok("the same run seed draws the same terrain",
        np.array_equal(g.cells[(0, 0)].hf_raw, LET.build(seed=1).cells[(0, 0)].hf_raw))
 
-    # 9. the grid places every cell disjointly and keeps its own heights
     z = LET.as_archive(g)
+
+    # 8b. THE PRIVILEGED MAP IS THE TERRAIN THE ROBOT IS STANDING ON.
+    #
+    # legged_eval's rule_walker adapter has the bug this guards against: its RULE_ORACLE
+    # mode loads go2-planner/data/benchmark_frozen.npz as its privileged height map while
+    # the simulator runs legged_eval's terrain underneath -- a different draw, no roughness,
+    # no rim.  It marks such runs unscorable, so nothing published is wrong, but the
+    # comparison it exists to support does not hold.  Here the optimistic arm reads the SAME
+    # dict the mesh was built from, and this asserts it cell for cell.
+    from planner.features import maps_from_archive as _mfa
+    _maps = _mfa(z)
+    _nlev = z["height_fields_before_fix"].shape[1]
+    ok("the optimistic arm's privileged map is the terrain under the robot, all 200 cells",
+       all(np.allclose(_maps[t * _nlev + l].height_m,
+                       g.cells[(t, l)].hf_raw * g.vertical_scale)
+           and _maps[t * _nlev + l].task == g.names[t]
+           for t in range(20) for l in range(10)))
+    ok("that map carries the roughness and the rim, not the clean course",
+       not np.allclose(_maps[0].height_m, g.cells[(0, 0)].hf_clean_m))
+
+    # 9. the grid places every cell disjointly and keeps its own heights
     cells = [(t, l) for t in range(3) for l in range(10)]
     V, F, spawns, goals, offs, (rows_, cols_), (Lx, Ly), grp = build_grid(z, cells)
     ok(f"grid {rows_}x{cols_} holds {len(cells)} cells", rows_ * cols_ >= len(cells))
@@ -433,6 +453,48 @@ def run_isaac(args) -> tuple:
 
     z, grid = load_terrain(args)
     terr = terrain_stamp(args, grid)
+
+    # --planner-set: the planner's own thresholds, overridden FOR THIS RUN ONLY.
+    #
+    # planner/config.py keeps STEP_TROT_MAX at 0.08 m marked CALIBRATION_NEEDED while
+    # SESSION_STATE 7 measured TROT's step bracket at 0.02-0.04 m, so the planner has been
+    # choosing TROT under a belief about itself that is 2-4x too generous.  Overriding it
+    # here rather than in the config is deliberate: a placeholder that has been quietly
+    # replaced by a run argument is still a placeholder, and the bracket came from three
+    # entry phases, which is a direction and not a calibration.  The override is stamped on
+    # every row so a run under it can never be read as a run under the config.
+    # The depth noise is drawn here, not by the fork, so it needs a stated seed. It follows
+    # the terrain seed for the same reason the terrain does: seed 1 must be seed 1 for every
+    # model, and 1/2/3 must be three draws whose spread is the error bar.
+    _rng = np.random.default_rng(args.terrain_seed)
+    # Half-width of legged_eval's robot-local map.  Read off that module rather than
+    # written as 2.0, because it is also where the planner is told it is standing.
+    _DTM_Y_HALF = 2.0
+    if args.perception == "depth":
+        LET._import_legged_eval()
+        from legged_eval.adapters import depth_terrain as _dtm
+        _DTM_Y_HALF = float(_dtm.Y_HALF)
+
+    # Resolved HERE and not further down.  It only depends on args, and the depth camera
+    # has to be constructed before sim.reset() while the old site was after it -- reading it
+    # early cost a run to a NameError that Kit reports as exit status 0 with no traceback,
+    # which is harness_findings.md 17 exactly.
+    PLANNER_ARM = args.skill.upper() == "PLANNER"
+
+    pcfg = PLANNER_CFG
+    pset = {}
+    for item in (args.planner_set or []):
+        key, _, val = item.partition("=")
+        if not val:
+            raise SystemExit(f"[bench] --planner-set wants group.FIELD=value, got {item!r}")
+        pset[key.strip()] = float(val)
+    if pset:
+        pcfg = PLANNER_CFG.replace(**pset)
+        print("[bench] *** PLANNER THRESHOLDS OVERRIDDEN FOR THIS RUN ***")
+        for k, v in sorted(pset.items()):
+            grp, _, nm = k.partition(".")
+            print(f"[bench]     {k} = {v:g}  (config: {getattr(getattr(PLANNER_CFG, grp), nm):g})")
+    planner_stamp = ";".join(f"{k}={v:g}" for k, v in sorted(pset.items()))
     cells, names, ts, ls = cell_list(z, args.tasks, args.levels)
     n = len(cells)
     full = len(names) * int(z["num_rows"])
@@ -509,6 +571,55 @@ def run_isaac(args) -> tuple:
     # untouched -- same phys_dt, same decimation, same order of writes, same control rate.
     # That is an argument, not a proof, so --video also prints the regression check the
     # user asked for: run the same cells with and without it and compare goals and steps.
+    # ---------------------------------------------------------------- depth camera
+    # The REAL perception arm.  --perception optimistic (the default) hands the planner
+    # the terrain's own height field through planner.features' sensor model: ground truth,
+    # range- and resolution-limited but never occluded, never noisy, never shaken by the
+    # body's own pitch.  --perception depth renders what the robot can actually see and
+    # inverts it, so the planner's input is an observation.
+    #
+    # The camera is eurekaverse's own, field for field, read off CustomDepthCfg rather than
+    # restated: same mount, same 87 deg, same 106x60, same update rate, same one-step delay.
+    # The inversion is legged_eval's (adapters/depth_terrain.py) -- the second copy of a
+    # depth-to-heightmap that this project must not grow.
+    depth = None
+    if args.perception == "depth":
+        if not PLANNER_ARM:
+            raise SystemExit("[bench] --perception depth is only meaningful for "
+                             "--skill PLANNER; a fixed clip does not look at anything.")
+        from isaaclab.sensors import TiledCamera, TiledCameraCfg
+        from scipy.spatial.transform import Rotation as _R
+        DC = IC.depth_cfg()
+        aperture = 20.955
+        focal = aperture / (2 * np.tan(np.radians(DC["horizontal_fov"]) / 2))
+        quat_xyzw = tuple(_R.from_euler("y", DC["pitch_rad"]).as_quat())
+        w_, h_ = DC["resolution"]
+        cam_cfg = TiledCameraCfg(
+            prim_path="/World/envs/env_.*/Robot/base/front_cam",
+            offset=TiledCameraCfg.OffsetCfg(pos=DC["pos"], rot=quat_xyzw,
+                                            convention="world"),
+            data_types=["distance_to_image_plane"],
+            spawn=sim_utils.PinholeCameraCfg(focal_length=focal,
+                                             horizontal_aperture=aperture,
+                                             clipping_range=(0.05, 20.0)),
+            width=w_, height=h_,
+            # Posed on demand from the loop, at the same cadence the fork uses.
+            update_period=0.0)
+        try:
+            depth = {"cam": TiledCamera(cam_cfg), "cfg": DC, "buf": None, "frames": 0,
+                     "reported": False}
+        except BaseException:
+            # Kit swallows this otherwise: harness_findings.md 17.
+            import traceback
+            sys.stderr.write("\n[bench] depth camera construction FAILED:\n")
+            traceback.print_exc(file=sys.stderr); sys.stderr.flush()
+            raise
+        print(f"[bench] depth camera: {w_}x{h_} -> {DC['processed']}, "
+              f"{DC['horizontal_fov']} deg, mount {DC['pos']} pitched "
+              f"{np.degrees(DC['pitch_rad']):.1f} deg down, "
+              f"every {DC['update_interval']} control steps, "
+              f"{DC['delay_steps']} step of latency, clip {DC['near_clip']}-{DC['far_clip']} m")
+
     video = None
     if args.video:
         from isaaclab.sensors import Camera, CameraCfg
@@ -550,7 +661,6 @@ def run_isaac(args) -> tuple:
     #
     # It is still an OPTIMISTIC perception arm and has to be reported as one: the geometry
     # is ground truth put through a sensor model, not a rendered depth image.
-    PLANNER_ARM = args.skill.upper() == "PLANNER"
     clip = load_clip("WALK" if PLANNER_ARM else args.skill, args.rate)
     # --heading, resolved once.  The cap is the skill's own, from the open-loop steering
     # probe (outputs/heading_candidates.md 2): WALK took +-0.04 rad with no measurable
@@ -646,7 +756,7 @@ def run_isaac(args) -> tuple:
         for nm in ("WALK", "TROT", "TURN"):
             c = load_clip(nm, args.rate)
             kf_, note_ = 0, f"--start-phase {args.start_phase}"
-            m_ = int(getattr(PLANNER_CFG.skill, f"ENTRY_FRAME_{nm}", -1))
+            m_ = int(getattr(pcfg.skill, f"ENTRY_FRAME_{nm}", -1))
             if nm == "TURN" and m_ >= 0:
                 kf_, note_ = m_ % len(c["q_des"]), "MEASURED, turn_entry_phase.md"
             elif args.start_phase == "measured" and m_ >= 0:
@@ -705,6 +815,63 @@ def run_isaac(args) -> tuple:
     n_settle = max(int(args.settle_s / dt), 1)
     ep_steps = int(EPISODE_LENGTH_S / dt)
     tracker = GoalTracker(goals, dt)
+
+    def depth_normalised():
+        """One depth frame per env, in the fork's own [-0.5, +0.5] convention.
+
+        legged_robot.update_depth_buffer + process_depth_image, in order and with the same
+        constants: negate to the Isaac Gym sign and back, crop the noisy edges, clip the
+        infinities a miss returns, add the granular and blackout noise, clip to
+        near/far, normalise.  blur and erase are 0.0 in the config and are not applied.
+        """
+        DC = depth["cfg"]
+        d = depth["cam"].data.output["distance_to_image_plane"]
+        d = d.squeeze(-1).detach().cpu().numpy().astype(np.float32)   # (n, h, w), metres
+        cl, cr = DC["crop_left"], DC["crop_right"]
+        ct, cb = DC["crop_top"], DC["crop_bottom"]
+        d = d[:, ct:d.shape[1] - cb if cb else None, cl:d.shape[2] - cr]
+        d = np.clip(np.nan_to_num(d, nan=1e6, posinf=1e6, neginf=-1e6), -1e6, 1e6)
+        if DC["granular_noise"]:
+            d = d + DC["granular_noise"] * _rng.standard_normal(d.shape).astype(np.float32)
+        if DC["blackout_noise"]:
+            d[_rng.random(d.shape) < DC["blackout_noise"]] = 0.0
+        d = np.clip(d, DC["near_clip"], DC["far_clip"])
+        return (d - DC["near_clip"]) / (DC["far_clip"] - DC["near_clip"]) - 0.5
+
+    def depth_maps():
+        """The delayed depth frame, inverted to one robot-local TerrainMap per env.
+
+        Unseen cells come back NaN and are filled with 0 -- the ground continues.  That is
+        legged_eval's own choice in depth_terrain.local_map() and its reasons are recorded
+        there: pulling the nearest observed value across invents obstacles that were never
+        seen, and leaving the NaN makes planner.features count every unobserved cell as a
+        pit, which is most of the frame.
+        """
+        from legged_eval.adapters import depth_terrain as DTM
+        from planner.features import TerrainMap
+        g = snap(robot.data.projected_gravity_b)
+        H, cov, _z0 = DTM.local_maps_batch(depth["buf"], g)
+        if not depth["reported"]:
+            depth["reported"] = True
+            d = depth["buf"]
+            near = float((d < 0.49).mean())     # anything the far clip did not swallow
+            print(f"[bench] depth check: {depth['frames']} frame(s), buffer "
+                  f"{d.shape} in [{d.min():+.3f}, {d.max():+.3f}], "
+                  f"{100*near:.1f}% of pixels returned inside 2 m, "
+                  f"map coverage {100*float(np.mean(cov)):.1f}% of "
+                  f"{H.shape[1]}x{H.shape[2]} cells, "
+                  f"observed height {np.nanmin(H):+.2f}..{np.nanmax(H):+.2f} m", flush=True)
+            if near < 0.01:
+                raise SystemExit(
+                    "[bench] refusing to score: the depth buffer is empty -- fewer than 1% "
+                    "of pixels came back inside the far clip. A camera that renders nothing "
+                    "does not fail here, it hands the planner a uniform pit and the run "
+                    "looks like a bad policy instead of a broken sensor.")
+        H = np.where(np.isfinite(H), H, 0.0)
+        maps = [TerrainMap(height_m=H[k], horizontal_scale=DTM.HS,
+                           task=names[cells[k][0]], level=cells[k][1],
+                           spawn_m=(0.0, DTM.Y_HALF)) for k in range(n)]
+        return maps, float(np.mean(cov))
 
     def grab_frame():
         """One RGB frame per recorded cell.  RENDERS ONLY -- never steps physics.
@@ -824,7 +991,7 @@ def run_isaac(args) -> tuple:
               bq_ = snap(robot.data.root_quat_w)
               bpos_ = snap(robot.data.root_pos_w)
               bp_ = snap(robot.data.body_pos_w)
-              pl = [RulePlanner(cfg=PLANNER_CFG, initial=_SID.WALK) for _ in range(n)]
+              pl = [RulePlanner(cfg=pcfg, initial=_SID.WALK) for _ in range(n)]
               pl_sk = [_SID.WALK] * n
               pl_ph = np.zeros(n, dtype=int)
               pl_q = {nm: np.asarray(c["q_des"], np.float32) for nm, c in pl_clips.items()}
@@ -858,19 +1025,45 @@ def run_isaac(args) -> tuple:
                                           effort_limit_nm=hip_effort_limit_nm)
                                 if ycap > 0 else None)
                   pl_foot.append(fp); pl_yaw.append(ym)
-              print(f"[bench] *** RULE-PLANNER ARM: {n} independent planners, "
-                    f"tick {PLANNER_CFG.feature.TICK_HZ:.0f} Hz. The planner reads the frozen "
-                    f"archive's height field THROUGH THE SENSOR MODEL "
-                    f"(planner.features.extract); the low level sees base velocity, heading "
-                    f"error and the clip's contact channel only. This is an OPTIMISTIC "
-                    f"perception arm: ground-truth geometry put through a sensor model, not "
-                    f"a rendered depth image. ***")
+              if depth is not None:
+                  print(f"[bench] *** RULE-PLANNER ARM, DEPTH PERCEPTION: {n} independent "
+                        f"planners, tick {pcfg.feature.TICK_HZ:.0f} Hz. The planner sees "
+                        f"ONLY the rendered depth image, inverted to a robot-local height "
+                        f"map by legged_eval.adapters.depth_terrain -- occluded, noisy, and "
+                        f"shaken by the body's own pitch. No ground-truth geometry reaches "
+                        f"it. ***")
+              else:
+                  print(f"[bench] *** RULE-PLANNER ARM: {n} independent planners, "
+                        f"tick {pcfg.feature.TICK_HZ:.0f} Hz. The planner reads the "
+                        f"TERRAIN's own height field THROUGH THE SENSOR MODEL "
+                        f"(planner.features.extract); the low level sees base velocity, "
+                        f"heading error and the clip's contact channel only. This is an "
+                        f"OPTIMISTIC perception arm: ground-truth geometry put through a "
+                        f"sensor model, not a rendered depth image. ***")
 
-          tick_every = (max(int(round((1.0 / PLANNER_CFG.feature.TICK_HZ) / dt)), 1)
+          tick_every = (max(int(round((1.0 / pcfg.feature.TICK_HZ) / dt)), 1)
                       if PLANNER_ARM else 0)
           for step in range(ep_steps):
               frame = step % ncyc
               cmd = np.tile(q_seq[frame], (n, 1))
+
+              if depth is not None:
+                  # The fork updates on global_counter % update_interval and then reads a
+                  # buffer depth_delay_steps old, so the planner never sees the frame from
+                  # the step it is acting on.  Same here: render on the cadence, hold the
+                  # frames, hand over the oldest.
+                  DC = depth["cfg"]
+                  if step % DC["update_interval"] == 0:
+                      sim.render()
+                      depth["cam"].update(dt, force_recompute=True)
+                      fr = depth_normalised()
+                      if depth["buf"] is None:
+                          depth["hist"] = [fr] * (DC["delay_steps"] + 1)
+                      else:
+                          depth["hist"].append(fr)
+                          depth["hist"] = depth["hist"][-(DC["delay_steps"] + 1):]
+                      depth["buf"] = depth["hist"][0]
+                      depth["frames"] += 1
 
               if PLANNER_ARM:
                   pos_w = snap(robot.data.root_pos_w)
@@ -881,17 +1074,27 @@ def run_isaac(args) -> tuple:
                                    % 360.0 - 180.0)
                   # ---- planner tick -------------------------------------------------
                   if step % tick_every == 0:
+                      if depth is not None:
+                          pl_tmaps, _cov = depth_maps()
                       for k in range(n):
                           if not alive[k]:
                               continue
                           spd = float(abs(vb[k, 0]))
-                          la = lookahead_distance(spd, PLANNER_CFG)
+                          la = lookahead_distance(spd, pcfg)
                           # x,y in the CELL's own frame: the archive's maps are per cell and
                           # each robot sits at its own world offset.
-                          xk = float(pos_w[k, 0] - offs[k, 0])
-                          yk = float(pos_w[k, 1] - offs[k, 1])
+                          if depth is not None:
+                              # The observed map is ROBOT-LOCAL: x runs 0..2 m ahead and y
+                              # -2..+2 m across, with the robot at its own origin.  Feeding
+                              # the cell coordinates here instead would read the map at the
+                              # robot's position in the COURSE, which for a robot 1 m along
+                              # is a metre of terrain it has already walked over.
+                              xk, yk = 0.0, _DTM_Y_HALF
+                          else:
+                              xk = float(pos_w[k, 0] - offs[k, 0])
+                              yk = float(pos_w[k, 1] - offs[k, 1])
                           try:
-                              obs = extract(pl_tmaps[k], xk, yk, la, PLANNER_CFG)
+                              obs = extract(pl_tmaps[k], xk, yk, la, pcfg)
                           except Exception:
                               continue
                           dec = pl[k].step(obs, tick_every * dt, x_m=xk,
@@ -1027,7 +1230,8 @@ def run_isaac(args) -> tuple:
                                # not two readings of one benchmark and must never be
                                # averaged together; this column is how that stays visible
                                # after the run has scrolled off.
-                               "terrain": terr,
+                               "terrain": terr, "planner_set": planner_stamp,
+                               "perception": args.perception,
                                "partial": int(n < full), "skill": args.skill,
                                "start_phase": args.start_phase, "foot_comp": args.foot_comp,
                                "steps": step + 1})
@@ -1130,6 +1334,17 @@ def main() -> int:
                          "0.495 m, so the first recording was 20 s of a grey wall. 0.95 m "
                          "puts the crossing at 0.82 m -- clear by 0.33 -- for a 16 deg "
                          "look-down, which still reads as a side view.")
+    ap.add_argument("--perception", choices=("optimistic", "depth"), default="optimistic",
+                    help="what the Rule-Planner is allowed to see. optimistic (default): "
+                         "the terrain's own height field through planner.features' sensor "
+                         "model -- range- and resolution-limited, but never occluded and "
+                         "never noisy. depth: the rendered depth image, inverted by "
+                         "legged_eval's depth_terrain. NEEDS A GPU and --enable_cameras.")
+    ap.add_argument("--planner-set", nargs="*", default=None, metavar="group.FIELD=VALUE",
+                    help="override planner thresholds for this run only, e.g. "
+                         "--planner-set skill.STEP_TROT_MAX=0.03. planner/config.py is NOT "
+                         "written to: a CALIBRATION_NEEDED placeholder stays one. Every row "
+                         "is stamped with what was overridden.")
     ap.add_argument("--results-csv", default=None)
     ap.add_argument("--plan", action="store_true")
     ap.add_argument("--self-test", action="store_true")
