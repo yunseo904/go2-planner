@@ -57,6 +57,7 @@ from planner.skills import (BaseState, SkillId, SUPPORTED, UNSUPPORTED_REASON,
 from sim import diagnose as D
 from sim import isaac_cfg as IC
 from sim.footcomp import FootPlacement, stance_time_s
+from sim.yawmoment import YawMoment
 from terrain_toolkit.paths import SKILL_CLIPS_META_JSON
 
 _SIM_APP = None
@@ -262,6 +263,15 @@ FOOT_COMP = {
 #: heading, it is trying to change one, and its own log yaw rate is the target.
 HEADING_CAP = {SkillId.WALK: 0.04, SkillId.TROT: 0.02, SkillId.TURN: 0.0}
 
+#: --yaw-moment caps, N.m of hip feed-forward torque, per skill.  TROT is the only
+#: skill this was built for: outputs/trot_straight.md measures its foot-placement
+#: heading authority as spent at +-0.02 rad, while WALK already reaches the benchmark
+#: budget (0.24 deg/m) without any of this.  Adding a second heading actuator to a
+#: skill that does not need one would be a change with nothing to show for it and a
+#: control group to spoil, so WALK and TURN are 0 -- OFF -- until something asks.
+#: The number itself is set by the probe, not here; 0 means the term never runs.
+YAW_MOMENT_CAP_NM = {SkillId.WALK: 0.0, SkillId.TROT: 0.0, SkillId.TURN: 0.0}
+
 
 def run_isaac(args) -> dict:
     from isaaclab.app import AppLauncher
@@ -322,15 +332,78 @@ def run_isaac(args) -> dict:
     idx_t = torch.as_tensor(idx, device=sim.device, dtype=torch.long)
     foot_ids, foot_names = foot_body_ids(robot)
 
+    # The hip's effort limit, READ FROM THE ARTICULATION.  --yaw-moment adds torque on
+    # top of the PD and IdealPDActuator clips the sum at this value SILENTLY, so the
+    # number that bounds the new term has to be the one the actuator will actually
+    # enforce.  Refused rather than defaulted: a nominal 23.7 that disagreed with the
+    # installed config would make every headroom statement in the run a fiction.
+    #
+    # READ FROM THE ACTUATOR, not from robot.data.  The first version of this read
+    # robot.data.joint_effort_limits and got 1e9, which is the PHYSX limit -- and PhysX
+    # is not what clips here.  The actuator is an explicit IdealPDActuator, so the clip
+    # that binds is applied in Python, in ActuatorBase._clip_effort, against
+    # actuator.effort_limit.  With 1e9 in hand the headroom guard below accepted any cap
+    # at all and the saturation counter could never fire: a guard that is always open.
+    # Caught by the banner printing "against a 1000000000.00 Nm limit" next to a peak of
+    # 11.79 Nm.
+    def _hip_effort_limit() -> float:
+        want_hip = robot.joint_names[idx[0]]                       # e.g. FL_hip_joint
+        for act in robot.actuators.values():
+            names = list(getattr(act, "joint_names", []) or [])
+            e = getattr(act, "effort_limit", None)
+            if e is None or want_hip not in names:
+                continue
+            arr = np.asarray(snap(e)).reshape(-1)
+            v = float(arr[names.index(want_hip)] if arr.size == len(names) else arr.flat[0])
+            if np.isfinite(v) and 0.0 < v < 1e4:
+                return v
+        return float("nan")
+
+    hip_effort_limit_nm = _hip_effort_limit()
+    if not np.isfinite(hip_effort_limit_nm):
+        # Refused, not defaulted.  --yaw-moment's whole safety argument is "the sum of
+        # the PD and the feed-forward stays under the limit the actuator enforces"; with
+        # the limit unknown that argument is not available and the run must not pretend
+        # otherwise.  Position-only runs are unaffected.
+        if args.yaw_moment != "off":
+            raise SystemExit(
+                "[planner] REFUSING --yaw-moment: could not read the hip's effort limit "
+                "off the articulation, so the headroom this term needs cannot be checked. "
+                "outputs/isaac_actuator_probe.json measured it at 23.70 Nm on this config; "
+                "if that is still right, the read above is what is broken, not the limit.")
+        hip_effort_limit_nm = float("nan")
+    else:
+        print(f"[planner] hip effort limit {hip_effort_limit_nm:.2f} Nm "
+              f"(the actuator's own clip, not PhysX's)")
+    hip_sat_steps = 0
+
     # Entry phase per clip, by the same kinematic criterion the single-clip harness
     # uses: the frame whose four feet are closest to coplanar.  A switch lands on
     # that frame, so a mid-run gait change starts from a pose the robot can stand on
     # rather than from wherever frame 0 happens to be.
+    #
+    # TURN is the exception and it is a MEASURED one.  outputs/turn_entry_phase.md swept
+    # all 45 phases of the TURN clip over 9 flat cells in both compensator arms: the
+    # frame `level_start` picks (24) sits inside a contiguous ten-frame dead band that
+    # fails in BOTH arms, and it is picked precisely because it has the best foot spread
+    # in the cycle -- the criterion actively misleads here.  Frame 6 is the only phase
+    # that passes 9/9 in both arms with both neighbours doing the same, and it is already
+    # in the config as skill.ENTRY_FRAME_TURN with provenance MEASURED.
+    #
+    # Default stays `rule`, so every earlier result reproduces.  --entry-turn measured is
+    # the on/off pair.
     for sid in list(clips):
         k, ph = level_start(clips[sid], robot, sim, idx_t, phys_dt)
+        note = ""
+        if (args.entry_turn == "measured" and sid is SkillId.TURN
+                and DEFAULT.skill.ENTRY_FRAME_TURN >= 0):
+            k = int(DEFAULT.skill.ENTRY_FRAME_TURN) % len(clips[sid]["q_des"])
+            note = (f"  <- MEASURED (turn_entry_phase.md), overriding the rule's "
+                    f"{ph['start_frame']}")
+            ph = dict(ph, start_frame=k, spread_at_start=float("nan"))
         clips[sid] = rotate_clip(clips[sid], k)
         print(f"[planner]   {sid.value:5s} entry frame {ph['start_frame']}, "
-              f"foot spread {ph['spread_at_start']*1000:.1f} mm")
+              f"foot spread {ph['spread_at_start']*1000:.1f} mm{note}")
 
     initial = SkillId[args.initial]
     root = robot.data.default_root_state.clone()
@@ -382,6 +455,22 @@ def run_isaac(args) -> dict:
                              vy_log=vy_log, wz_log=wz_log,
                              cycle_len=len(clip["q_des"]), **s)
 
+    def yaw_for(sid, clip):
+        """The stance-leg yaw couple, or None.  TROT-only unless a cap is forced."""
+        if args.yaw_moment == "off":
+            return None
+        cap = (args.yaw_moment_cap_nm if args.yaw_moment_cap_nm is not None
+               else YAW_MOMENT_CAP_NM.get(sid, 0.0))
+        if cap <= 0.0 or (args.yaw_moment_skill != "all"
+                          and sid.value != args.yaw_moment_skill):
+            return None
+        return YawMoment(lever_m=lever, hip_x_m=hip_xy[:, 0], hip_y_m=hip_xy[:, 1],
+                         bias_nm=args.yaw_moment_nm,
+                         gain_nm_per_rad=(args.yaw_moment_gain
+                                          if args.yaw_moment == "hold" else 0.0),
+                         cap_nm=cap,
+                         effort_limit_nm=hip_effort_limit_nm)
+
     if args.foot_comp != "off":
         print("[planner] *** FOOT PLACEMENT ON, per skill. This CLOSES A LOOP on base "
               "velocity and OVERWRITES the recording; no run here is an open-loop replay. "
@@ -405,7 +494,22 @@ def run_isaac(args) -> dict:
               "heading term carries no constant. ***")
 
     planner = RulePlanner(cfg=DEFAULT, initial=initial)
-    policies = {sid: make_policy(sid, clips=clips, foot_for=foot_for) for sid in SkillId}
+    policies = {sid: make_policy(sid, clips=clips, foot_for=foot_for, yaw_for=yaw_for)
+                for sid in SkillId}
+    _ym_on = [sid for sid in SUPPORTED if getattr(policies[sid], "yaw", None) is not None]
+    if _ym_on:
+        _y = policies[_ym_on[0]].yaw
+        print(f"[planner] *** YAW MOMENT --yaw-moment {args.yaw_moment} on {','.join(x.value for x in _ym_on)}: "
+              f"feed-forward hip torque on the STANCE legs, bias {args.yaw_moment_nm:+.3f} Nm, "
+              f"gain {args.yaw_moment_gain:+.2f} Nm/rad, cap {_y.cap_nm:.2f} Nm against a "
+              f"{hip_effort_limit_nm:.2f} Nm hip limit. This is a DYNAMIC intervention: it "
+              f"moves no foot, it adds torque to the legs already on the ground, and the "
+              f"recording's own contact channel says which those are. Geometry: "
+              f"{abs(_y.couple_nm_per_nm(np.zeros(4, bool))):.3f} Nm of yaw couple per Nm "
+              f"with four down, {abs(_y.couple_nm_per_nm(np.array([0,1,1,0], bool))):.3f} "
+              f"on a diagonal pair. Report paired with --yaw-moment off. ***")
+    else:
+        print("[planner] yaw moment OFF (the default): no feed-forward torque is commanded")
     playing = initial
     policies[playing].reset()
 
@@ -414,8 +518,11 @@ def run_isaac(args) -> dict:
     print(f"[planner] {n_steps} control steps = {total_s(sched):.0f} s; planner ticks every "
           f"{tick_every} steps ({DEFAULT.feature.TICK_HZ:.0f} Hz)")
 
+    yaw_any = bool(_ym_on)
     rec = {k: [] for k in ("contact_f", "root_lin_vel_b", "root_ang_vel_b", "root_pos_w",
                            "root_quat_w", "played", "planned", "foot_u", "swing")}
+    rec["tau_hip"] = []
+    rec["tau_ff"] = []
     events, refused, last_q, entry_note = [], {}, None, ""
     blend_left, blend_steps, blend_from = 0, 0, None
     last_u, gate_defer = None, 0
@@ -546,9 +653,31 @@ def run_isaac(args) -> dict:
         tgt = robot.data.default_joint_pos.clone()
         tgt[:, idx_t] = torch.as_tensor(q, device=sim.device, dtype=torch.float32)
         robot.set_joint_position_target(tgt)
+        # The feed-forward torque goes through a DIFFERENT call from the position
+        # target, and IdealPDActuator ADDS it to the PD before clipping the sum at
+        # effort_limit -- measured, not assumed: outputs/isaac_actuator_probe.json
+        # q3_effort_is_additive true, q3_effort_replaces_pd false, 5 Nm in -> 5.0 Nm out.
+        # It is written EVERY step, including the all-zero steps: an effort target is
+        # sticky, so skipping the write when the term is off would leave the last
+        # non-zero torque applied for the rest of the run.
+        if yaw_any:
+            eff = torch.zeros_like(tgt)
+            eff[:, idx_t] = torch.as_tensor(
+                np.asarray(cmd.tau_ff, dtype=np.float32)
+                if cmd.tau_ff is not None else np.zeros(12, np.float32),
+                device=sim.device, dtype=torch.float32)
+            robot.set_joint_effort_target(eff)
         for _ in range(decim):
             robot.write_data_to_sim(); sim.step()
             robot.update(phys_dt); contacts.update(phys_dt)
+        if yaw_any:
+            # What the actuator ACTUALLY applied, against the limit it clips at.  A run
+            # whose hips are pinned at the clip is not a run with more heading
+            # authority -- it is one whose gait is being starved to pay for the couple,
+            # and that has to be visible in the results row rather than inferred.
+            _tau_hip = np.abs(snap(robot.data.applied_torque[0, idx_t])[0::3])
+            hip_sat_steps += int((_tau_hip >= hip_effort_limit_nm - 1e-3).any())
+            rec["tau_hip"].append(_tau_hip.max())
 
         rec["contact_f"].append(snap(contacts.data.net_forces_w[0].norm(dim=-1)))
         rec["root_lin_vel_b"].append(snap(robot.data.root_lin_vel_b[0]))
@@ -560,6 +689,8 @@ def run_isaac(args) -> dict:
                                                  np.zeros(12, np.float32))).copy())
         rec["swing"].append(np.asarray(getattr(policies[playing], "last_swing",
                                                np.zeros(4, bool)), dtype=bool).copy())
+        rec["tau_ff"].append(np.asarray(getattr(policies[playing], "last_tau_ff",
+                                                np.zeros(12, np.float32))).copy())
         rec["played"].append(list(SkillId).index(playing))
         rec["planned"].append(list(SkillId).index(planner.active))
         x_m = float(robot.data.root_pos_w[0, 0].item())
@@ -574,13 +705,35 @@ def run_isaac(args) -> dict:
                 print(f"[planner] TERMINATED at {t:.2f} s on {why}")
                 break
 
-    a = {k: np.asarray(v) for k, v in rec.items()}
+    if yaw_any:
+        n_ctrl = max(len(rec["root_pos_w"]), 1)
+        print(f"[planner] yaw moment: peak hip torque "
+              f"{max(rec['tau_hip']) if rec['tau_hip'] else 0.0:.2f} Nm against a "
+              f"{hip_effort_limit_nm:.2f} Nm limit; the actuator clipped a hip on "
+              f"{hip_sat_steps}/{n_ctrl} control steps ({100*hip_sat_steps/n_ctrl:.1f}%)")
+        for sid in SUPPORTED:
+            y = getattr(policies[sid], "yaw", None)
+            if y is not None:
+                print(f"[planner]   {sid.value:5s} commanded |c| max {y.max_abs_nm:.3f} Nm, "
+                      f"at its cap on {100*y.cap_hit_frac:.1f}% of stance-leg steps")
+    a = {k: np.asarray(v) for k, v in rec.items() if len(v)}
     return summarise(args, a, dt, sched, planner, events, refused, meta, clips,
-                     terminated_s, term_reason, gate_defer)
+                     terminated_s, term_reason, gate_defer,
+                     yaw_extra={"yaw_moment": args.yaw_moment,
+                                "yaw_moment_nm": args.yaw_moment_nm,
+                                "yaw_moment_gain": args.yaw_moment_gain,
+                                "yaw_moment_cap_nm": (args.yaw_moment_cap_nm
+                                                      if args.yaw_moment_cap_nm is not None
+                                                      else float("nan")),
+                                "yaw_moment_skill": args.yaw_moment_skill,
+                                "hip_effort_limit_nm": hip_effort_limit_nm,
+                                "hip_sat_frac": hip_sat_steps / max(len(rec["root_pos_w"]), 1),
+                                "tau_hip_peak_nm": (max(rec["tau_hip"])
+                                                    if rec["tau_hip"] else 0.0)})
 
 
 def summarise(args, a, dt, sched, planner, events, refused, meta, clips,
-              terminated_s, term_reason, gate_defer=0) -> dict:
+              terminated_s, term_reason, gate_defer=0, yaw_extra=None) -> dict:
     """Per-segment gait numbers against the clip that was actually playing."""
     from verify_skill_replay import expected_from_meta, report
     played = a["played"]
@@ -589,7 +742,7 @@ def summarise(args, a, dt, sched, planner, events, refused, meta, clips,
     bounds = [0] + [i for i in range(1, n) if played[i] != played[i - 1]] + [n]
     print("\n-- what was played, and was it the gait that was asked for --")
     print(f"   {'t0':>6s} {'t1':>6s} {'skill':6s} {'cycles':>7s} {'stride':>14s} "
-          f"{'vx':>14s} {'yaw deg/s':>11s}  verdict")
+          f"{'vx':>14s} {'yaw deg/s':>11s} {'deg/m':>7s}  verdict")
     segs = []
     for lo, hi in zip(bounds[:-1], bounds[1:]):
         if hi - lo < 8:
@@ -602,13 +755,20 @@ def summarise(args, a, dt, sched, planner, events, refused, meta, clips,
                "vx_mean": float(a["root_lin_vel_b"][lo:hi, 0].mean()),
                "vy_mean": float(a["root_lin_vel_b"][lo:hi, 1].mean()),
                "yaw_rate_deg_s": float(np.degrees(a["root_ang_vel_b"][lo:hi, 2].mean()))}
+        # deg of yaw per METRE travelled: the benchmark's own budget unit (0.565 deg/m).
+        # Computed here rather than left to whoever reads the CSV, because "yaw rate"
+        # and "curvature" are exactly the pair CLAUDE.md 6.5 warns about -- a gait that
+        # slows down improves one while the other is unchanged.
+        seg["curv_deg_per_m"] = (abs(seg["yaw_rate_deg_s"]) / abs(seg["vx_mean"])
+                                 if abs(seg["vx_mean"]) > 1e-6 else float("nan"))
         f = D.gait_reproduced(seg, exp)
         verdict = "ok" if all(x.severity == "ok" for x in f) else f[0].severity.upper()
         cyc = (hi - lo) * dt * (exp["stride_hz"] if np.isfinite(exp["stride_hz"]) else np.nan)
         print(f"   {lo*dt:6.2f} {hi*dt:6.2f} {sid.value:6s} {cyc:7.1f} "
               f"{seg['stride_hz']:6.2f}/{exp['stride_hz']:5.2f} Hz "
-              f"{seg['vx_mean']:6.3f}/{exp['vx_mean']:5.3f} {seg['yaw_rate_deg_s']:11.2f}  "
-              f"{verdict}  {f[0].symptom[:44] if f else ''}")
+              f"{seg['vx_mean']:6.3f}/{exp['vx_mean']:5.3f} {seg['yaw_rate_deg_s']:11.2f} "
+              f"{seg['curv_deg_per_m']:7.2f}  "
+              f"{verdict}  {f[0].symptom[:40] if f else ''}")
         seg["verdict"] = verdict
         segs.append(seg)
 
@@ -629,7 +789,7 @@ def summarise(args, a, dt, sched, planner, events, refused, meta, clips,
            "switch_entry": args.switch_entry, "switch_blend_s": args.switch_blend_s,
            "speed_gate": args.speed_gate, "speed_refusals": planner.speed_refusals,
            "switch_gate": args.switch_gate, "gate_deferrals": gate_defer,
-           "heading": args.heading,
+           "heading": args.heading, "entry_turn": args.entry_turn,
            "planner_switches": planner.switches, "executed_switches": len(switches),
            "refused_ticks": sum(refused.values()),
            "refused_skills": "|".join(sorted(s.value for s in refused)),
@@ -641,6 +801,26 @@ def summarise(args, a, dt, sched, planner, events, refused, meta, clips,
            "terminated_s": terminated_s if terminated_s is not None else "",
            "term_reason": term_reason,
            "pairs": "|".join(f"{e['from']}>{e['to']}" for e in switches)}
+    # The longest segment's gait numbers, promoted into the row.  A --schedule hold run
+    # has exactly one, and every A/B in outputs/trot_yaw_moment.md is a comparison of
+    # these four columns -- reading them back out of a trace for each comparison is how
+    # the curvature in one table stopped matching the curvature in another.
+    if segs:
+        _m = max(segs, key=lambda s_: s_["t1_s"] - s_["t0_s"])
+        row.update({"main_skill": _m["role"], "curv_deg_per_m": _m["curv_deg_per_m"],
+                    "yaw_rate_deg_s": _m["yaw_rate_deg_s"], "vx_mean": _m["vx_mean"],
+                    "vy_mean": _m["vy_mean"], "stride_hz": _m["stride_hz"],
+                    "duty": _m["duty"], "main_verdict": _m["verdict"]})
+    # Every intervention this run had on, stamped into the row.  A results file whose
+    # rows do not say which arm they are is a results file that gets read wrong once.
+    if yaw_extra:
+        row.update(yaw_extra)
+    if segs:
+        _m = max(segs, key=lambda s_: s_["t1_s"] - s_["t0_s"])
+        print(f"\n   {_m['role']} curvature {_m['curv_deg_per_m']:.2f} deg/m "
+              f"(benchmark budget 0.565); yaw {_m['yaw_rate_deg_s']:+.2f} deg/s, "
+              f"vx {_m['vx_mean']:.3f} m/s, stride {_m['stride_hz']:.2f} Hz, "
+              f"survived {terminated_s if terminated_s is not None else 'the whole run'}")
     if args.results_csv:
         report([row], args.results_csv)
     if args.trace_npz:
@@ -670,6 +850,49 @@ def main() -> int:
                          "heading-only: the heading half alone, because every rate loop "
                          "measured made heading worse. Caps are per skill, from the "
                          "open-loop steering probe.")
+    # ----------------------------------------------------------------- yaw moment
+    # The --flag contract this project uses for an intervention: default OFF, a banner
+    # when it is on, its settings stamped into every results row, and an on/off pair
+    # required before anything is reported.  outputs/interventions.md is the register.
+    ap.add_argument("--yaw-moment", choices=("off", "probe", "hold"), default="off",
+                    help="off (default): nothing is commanded but position, and the run "
+                         "is bit-identical to one from before this flag existed. probe: a "
+                         "CONSTANT feed-forward hip torque on the stance legs, open loop, "
+                         "for measuring the actuator's gain the way "
+                         "outputs/heading_candidates.md 2 measured foot placement's -- "
+                         "amplitude from --yaw-moment-nm, no feedback of any kind. hold: "
+                         "close the loop, c = --yaw-moment-gain * heading error, on top of "
+                         "any --yaw-moment-nm bias. This is a DYNAMIC actuator: it moves no "
+                         "foot and its bound is the friction cone and the hip's effort "
+                         "limit, not the trot's footfall margin, which is what every route "
+                         "in outputs/trot_straight.md ran out of.")
+    ap.add_argument("--yaw-moment-nm", type=float, default=0.0,
+                    help="constant hip torque amplitude, N.m. Positive is +front/-rear, "
+                         "which the geometry says gives a NEGATIVE yaw moment -- a sign "
+                         "derived in sim/yawmoment.py and deliberately not trusted: run "
+                         "both signs. Not clipped by anything but --yaw-moment-cap-nm, "
+                         "because the bias IS the amplitude being measured.")
+    ap.add_argument("--yaw-moment-gain", type=float, default=0.0,
+                    help="N.m of hip torque per radian of heading error, for --yaw-moment "
+                         "hold. Set it from the probe's measured gain, not by feel.")
+    ap.add_argument("--yaw-moment-cap-nm", type=float, default=None,
+                    help="magnitude bound on the commanded torque. Default: the per-skill "
+                         "YAW_MOMENT_CAP_NM table (all zero, i.e. OFF, until the probe "
+                         "fills it in). Refused above half the hip's effort limit -- the "
+                         "PD that plays the clip needs that headroom, and the actuator "
+                         "clips the sum silently.")
+    ap.add_argument("--yaw-moment-skill", default="TROT",
+                    help="which skill carries the term (default TROT, the only one whose "
+                         "heading authority is spent; WALK already meets the budget). "
+                         "'all' puts it on every supported skill.")
+    ap.add_argument("--entry-turn", choices=("rule", "measured"), default="rule",
+                    help="where a TURN replay starts in its cycle. rule (default, and what "
+                         "every earlier result used): verify_skill_replay.level_start, the "
+                         "most-coplanar frame. measured: skill.ENTRY_FRAME_TURN from the "
+                         "config, frame 6, which outputs/turn_entry_phase.md found is the "
+                         "only phase of 45 that turns 9/9 in both compensator arms. The "
+                         "rule picks frame 24, inside a ten-frame band that fails in both. "
+                         "Affects TURN only.")
     ap.add_argument("--switch-gate", choices=("off", "settled"), default="off",
                     help="settled: defer a switch while the foot-placement correction is "
                          "pinned at its cap, i.e. while the current gait is in an excursion "

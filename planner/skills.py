@@ -152,6 +152,13 @@ class Command:
     note: str = ""
     q: Optional[np.ndarray] = None
     supported: bool = True
+    #: FEED-FORWARD TORQUE, N.m, same 12-vector order as ``q``.  None (the default)
+    #: means the policy asks for nothing but position, which is what every policy did
+    #: before ``sim/yawmoment.py`` existed.  It is a SEPARATE field rather than an
+    #: addition to ``q`` on purpose: a torque and an angle are different quantities and
+    #: reach the articulation through different calls, and folding one into the other
+    #: via the PD gain would make the run's authority depend on a gain schedule.
+    tau_ff: Optional[np.ndarray] = None
 
 
 class SkillPolicy(Protocol):
@@ -246,10 +253,14 @@ class ClipPolicy:
     """
 
     def __init__(self, skill: SkillId, clip: dict, foot=None,
-                 hip_sign: float = 1.0, start_frame: int = 0) -> None:
+                 hip_sign: float = 1.0, start_frame: int = 0, yaw=None) -> None:
         self.skill = skill
         self.clip = clip
         self.foot = foot
+        #: ``sim.yawmoment.YawMoment`` or None.  Disjoint from ``foot`` in both legs
+        #: and joints -- that one edits the SWING hips' angles, this one adds torque to
+        #: the STANCE hips -- so the two cannot be competing for the same authority.
+        self.yaw = yaw
         self.name = str(clip["name"])
         self._q = np.asarray(clip["q_des"], dtype=np.float32).copy()
         self._q[:, 0::3] *= hip_sign
@@ -262,14 +273,18 @@ class ClipPolicy:
         #: placement actually did rather than have it inferred from the outcome.
         self.last_u = np.zeros(12, dtype=np.float32)
         self.last_swing = np.zeros(4, dtype=bool)
+        self.last_tau_ff = np.zeros(12, dtype=np.float32)
 
     def reset(self) -> None:
         self._i = 0
         self._elapsed = 0.0
         self.last_u = np.zeros(12, dtype=np.float32)
         self.last_swing = np.zeros(4, dtype=bool)
+        self.last_tau_ff = np.zeros(12, dtype=np.float32)
         if self.foot is not None:
             self.foot.reset()
+        if self.yaw is not None:
+            self.yaw.reset()
 
     @property
     def frame(self) -> int:
@@ -283,17 +298,25 @@ class ClipPolicy:
         f = self.frame
         q = self._q[f].astype(np.float32, copy=True)
         self.last_u = np.zeros(12, dtype=np.float32)
+        self.last_tau_ff = np.zeros(12, dtype=np.float32)
         self.last_swing = self._swing[f]
+        psi = float(getattr(obs, "psi_err", 0.0))
         if self.foot is not None:
             vy = float(getattr(obs, "vy", 0.0))
             wz = float(getattr(obs, "wz", 0.0))
             vx = float(getattr(obs, "vx", 0.0))
-            psi = float(getattr(obs, "psi_err", 0.0))
             self.last_u = self.foot.step(vy, wz, self._swing[f], vx=vx, psi_err_rad=psi)
             q = q + self.last_u
+        tau = None
+        if self.yaw is not None:
+            # Same phase-locked gate as the placement above, read the other way round:
+            # that one acts on the legs in the AIR, this one on the legs on the GROUND.
+            self.last_tau_ff = self.yaw.step(self._swing[f], psi_err_rad=psi).astype(np.float32)
+            tau = self.last_tau_ff
         self._i += 1
         self._elapsed += dt
-        return Command(note=f"{self.skill} clip {self.name} frame {f}/{self._n}", q=q)
+        return Command(note=f"{self.skill} clip {self.name} frame {f}/{self._n}", q=q,
+                       tau_ff=tau)
 
     def done(self) -> bool:
         return False
@@ -337,7 +360,7 @@ class UnsupportedPolicy:
 
 def make_policy(skill: SkillId, library: Optional[Dict[SkillId, Skill]] = None,
                 kinematic: bool = False, clips: Optional[Dict[SkillId, dict]] = None,
-                foot_for=None, hip_sign: float = 1.0) -> SkillPolicy:
+                foot_for=None, hip_sign: float = 1.0, yaw_for=None) -> SkillPolicy:
     """Build the executor for ``skill``.
 
     With ``clips`` given this returns a real :class:`ClipPolicy` for the skills the
@@ -350,7 +373,8 @@ def make_policy(skill: SkillId, library: Optional[Dict[SkillId, Skill]] = None,
         if skill not in SUPPORTED or skill not in clips:
             return UnsupportedPolicy(skill)
         foot = foot_for(skill, clips[skill]) if foot_for is not None else None
-        return ClipPolicy(skill, clips[skill], foot=foot, hip_sign=hip_sign)
+        yaw = yaw_for(skill, clips[skill]) if yaw_for is not None else None
+        return ClipPolicy(skill, clips[skill], foot=foot, hip_sign=hip_sign, yaw=yaw)
     if kinematic:
         return KinematicPolicy(skill, library or build_library())
     return StandStillPolicy(skill)
