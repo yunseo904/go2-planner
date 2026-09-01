@@ -454,6 +454,39 @@ def run_isaac(args) -> tuple:
     z, grid = load_terrain(args)
     terr = terrain_stamp(args, grid)
 
+    # Resolved HERE and not further down.  It only depends on args, and the depth camera
+    # has to be constructed before sim.reset() while the old site was after it -- reading it
+    # early cost a run to a NameError that Kit reports as exit status 0 with no traceback,
+    # which is harness_findings.md 17 exactly.
+    PLANNER_ARM = args.skill.upper() == "PLANNER"
+
+    # THE RULE-PLANNER IS A DEPTH ARM.  The experiment's premise is a robot that reads the
+    # terrain from its own camera, and since 2026-09-02 that is what the default does.
+    # --perception optimistic is still there and is still useful, but it is now a CONTROL --
+    # the perception upper bound, ground truth through a sensor model -- and has to be asked
+    # for by name.  It was the default for as long as there was no depth path, and leaving
+    # it as the default after there was one would have gone on publishing the control as
+    # the result.
+    #
+    # The single-skill arms read no terrain at all, so perception does not apply to them
+    # and is recorded as `n/a` rather than as a setting that happened not to matter.
+    if not PLANNER_ARM:
+        args.perception = "n/a"
+    elif args.perception is None:
+        args.perception = "depth"
+
+    # The depth noise is drawn here, not by the fork, so it needs a stated seed.  It follows
+    # the terrain seed for the same reason the terrain does: seed 1 must be seed 1 for every
+    # model, and 1/2/3 must be three draws whose spread is the error bar.
+    _rng = np.random.default_rng(args.terrain_seed)
+    # Half-width of legged_eval's robot-local map.  Read off that module rather than written
+    # as 2.0, because it is also where the planner is told it is standing.
+    _DTM_Y_HALF = 2.0
+    if args.perception == "depth":
+        LET._import_legged_eval()
+        from legged_eval.adapters import depth_terrain as _dtm
+        _DTM_Y_HALF = float(_dtm.Y_HALF)
+
     # --planner-set: the planner's own thresholds, overridden FOR THIS RUN ONLY.
     #
     # planner/config.py keeps STEP_TROT_MAX at 0.08 m marked CALIBRATION_NEEDED while
@@ -463,24 +496,6 @@ def run_isaac(args) -> tuple:
     # replaced by a run argument is still a placeholder, and the bracket came from three
     # entry phases, which is a direction and not a calibration.  The override is stamped on
     # every row so a run under it can never be read as a run under the config.
-    # The depth noise is drawn here, not by the fork, so it needs a stated seed. It follows
-    # the terrain seed for the same reason the terrain does: seed 1 must be seed 1 for every
-    # model, and 1/2/3 must be three draws whose spread is the error bar.
-    _rng = np.random.default_rng(args.terrain_seed)
-    # Half-width of legged_eval's robot-local map.  Read off that module rather than
-    # written as 2.0, because it is also where the planner is told it is standing.
-    _DTM_Y_HALF = 2.0
-    if args.perception == "depth":
-        LET._import_legged_eval()
-        from legged_eval.adapters import depth_terrain as _dtm
-        _DTM_Y_HALF = float(_dtm.Y_HALF)
-
-    # Resolved HERE and not further down.  It only depends on args, and the depth camera
-    # has to be constructed before sim.reset() while the old site was after it -- reading it
-    # early cost a run to a NameError that Kit reports as exit status 0 with no traceback,
-    # which is harness_findings.md 17 exactly.
-    PLANNER_ARM = args.skill.upper() == "PLANNER"
-
     pcfg = PLANNER_CFG
     pset = {}
     for item in (args.planner_set or []):
@@ -1334,12 +1349,14 @@ def main() -> int:
                          "0.495 m, so the first recording was 20 s of a grey wall. 0.95 m "
                          "puts the crossing at 0.82 m -- clear by 0.33 -- for a 16 deg "
                          "look-down, which still reads as a side view.")
-    ap.add_argument("--perception", choices=("optimistic", "depth"), default="optimistic",
-                    help="what the Rule-Planner is allowed to see. optimistic (default): "
-                         "the terrain's own height field through planner.features' sensor "
-                         "model -- range- and resolution-limited, but never occluded and "
-                         "never noisy. depth: the rendered depth image, inverted by "
-                         "legged_eval's depth_terrain. NEEDS A GPU and --enable_cameras.")
+    ap.add_argument("--perception", choices=("optimistic", "depth"), default=None,
+                    help="what the Rule-Planner is allowed to see. DEFAULT depth: the "
+                         "rendered depth image, inverted by legged_eval's depth_terrain -- "
+                         "occluded, noisy, and what the experiment is about. Needs a GPU "
+                         "and --enable_cameras. optimistic: the terrain's own height field "
+                         "through planner.features' sensor model, never occluded and never "
+                         "noisy -- the perception UPPER BOUND, a control arm, not the "
+                         "result. Ignored by the single-skill arms, which read no terrain.")
     ap.add_argument("--planner-set", nargs="*", default=None, metavar="group.FIELD=VALUE",
                     help="override planner thresholds for this run only, e.g. "
                          "--planner-set skill.STEP_TROT_MAX=0.03. planner/config.py is NOT "

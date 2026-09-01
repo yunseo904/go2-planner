@@ -10,12 +10,17 @@ Per cell, the best of the single-skill arms, then the equal-weight mean over cel
 
 | arm | score / 8 |
 |---|---|
-| WALK fixed | 0.755 |
-| TROT fixed | 0.290 |
-| **TURN fixed** (new) | **0.170** |
+| WALK fixed † | 0.755 |
+| TROT fixed † | 0.290 |
+| **TURN fixed** † (new) | **0.170** |
 | **ORACLE — best of the three, per cell** | **0.810** |
 | *(best of WALK/TROT only)* | *0.790* |
-| Rule-Planner (optimistic perception) | 0.570 |
+| **Rule-Planner, depth** (the arm) | **0.600** |
+| Rule-Planner, optimistic (control) | 0.570 |
+
+† the single-skill arms read no terrain at all, so `perception` does not apply to them and
+their rows carry `perception=n/a`.  That is the point of the WALK row: it scores 0.76
+without looking at anything.
 
 **A perfect chooser gains 0.06 over always walking.**  Some skill beats WALK in only 12 of
 200 cells (TROT in 7, TURN in 5), and in the other 188 the best thing the library can do is
@@ -41,10 +46,10 @@ read out of `CustomDepthCfg` by `sim/isaac_cfg.depth_cfg()`) and inverts it with
 41x81 local grid, observed heights −1.00 to +0.16 m — the −1.00 is the ray-carve marking a
 pit, the +0.16 is real geometry.
 
-| Rule-Planner | score / 8 |
-|---|---|
-| optimistic (ground truth through a sensor model) | 0.570 |
-| **depth (rendered, occluded, noisy)** | **0.600** |
+| Rule-Planner | score / 8 | |
+|---|---|---|
+| **depth (rendered, occluded, noisy)** | **0.600** | **the arm** (default since 2026-09-02) |
+| optimistic (ground truth through a sensor model) | 0.570 | perception upper bound, a control |
 
 Paired: depth better in 10 cells, worse in 4, tied in 186.
 
@@ -96,14 +101,15 @@ putting the robot into a gait it cannot hold) and it does not rescue the arm: 0.
 
 ## 4. The four numbers together
 
-| | score / 8 |
-|---|---|
-| E2E teacher, same protocol, seed 1 | **4.83** |
-| oracle over the whole skill library | 0.81 |
-| WALK fixed, no perception at all | 0.76 |
-| Rule-Planner, depth | 0.60 |
-| Rule-Planner, corrected threshold | 0.59 |
-| Rule-Planner, as configured | 0.57 |
+| | score / 8 | |
+|---|---|---|
+| E2E teacher, same protocol, seed 1 | **4.83** | |
+| oracle over the whole skill library | 0.81 | |
+| WALK fixed, no perception at all | 0.76 | |
+| **Rule-Planner, depth** | **0.60** | **the arm** |
+| Rule-Planner, depth + corrected threshold | *not yet run* | |
+| Rule-Planner, optimistic + corrected threshold | 0.59 | control |
+| Rule-Planner, optimistic | 0.57 | control |
 
 Everything between 0.57 and 0.81 is planner engineering, and the whole of it is 0.24.
 Everything between 0.81 and 4.83 is the skill library, and it is 4.02.
