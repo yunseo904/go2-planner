@@ -592,13 +592,22 @@ falls or episode length at all.
 
 ### 6. The review run
 
-`outputs/bench_le/depth_review_s1.csv` -- the representative arm (Rule-Planner, depth, roll
-couple, heading hold) re-measured in the section-8 format. **It reproduces the published arm
-on 200 of 200 cells, 0.685.** `outputs/aggregate_depth_review.md` is its three-table
-aggregate. Seeds 2 and 3 follow for the error bar.
+`outputs/bench_le/depth_review_s{1,2,3}.csv` — the representative arm (Rule-Planner, depth,
+roll couple, heading hold) re-measured in the section-8 format, three seeds.
 
-Cost note for planning: the depth run took **4.7 minutes**, not the ~20 assumed. Depth is
-much cheaper than it has been treated as.
+| seed | this session | published | identical cells |
+|---|---|---|---|
+| 1 | 0.685 | 0.685 | **200 / 200** |
+| 2 | 0.620 | 0.620 | **200 / 200** |
+| 3 | 0.595 | 0.595 | **200 / 200** |
+| **mean** | **0.633** | 0.63 | |
+
+**Every cell of every seed is bit-identical to the published arm.** The added columns changed
+no physics, and the representative number is confirmed at 0.633 rather than merely repeated.
+`outputs/aggregate_depth_review.md` is seed 1's three-table aggregate.
+
+Cost note for planning: a depth run takes **4.7 minutes**, not the ~20 assumed. Depth is far
+cheaper than it has been treated as, which is what makes `--episodes 5` (§15) affordable.
 
 ### 7. Asked for and already done before this session
 
