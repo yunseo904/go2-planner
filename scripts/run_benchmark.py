@@ -79,6 +79,7 @@ from planner.features import maps_from_archive, extract, lookahead_distance
 from planner.rules import RulePlanner
 from planner.skills import SkillId as _SID
 from sim.yawmoment import YawMoment
+from sim.attitude import RollCouple
 
 _SIM_APP = None
 
@@ -727,6 +728,11 @@ def run_isaac(args) -> tuple:
         raise SystemExit("[bench] REFUSING --yaw-moment: could not read the hip's effort "
                          "limit off the articulation, so the headroom this term needs "
                          "cannot be checked.")
+    if args.roll_couple != "off" and not np.isfinite(hip_effort_limit_nm):
+        raise SystemExit("[bench] REFUSING --roll-couple: could not read the hip's effort "
+                         "limit off the articulation. The cap check is the only thing "
+                         "stopping this term from eating the PD that plays the clip, and "
+                         "a guard that cannot fire is not a guard (SESSION_STATE 6).")
     # Entry phase, by the same rules the replay harness offers, so a benchmark row and a
     # flat row are the same configuration.
     if args.start_phase == "measured":
@@ -826,6 +832,16 @@ def run_isaac(args) -> tuple:
             robot.set_joint_position_target(target)
             for _ in range(decim):
                 robot.write_data_to_sim(); sim.step(); robot.update(phys_dt)
+
+    if args.roll_couple != "off":
+        print(f"[bench] *** LEVEL 2 -- ROLL COUPLE ON. Uniform feed-forward hip torque on "
+              f"the stance legs: gain {args.roll_gain:g} N.m/rad, damp {args.roll_damp:g} "
+              f"N.m/(rad/s), cap {args.roll_cap_nm:g} N.m, sign {args.roll_sign:+g}, bias "
+              f"{args.roll_couple_nm:g} N.m. Hip effort limit read off the ACTUATOR: "
+              f"{hip_effort_limit_nm:.2f} N.m. Every fall on this grid is a roll fall "
+              f"(200/200 in both roughness arms) and this is the term aimed at that. ***")
+        print(f"[bench]     Report this PAIRED with --roll-couple off. 'It did not fall' "
+              f"is not a result on its own: stride and v_x must not move.")
 
     n_settle = max(int(args.settle_s / dt), 1)
     ep_steps = int(EPISODE_LENGTH_S / dt)
@@ -929,6 +945,13 @@ def run_isaac(args) -> tuple:
     t0 = time.time()
     try:
       for ep in range(args.episodes):
+          peak_roll = np.zeros(n); peak_pitch = np.zeros(n)
+          end_roll = np.zeros(n); end_pitch = np.zeros(n)
+          end_cause = np.full(n, "none", dtype=object)
+          # Steps each robot was upright.  pl_held only exists on the planner arm, and a
+          # speed read off travelled_m without it is a distance divided by 20 s whether the
+          # robot lived 20 s or 2.
+          upright = np.zeros(n, dtype=int)
           robot.write_root_state_to_sim(root0)
           robot.write_joint_state_to_sim(q_stand, torch.zeros_like(q_stand))
           hold(q_stand, n_settle)
@@ -971,15 +994,29 @@ def run_isaac(args) -> tuple:
           _, _, yaw0 = quat_to_rpy_deg(snap(robot.data.root_quat_w))
           yaw_ref = np.asarray(yaw0, dtype=float)
           foots = None
+          rolls = None
           if args.foot_comp != "off":
               from sim.replay import quat_rotate_inv
               bq = snap(robot.data.root_quat_w)
               bpos = snap(robot.data.root_pos_w)
               foots = []
+              rolls = []
               for k in range(n):
                   hxy = np.array([quat_rotate_inv(bq[k][None, :],
                                                   (bp[k, h_by[l]] - bpos[k])[None, :])[0, :2]
                                   for l in legs])
+                  # The roll couple, one per robot, for the single-skill arms.  WALK is
+                  # the arm this term is aimed at (every fall on the grid is a roll fall,
+                  # sim/attitude.py) and TROT/TURN are the controls the user requires: a
+                  # term that helps one gait and is silent or harmful in the others is a
+                  # different finding from one that helps the robot.
+                  rolls.append(RollCouple(
+                      lever_m=lever[k] if settle_ok[k] else med,
+                      hip_x_m=hxy[:, 0], hip_y_m=hxy[:, 1],
+                      bias_nm=args.roll_couple_nm,
+                      kp_nm_per_rad=args.roll_gain, kd_nm_per_rad_s=args.roll_damp,
+                      cap_nm=(args.roll_cap_nm if args.roll_couple != "off" else 0.0),
+                      sign=args.roll_sign, effort_limit_nm=hip_effort_limit_nm))
                   foots.append(FootPlacement(
                       t_stance_s=stance_time_s(clip["contact"], clip["fs"]),
                       lever_m=lever[k] if settle_ok[k] else med,
@@ -1011,7 +1048,7 @@ def run_isaac(args) -> tuple:
               pl_ph = np.zeros(n, dtype=int)
               pl_q = {nm: np.asarray(c["q_des"], np.float32) for nm, c in pl_clips.items()}
               pl_sw = {nm: ~np.asarray(c["contact"], bool) for nm, c in pl_clips.items()}
-              pl_foot, pl_yaw = [], []
+              pl_foot, pl_yaw, pl_roll = [], [], []
               pl_switches = np.zeros(n, dtype=int)
               pl_refused = np.zeros(n, dtype=int)
               pl_held = {nm: np.zeros(n, dtype=int) for nm in pl_clips}
@@ -1020,7 +1057,7 @@ def run_isaac(args) -> tuple:
                                        (bp_[k, h_by[l]] - bpos_[k])[None, :])[0, :2]
                                   for l in legs])
                   lev = lever[k] if settle_ok[k] else med
-                  fp, ym = {}, {}
+                  fp, ym, rl = {}, {}, {}
                   for nm in pl_clips:
                       vyl, wzl = _log_motion_for(pl_meta, pl_clips[nm]["name"])
                       ymode = "log-cycle" if nm == "TURN" else (
@@ -1039,7 +1076,16 @@ def run_isaac(args) -> tuple:
                                           bias_nm=args.yaw_moment_nm, cap_nm=ycap,
                                           effort_limit_nm=hip_effort_limit_nm)
                                 if ycap > 0 else None)
-                  pl_foot.append(fp); pl_yaw.append(ym)
+                      # Shares the hip with the yaw couple, so it is told what that one
+                      # already holds and refuses a cap the two cannot both have.
+                      rl[nm] = RollCouple(
+                          lever_m=lev, hip_x_m=hxy[:, 0], hip_y_m=hxy[:, 1],
+                          bias_nm=args.roll_couple_nm,
+                          kp_nm_per_rad=args.roll_gain, kd_nm_per_rad_s=args.roll_damp,
+                          cap_nm=(args.roll_cap_nm if args.roll_couple != "off" else 0.0),
+                          sign=args.roll_sign, effort_limit_nm=hip_effort_limit_nm,
+                          shared_with_nm=ycap)
+                  pl_foot.append(fp); pl_yaw.append(ym); pl_roll.append(rl)
               if depth is not None:
                   print(f"[bench] *** RULE-PLANNER ARM, DEPTH PERCEPTION: {n} independent "
                         f"planners, tick {pcfg.feature.TICK_HZ:.0f} Hz. The planner sees "
@@ -1061,6 +1107,7 @@ def run_isaac(args) -> tuple:
           for step in range(ep_steps):
               frame = step % ncyc
               cmd = np.tile(q_seq[frame], (n, 1))
+              tau_pl = np.zeros((n, 12))
 
               if depth is not None:
                   # The fork updates on global_counter % update_interval and then reads a
@@ -1084,7 +1131,8 @@ def run_isaac(args) -> tuple:
                   pos_w = snap(robot.data.root_pos_w)
                   vb = snap(robot.data.root_lin_vel_b)
                   wb = snap(robot.data.root_ang_vel_b)
-                  _, _, yaw_now = quat_to_rpy_deg(snap(robot.data.root_quat_w))
+                  roll_now, _p_now, yaw_now = quat_to_rpy_deg(snap(robot.data.root_quat_w))
+                  roll_now = np.asarray(roll_now, float)
                   psi = np.radians((np.asarray(yaw_now, float) - yaw_ref + 180.0)
                                    % 360.0 - 180.0)
                   # ---- planner tick -------------------------------------------------
@@ -1139,8 +1187,8 @@ def run_isaac(args) -> tuple:
                           pl_foot[k][nm].reset()
                           if pl_yaw[k][nm] is not None:
                               pl_yaw[k][nm].reset()
+                          pl_roll[k][nm].reset()
                   # ---- one control step of whatever is playing -----------------------
-                  tau_pl = np.zeros((n, 12))
                   for k in range(n):
                       nm = pl_sk[k].value
                       ph = pl_ph[k] % len(pl_q[nm])
@@ -1157,6 +1205,13 @@ def run_isaac(args) -> tuple:
                           if pl_yaw[k][nm] is not None:
                               tau_pl[k] = pl_yaw[k][nm].step(pl_sw[nm][ph],
                                                              psi_err_rad=float(psi[k]))
+                          # ADDED, not replacing: the two couples are duals on one joint
+                          # (uniform c gives roll, sign(x)*c gives yaw), so their torques
+                          # superpose and the cap check above is what keeps the sum inside
+                          # the actuator.
+                          tau_pl[k] = tau_pl[k] + pl_roll[k][nm].step(
+                              pl_sw[nm][ph], roll_rad=float(np.radians(roll_now[k])),
+                              roll_rate_rad_s=float(wb[k, 0]))
                       pl_ph[k] = (pl_ph[k] + 1) % len(pl_q[nm])
               elif foots is not None:
                   vb = snap(robot.data.root_lin_vel_b)
@@ -1172,15 +1227,20 @@ def run_isaac(args) -> tuple:
                                        % 360.0 - 180.0)
                   else:
                       psi = np.zeros(n)
+                  roll_now, _pitch_now, _ = quat_to_rpy_deg(snap(robot.data.root_quat_w))
+                  roll_now = np.asarray(roll_now, float)
                   for k in range(n):
                       if alive[k]:
                           cmd[k] = cmd[k] + foots[k].step(float(vb[k, 1]), float(wb[k, 2]),
                                                           swing_seq[frame], vx=float(vb[k, 0]),
                                                           psi_err_rad=float(psi[k]))
+                          tau_pl[k] = rolls[k].step(
+                              swing_seq[frame], roll_rad=float(np.radians(roll_now[k])),
+                              roll_rate_rad_s=float(wb[k, 0]))
               tgt = robot.data.default_joint_pos.clone()
               tgt[:, idx_t] = torch.as_tensor(cmd, device=sim.device, dtype=torch.float32)
               robot.set_joint_position_target(tgt)
-              if PLANNER_ARM and args.yaw_moment != "off":
+              if (PLANNER_ARM and args.yaw_moment != "off") or args.roll_couple != "off":
                   # Written EVERY step including the all-zero ones: an effort target is
                   # sticky, so skipping the write leaves the last non-zero torque applied.
                   eff = torch.zeros_like(tgt)
@@ -1196,15 +1256,34 @@ def run_isaac(args) -> tuple:
               pos = snap(robot.data.root_pos_w)
               idx = tracker.update(pos[:, :2])
               roll, pitch, _ = quat_to_rpy_deg(snap(robot.data.root_quat_w))
-              dead = ((np.abs(np.radians(roll)) > ROLL_PITCH_CUTOFF_RAD)
-                      | (np.abs(np.radians(pitch)) > ROLL_PITCH_CUTOFF_RAD)
-                      | (pos[:, 2] - ground_z < HEIGHT_CUTOFF_M)
-                      | (idx >= NUM_GOALS))
+              roll = np.asarray(roll, float); pitch = np.asarray(pitch, float)
+              # WHICH AXIS, and how far it got before the cutoff.  The termination test is
+              # an OR of three conditions and the row used to record only that one of them
+              # fired, which is not enough to aim a controller: "it fell" does not say
+              # whether it fell sideways, forwards, or through the floor.  Peaks are kept
+              # while the robot is alive only -- a fallen robot keeps rolling.
+              live = alive
+              upright[live] += 1
+              peak_roll[live] = np.maximum(peak_roll[live], np.abs(roll[live]))
+              peak_pitch[live] = np.maximum(peak_pitch[live], np.abs(pitch[live]))
+              over_r = np.abs(np.radians(roll)) > ROLL_PITCH_CUTOFF_RAD
+              over_p = np.abs(np.radians(pitch)) > ROLL_PITCH_CUTOFF_RAD
+              over_z = (pos[:, 2] - ground_z) < HEIGHT_CUTOFF_M
+              dead = over_r | over_p | over_z | (idx >= NUM_GOALS)
               newly = alive & dead
+              # First cause wins, and they are recorded separately because a robot can trip
+              # two at once on the way down.
+              end_cause[newly & over_r] = "roll"
+              end_cause[newly & over_p & ~over_r] = "pitch"
+              end_cause[newly & over_z & ~over_r & ~over_p] = "below"
+              end_cause[newly & (idx >= NUM_GOALS) & ~over_r & ~over_p & ~over_z] = "goals"
+              end_roll[newly] = roll[newly]; end_pitch[newly] = pitch[newly]
               ended[newly] = idx[newly]
               alive &= ~newly
               if not alive.any():
                   break
+          end_cause[alive] = "timeout"
+          end_roll[alive] = roll[alive]; end_pitch[alive] = pitch[alive]
           ended[alive] = tracker.idx[alive]        # the rest time out, upstream's way
           # Where each robot finished, and how far it still had to go.  Recorded because the
           # integer goal count has about three and a half units of usable range.
@@ -1231,6 +1310,20 @@ def run_isaac(args) -> tuple:
                                "dist_to_next_goal_m": float(dist_next[k]),
                                "dist_to_last_goal_m": float(dist_last[k]),
                                "alive_at_end": int(alive[k]),
+                               "end_cause": end_cause[k],
+                               "upright_s": float(upright[k] * dt),
+                               # Forward speed along the CELL's x, over the time the robot
+                               # was actually up.  The gait is an open-loop clip replayed at
+                               # a fixed rate, so STRIDE cannot move -- the phase advance is
+                               # a constant of the harness, not a result.  Speed can, and a
+                               # balance term that buys survival by slowing down has bought
+                               # nothing, so this is the column that says it did not.
+                               "vx_mean_ms": (float((fin_xy[k, 0] - spawns[k][0])
+                                                    / max(upright[k] * dt, 1e-9))),
+                               "end_roll_deg": float(end_roll[k]),
+                               "end_pitch_deg": float(end_pitch[k]),
+                               "peak_roll_deg": float(peak_roll[k]),
+                               "peak_pitch_deg": float(peak_pitch[k]),
                                "switches": int(pl_switches[k]) if PLANNER_ARM else "",
                                "refused_ticks": int(pl_refused[k]) if PLANNER_ARM else "",
                                # Fractions of the steps this robot was UP: they sum to 1.
@@ -1247,9 +1340,25 @@ def run_isaac(args) -> tuple:
                                # after the run has scrolled off.
                                "terrain": terr, "planner_set": planner_stamp,
                                "perception": args.perception,
+                               "roll_couple": args.roll_couple,
+                               "roll_gain": args.roll_gain if args.roll_couple != "off" else "",
+                               "roll_damp": args.roll_damp if args.roll_couple != "off" else "",
+                               "roll_cap_nm": args.roll_cap_nm if args.roll_couple != "off" else "",
+                               "roll_sign": args.roll_sign if args.roll_couple != "off" else "",
                                "partial": int(n < full), "skill": args.skill,
                                "start_phase": args.start_phase, "foot_comp": args.foot_comp,
                                "steps": step + 1})
+          if args.roll_couple != "off":
+              _rcs = ([rolls[k] for k in range(n)] if rolls is not None
+                      else [pl_roll[k][pl_sk[k].value] for k in range(n)])
+              _ap = sum(r.applied for r in _rcs)
+              _ch = sum(r.cap_hits for r in _rcs)
+              _mx = max((r.max_abs_nm for r in _rcs), default=0.0)
+              print(f"[bench] roll couple: {_ap} stance-leg-steps driven, "
+                    f"{100.0*_ch/max(_ap,1):.1f}% of them at the cap, peak hip torque from "
+                    f"this term {_mx:.2f} N.m against the {hip_effort_limit_nm:.2f} N.m "
+                    f"limit. A term that sits at its cap has no room to regulate; a term "
+                    f"that never reaches it is not the binding constraint.")
           print(f"[bench] episode {ep+1}/{args.episodes}: goals reached "
                 f"min {ended.min()} median {np.median(ended):.1f} max {ended.max()}, "
                 f"{int((ended >= NUM_GOALS).sum())}/{n} cells completed the course "
@@ -1349,6 +1458,27 @@ def main() -> int:
                          "0.495 m, so the first recording was 20 s of a grey wall. 0.95 m "
                          "puts the crossing at 0.82 m -- clear by 0.33 -- for a 16 deg "
                          "look-down, which still reads as a side view.")
+    ap.add_argument("--roll-couple", choices=("off", "hold"), default="off",
+                    help="LEVEL 2. The stance-leg roll couple (sim/attitude.py): uniform "
+                         "feed-forward hip torque on the legs the recording has down, "
+                         "which is a roll moment and (to the 3%% front/rear mismatch) no "
+                         "yaw. off (default) reproduces every earlier run bit for bit. "
+                         "Aimed at the only failure the grid has: 200 of 200 terminations "
+                         "are roll, none is pitch.")
+    ap.add_argument("--roll-gain", type=float, default=8.0,
+                    help="N.m of hip torque per rad of roll error")
+    ap.add_argument("--roll-damp", type=float, default=0.8,
+                    help="N.m per rad/s of roll rate. The disturbance is a 2.7 Hz texture, "
+                         "so the rate term is the half that can see it coming.")
+    ap.add_argument("--roll-cap-nm", type=float, default=2.0,
+                    help="magnitude bound on the couple. Refused if it plus the yaw "
+                         "couple's cap exceeds half the hip's effort limit.")
+    ap.add_argument("--roll-couple-nm", type=float, default=0.0,
+                    help="constant open-loop bias, for the SIGN probe: run with --roll-gain 0 "
+                         "and see which way the robot rolls. The derived sign is written "
+                         "down in sim/attitude.py and is not trusted (footcomp.py).")
+    ap.add_argument("--roll-sign", type=float, default=1.0, choices=(1.0, -1.0),
+                    help="flip the derived sign if the open-loop probe says so")
     ap.add_argument("--perception", choices=("optimistic", "depth"), default=None,
                     help="what the Rule-Planner is allowed to see. DEFAULT depth: the "
                          "rendered depth image, inverted by legged_eval's depth_terrain -- "
