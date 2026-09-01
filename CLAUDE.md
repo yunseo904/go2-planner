@@ -52,9 +52,28 @@ Go2 파쿠르: 룰베이스 스킬 플래너 vs E2E 학습 정책 비교 (Isaac 
 ### 지형
 
 - **평가 지형: benchmark 20태스크.** 학습 지형에서 평가하지 않는다 (E2E에 유리해짐).
-- 동결본 `data/benchmark_frozen.npz`를 정본으로 쓴다. 재생성 금지.
-- `height_fields_before_fix`가 정본. upstream의 benchmark 경로는 `fix_terrain`을 호출하지 않으므로 시뮬이 실제로 쓰는 것과 일치한다.
-- 해시 검증: `data/benchmark_frozen.sha256`, `data/upstream_commit.txt`
+- **정본은 `legged_eval` 이다 (2026-09-01 변경).** `~/legged_eval` 은 **읽기 전용**이다
+  — 다른 분이 만든 패키지이고, 이 프로젝트 밖의 여러 모델이 같은 자로 재려고 쓴다.
+  붙이는 코드는 `sim/legged_eval_terrain.py` 하나뿐이고, 지형 로직은 한 줄도 복사하지
+  않는다 (`legged_eval.terrain.build_terrain_class` 에 최소 host 를 물려 그쪽 코드가 돈다).
+- **바뀐 이유:** 동결본에는 upstream 이 모든 패치에 얹는 두 가지가 빠져 있었다 —
+  `random_uniform_terrain` 거칠기(진폭 ±0.02~0.04 m)와 0.1 m 폭 0.5 m 높이의 테두리 벽.
+  둘 다 코스를 **어렵게** 만드는 것이라, 동결본은 E2E 숫자가 나온 것보다 쉬운 벤치마크를
+  재고 있었다. 이 문서의 §3 이 이미 그렇게 적어 두고 있었다.
+- **동결본은 그 둘이 빠진 것에 더해 애초에 다른 추첨이다.** 200 셀 중 같은 것은 20 셀뿐이고,
+  8 개 코스는 최고 높이가 1 m 넘게 다르다. 그래서 **동결본 점수와 legged_eval 점수는
+  평균 내지도, 나란히 비교하지도 않는다.** `run_benchmark.py` 가 모든 행에 `terrain` 열을
+  찍는 이유다.
+- 지형 난수는 **실행 시드를 따른다** (`--terrain-seed`, 기본 1). 시드 1 은 어느 모델에나
+  같은 20 코스이고, 시드 1/2/3 의 퍼짐이 오차 막대다.
+- **`data/benchmark_frozen.npz` 는 평가에 쓰지 않는다.** 지우지도 않는다 — 2026-09-01 이전의
+  모든 숫자(`outputs/bench/`, `terrain_profile.csv`, 오프라인 스윕, 임계값 근거)가 그 위에서
+  나왔고, 지우면 그것들이 재현 불가가 된다. `--terrain frozen` 으로만 닿을 수 있고, 그 런의
+  행은 `terrain=frozen-no-roughness-no-walls` 로 찍힌다.
+- `height_fields_before_fix`가 정본. upstream의 benchmark 경로는 `fix_terrain`을 호출하지 않으므로 시뮬이 실제로 쓰는 것과 일치한다. (legged_eval 경로에서는 이 키가 **거칠기·벽까지
+  올라간 래스터**를 담는다 — 로봇 발밑에 실제로 있는 것이고, 낙관적 인지 아암이 봐야 하는 것도
+  그것이다.)
+- 해시 검증: `data/benchmark_frozen.sha256`, `data/upstream_commit.txt` (동결본 한정)
 
 ### 금지 사항
 

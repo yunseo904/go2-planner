@@ -67,6 +67,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from sim import heightfield as HF
+from sim import legged_eval_terrain as LET
 from terrain_toolkit.paths import FROZEN_NPZ, SKILL_CLIPS_META_JSON
 # Imported HERE, at module scope, and not lazily inside run_isaac().  Importing
 # planner.features into an already-running Kit process exits the process with status 0,
@@ -89,6 +90,41 @@ EPISODE_LENGTH_S = 20.0           # LeggedRobotCfg.env.episode_length_s
 ROLL_PITCH_CUTOFF_RAD = 1.5       # legged_robot.check_termination
 HEIGHT_CUTOFF_M = -0.25           # legged_robot.check_termination
 NUM_GOALS = 8
+
+
+# --------------------------------------------------------------------------- #
+# Where the terrain comes from
+# --------------------------------------------------------------------------- #
+#: ``legged_eval`` is the default and ``frozen`` is kept only so the numbers measured
+#: before 2026-09-01 stay reproducible.  They are DIFFERENT TERRAIN, not two readings of
+#: one: the archive has no roughness and no rim, and it draws its courses from upstream's
+#: own seed rather than the run seed.  Measured over all 200 cells, only 20 of them come
+#: out identical -- the other 180 are a different draw of the same generator, and eight
+#: courses differ by more than a metre in peak height.  So a frozen score and a
+#: legged_eval score may never be averaged or compared, and every row says which it is.
+TERRAIN_SOURCES = ("legged_eval", "frozen")
+
+
+def load_terrain(args):
+    """The archive-shaped dict the rest of this file reads, from either source."""
+    if getattr(args, "terrain", "legged_eval") == "frozen":
+        return np.load(FROZEN_NPZ, allow_pickle=False), None
+    grid = LET.build(seed=args.terrain_seed,
+                     roughness=not getattr(args, "no_roughness", False),
+                     border_walls=not getattr(args, "no_border_walls", False))
+    return LET.as_archive(grid), grid
+
+
+def terrain_stamp(args, grid) -> str:
+    """One string naming the terrain, for the CSV and the banner."""
+    if grid is None:
+        return "frozen-no-roughness-no-walls"
+    bits = ["legged_eval", f"seed{grid.seed}"]
+    if not grid.roughness:
+        bits.append("no-roughness")
+    if not grid.border_walls:
+        bits.append("no-walls")
+    return "-".join(bits)
 
 
 class GoalTracker:
@@ -198,8 +234,9 @@ def aggregate(rows: list) -> dict:
     }
 
 
-def plan_report(args) -> str:
-    z = np.load(FROZEN_NPZ, allow_pickle=False)
+def plan_report(args, z=None, grid=None) -> str:
+    if z is None:
+        z, grid = load_terrain(args)
     cells, names, ts, ls = cell_list(z, args.tasks, args.levels)
     full = len(z["task_names"]) * int(z["num_rows"])
     hs = float(z["horizontal_scale"])
@@ -207,8 +244,12 @@ def plan_report(args) -> str:
     Ly = (z["height_fields_before_fix"].shape[3] - 1) * hs
     ncols = int(z["num_rows"])
     rows = (len(cells) + ncols - 1) // ncols
-    L = [f"frozen archive: {FROZEN_NPZ.name}, {len(names)} tasks x {int(z['num_rows'])} levels "
-         f"= {full} cells",
+    src = (f"legged_eval, terrain seed {grid.seed}, roughness "
+           f"{'on' if grid.roughness else 'OFF'}, border walls "
+           f"{'on' if grid.border_walls else 'OFF'}" if grid is not None
+           else f"FROZEN ARCHIVE {FROZEN_NPZ.name} -- no roughness, no walls, upstream seed")
+    L = [f"terrain: {src}",
+         f"{len(names)} tasks x {int(z['num_rows'])} levels = {full} cells",
          f"selected: {len(cells)} cells ({len(ts)} tasks x {len(ls)} levels)",
          f"grid {rows} x {ncols}, cell {Lx:.1f} x {Ly:.1f} m, gutter {args.gutter:g} cell(s)",
          f"footprint {ncols*Lx*(1+args.gutter):.0f} x {rows*Ly*(1+args.gutter):.0f} m",
@@ -277,8 +318,36 @@ def self_test() -> int:
        abs(a["score"] - 4.0) < 1e-12 and a["n_cells"] == 3)
     ok("ten episodes in one cell do not outvote the other two", a["n_episodes"] == 12)
 
-    # 7. the grid places every cell disjointly and keeps its own heights
-    z = np.load(FROZEN_NPZ, allow_pickle=False)
+    # 7. the protocol constants are legged_eval's, read off legged_eval and not restated
+    d = LET.protocol_defaults()
+    ok("goal threshold is legged_eval's", d["next_goal_threshold"] == NEXT_GOAL_THRESHOLD_M)
+    ok("dwell time is legged_eval's", d["reach_goal_delay"] == REACH_GOAL_DELAY_S)
+    ok("episode length is legged_eval's", d["episode_length_s"] == EPISODE_LENGTH_S)
+    ok("tilt cutoff is legged_eval's", d["roll_pitch_cutoff"] == ROLL_PITCH_CUTOFF_RAD)
+    ok("height cutoff is legged_eval's", d["height_cutoff"] == HEIGHT_CUTOFF_M)
+    ok("goal count is legged_eval's", d["num_goals"] == NUM_GOALS)
+
+    # 8. the generated grid carries the two things the frozen archive does not
+    g = LET.build(seed=1)
+    ok("20 courses, in legged_eval's dispatch order", len(g.names) == 20)
+    c = g.cells[(0, 0)]
+    pad_w = int(0.1 // g.horizontal_scale)
+    rim = int(0.5 // g.vertical_scale)
+    ok(f"a {pad_w}-cell rim is raised to {rim*g.vertical_scale:.3f} m on all four sides",
+       (c.hf_raw[:pad_w, :] == rim).all() and (c.hf_raw[-pad_w:, :] == rim).all()
+       and (c.hf_raw[:, :pad_w] == rim).all() and (c.hf_raw[:, -pad_w:] == rim).all())
+    ok("the rasterised field is not the clean course (roughness is on)",
+       not np.allclose(c.hf_raw * g.vertical_scale, c.hf_clean_m))
+    ok("the spawn is eurekaverse's own x=1.0, y=W/2, z=0",
+       c.spawn == (1.0, g.terrain_width / 2.0, 0.0))
+    g2 = LET.build(seed=2)
+    ok("a different run seed draws a different terrain",
+       not np.array_equal(g.cells[(0, 0)].hf_raw, g2.cells[(0, 0)].hf_raw))
+    ok("the same run seed draws the same terrain",
+       np.array_equal(g.cells[(0, 0)].hf_raw, LET.build(seed=1).cells[(0, 0)].hf_raw))
+
+    # 9. the grid places every cell disjointly and keeps its own heights
+    z = LET.as_archive(g)
     cells = [(t, l) for t in range(3) for l in range(10)]
     V, F, spawns, goals, offs, (rows_, cols_), (Lx, Ly), grp = build_grid(z, cells)
     ok(f"grid {rows_}x{cols_} holds {len(cells)} cells", rows_ * cols_ >= len(cells))
@@ -299,8 +368,13 @@ def self_test() -> int:
        and all(grp[i][1] == grp[i + 1][0] for i in range(len(grp) - 1)))
     ok("the largest collider is under 1 M triangles",
        max(hi[1] - lo[1] for lo, hi in grp) < 1_000_000)
-    ok("goal 0 of cell 0 is the archive's, untranslated",
+    ok("goal 0 of cell 0 is legged_eval's, untranslated",
        np.allclose(goals[0, 0], z["goals_before_fix"][0, 0, 0, :2]))
+    # The goals are eurekaverse's own coordinates and are NOT moved -- legged_eval
+    # 2.5.  If this ever fails, someone has started nudging goals off pits again.
+    ok("no goal has been moved from the course function's output",
+       all(np.array_equal(g.cells[(t, l)].goals,
+                          z["goals_before_fix"][t, l]) for t in range(3) for l in range(10)))
 
     print(f"\nbenchmark self-test: {'PASS' if fails == 0 else f'{fails} FAILURES'}")
     return 0 if fails == 0 else 1
@@ -357,7 +431,8 @@ def run_isaac(args) -> tuple:
     from verify_skill_replay import (_log_motion_for, load_clip, level_start,
                                      quiescent_start, rotate_clip)
 
-    z = np.load(FROZEN_NPZ, allow_pickle=False)
+    z, grid = load_terrain(args)
+    terr = terrain_stamp(args, grid)
     cells, names, ts, ls = cell_list(z, args.tasks, args.levels)
     n = len(cells)
     full = len(names) * int(z["num_rows"])
@@ -369,7 +444,7 @@ def run_isaac(args) -> tuple:
             f"trap evaluate.py's num_envs clamp has, defeated by helpers.py). Pass "
             f"--allow-partial to run anyway; every row will be stamped partial=1 and the "
             f"printed mean is a wiring check, not a score.")
-    print(plan_report(args))
+    print(plan_report(args, z, grid))
 
     ucfg = IC.load()
     sys.path.insert(0, str(Path(ucfg.source).parents[3]))
@@ -408,7 +483,13 @@ def run_isaac(args) -> tuple:
         raise SystemExit(f"[bench] refusing to run: the ground plane at {plane_path} is "
                          f"still on the stage. 12 of the 20 tasks carry -1.0 m pits over "
                          f"16-48% of their area and every one of them would be floored.")
-    pit = int((z["height_fields_before_fix"][ts] < 0).any(axis=(1, 2, 3)).sum())
+    # legged_eval.terrain.PIT_DEPTH, not "< 0".  Once roughness is on, every cell dips a
+    # few millimetres below datum somewhere, so a "< 0" test calls all 20 tasks pitted and
+    # stops distinguishing anything.  -0.25 m is legged_eval's own threshold and it sits in
+    # an empty gap: these courses' holes are all exactly -1.0 m.
+    pit_depth = getattr(LET._import_legged_eval(), "PIT_DEPTH", -0.25)
+    pit = int((z["height_fields_before_fix"][ts] * float(z["vertical_scale"])
+               < pit_depth).any(axis=(1, 2, 3)).sum())
     print(f"[bench] removed the importer's infinite ground plane at {plane_path}; the "
           f"{pit} of {len(ts)} selected tasks that contain pits are open")
     print(f"[bench] terrain: {len(V)} vertices, {len(F)} faces, {n} cells in {rows}x{cols}")
@@ -419,6 +500,33 @@ def run_isaac(args) -> tuple:
         xf = UsdGeom.Xform.Define(stage, f"/World/envs/env_{k}")
         xf.AddTranslateOp().Set(Gf.Vec3d(float(spawns[k][0]), float(spawns[k][1]), 0.0))
     robot = Articulation(UNITREE_GO2_CFG.replace(prim_path="/World/envs/env_.*/Robot"))
+
+    # ---------------------------------------------------------------- side-view video
+    # One camera per recorded cell, created HERE -- before sim.reset(), like every other
+    # sensor, because a camera added after the scene is built is never rendered in this
+    # stack.  They render ON DEMAND (update_period 0.0) and never schedule themselves, and
+    # grab_frame() below calls sim.render() and nothing else: the physics substep loop is
+    # untouched -- same phys_dt, same decimation, same order of writes, same control rate.
+    # That is an argument, not a proof, so --video also prints the regression check the
+    # user asked for: run the same cells with and without it and compare goals and steps.
+    video = None
+    if args.video:
+        from isaaclab.sensors import Camera, CameraCfg
+        vc = list(args.video_cells) if args.video_cells else [0]
+        bad = [k for k in vc if not (0 <= k < n)]
+        if bad:
+            raise SystemExit(f"[bench] --video-cells {bad} outside 0..{n-1}")
+        cams = [Camera(CameraCfg(
+            prim_path=f"/World/side_cam_{i}", update_period=0.0,
+            height=args.video_height, width=args.video_width, data_types=["rgb"],
+            spawn=sim_utils.PinholeCameraCfg(focal_length=24.0,
+                                             clipping_range=(0.05, 60.0))))
+            for i in range(len(vc))]
+        video = {"cams": cams, "cells": vc, "frames": 0}
+        print("[bench] video: side view of cells " +
+              ", ".join(f"{k} ({names[cells[k][0]]}, level {cells[k][1]})" for k in vc) +
+              f", {args.video_width}x{args.video_height} -> {args.video}")
+
     sim.reset()
     if robot.num_instances != n:
         raise SystemExit(f"[bench] {robot.num_instances} robots for {n} cells")
@@ -563,11 +671,22 @@ def run_isaac(args) -> tuple:
               flush=True)
         traceback.print_exception(type(exc), exc, exc.__traceback__)
         sys.stdout.flush(); sys.stderr.flush()
-    ground_z = np.array([HF.height_at(z["height_fields_before_fix"][t, l],
-                                      float(z["horizontal_scale"]),
-                                      float(z["vertical_scale"]),
-                                      float(z["spawn_x"]), float(z["spawn_y"]))
-                         for (t, l) in cells])
+    # THE SPAWN, and the datum the pit rule is measured against, are legged_eval's.
+    #
+    # eurekaverse resets to `base_init_state + env_origin` with `origin_zero_z = True`, so
+    # the robot appears at a FIXED height above the patch datum z = 0 -- not above the
+    # ground under its feet.  This harness used to add args.spawn_z to the sampled terrain
+    # height, which was the same thing while the archive's spawn strip was exactly flat
+    # and is not any more: roughness moves the ground under the spawn by +-0.025 m, so
+    # sampling it would give every cell its own drop height and no two models the same one.
+    #
+    # The pit cutoff follows the same datum.  legged_eval terminates on
+    # `root_states[:, 2] < -0.25` in world coordinates, and this grid puts every cell's
+    # datum at z = 0, so patch-local and world z are the same number here.  Subtracting a
+    # per-cell ground sample (what this did before) would let a robot walk along the floor
+    # of a 1 m pit without ever tripping the rule.
+    spawn_datum_z = float(z.get("spawn_z", 0.0)) if isinstance(z, dict) else 0.0
+    ground_z = np.full(n, spawn_datum_z, dtype=float)
     root0 = robot.data.default_root_state.clone()
     root0[:, 0] = torch.as_tensor(spawns[:, 0], device=sim.device, dtype=root0.dtype)
     root0[:, 1] = torch.as_tensor(spawns[:, 1], device=sim.device, dtype=root0.dtype)
@@ -586,6 +705,44 @@ def run_isaac(args) -> tuple:
     n_settle = max(int(args.settle_s / dt), 1)
     ep_steps = int(EPISODE_LENGTH_S / dt)
     tracker = GoalTracker(goals, dt)
+
+    def grab_frame():
+        """One RGB frame per recorded cell.  RENDERS ONLY -- never steps physics.
+
+        All poses are set first, then ONE sim.render(), then the read-backs, because
+        render() draws every sensor in the scene: doing it per camera would be one full
+        render per recorded cell per frame.
+        """
+        p_ = snap(robot.data.root_pos_w)
+        for cam, k in zip(video["cams"], video["cells"]):
+            y0 = float(spawns[k][1])
+            eye = torch.tensor([[float(p_[k, 0]), y0 + args.video_side_m,
+                                 max(0.35, float(p_[k, 2]) + 0.12)]],
+                               device=sim.device, dtype=torch.float32)
+            tgt_ = torch.tensor([[float(p_[k, 0]), y0, 0.28]],
+                                device=sim.device, dtype=torch.float32)
+            cam.set_world_poses_from_view(eye, tgt_)
+        sim.render()
+        for cam, k in zip(video["cams"], video["cells"]):
+            cam.update(dt, force_recompute=True)
+            rgb = cam.data.output["rgb"][0].detach().cpu().numpy()
+            video["writers"][k].append_data(
+                np.ascontiguousarray(rgb[..., :3]).astype(np.uint8))
+        video["frames"] += 1
+
+    if video is not None:
+        import imageio.v2 as imageio
+        out_dir = Path(args.video)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        fps = max(1.0, 1.0 / (dt * args.video_stride))
+        video["writers"] = {}
+        for k in video["cells"]:
+            t_, l_ = cells[k]
+            fn = out_dir / f"cell{k:03d}_{names[t_]}_lvl{l_}.mp4"
+            video["writers"][k] = imageio.get_writer(
+                str(fn), fps=fps, macro_block_size=None, codec="libx264", quality=8)
+        print(f"[bench] video: {len(video['cells'])} clip(s) at {fps:.1f} fps -> {out_dir}")
+
     rows_out = []
     t0 = time.time()
     try:
@@ -815,6 +972,9 @@ def run_isaac(args) -> tuple:
               for _ in range(decim):
                   robot.write_data_to_sim(); sim.step(); robot.update(phys_dt)
 
+              if video is not None and step % args.video_stride == 0:
+                  grab_frame()
+
               pos = snap(robot.data.root_pos_w)
               idx = tracker.update(pos[:, :2])
               roll, pitch, _ = quat_to_rpy_deg(snap(robot.data.root_quat_w))
@@ -863,6 +1023,11 @@ def run_isaac(args) -> tuple:
                                "frac_TURN": _frac(pl_held, "TURN", k) if PLANNER_ARM else "",
                                "yaw_moment": args.yaw_moment,
                                "yaw_moment_gain": args.yaw_moment_gain,
+                               # WHICH TERRAIN.  A legged_eval row and a frozen row are
+                               # not two readings of one benchmark and must never be
+                               # averaged together; this column is how that stays visible
+                               # after the run has scrolled off.
+                               "terrain": terr,
                                "partial": int(n < full), "skill": args.skill,
                                "start_phase": args.start_phase, "foot_comp": args.foot_comp,
                                "steps": step + 1})
@@ -873,6 +1038,14 @@ def run_isaac(args) -> tuple:
     except Exception as _exc:
         _loud(_exc)
         raise
+    finally:
+        if video is not None and "writers" in video:
+            for w in video["writers"].values():
+                w.close()
+            print(f"[bench] video: {video['frames']} frames per clip -> {args.video}")
+            print("[bench] REGRESSION CHECK: re-run these cells without --video and "
+                  "compare `goals` and `steps` per row. Recording only adds render() "
+                  "calls between control steps; if any row moves, it did not.")
     return rows_out, aggregate(rows_out), n < full
 
 
@@ -883,6 +1056,21 @@ def main() -> int:
                     help="clip to hold on every cell, or PLANNER for the "
                          "Rule-Planner arm (each robot picks its own)")
     ap.add_argument("--rate", choices=("hi", "lo"), default="lo")
+    ap.add_argument("--terrain", choices=TERRAIN_SOURCES, default="legged_eval",
+                    help="legged_eval (default): the courses generated by legged_eval, "
+                         "WITH its roughness and its border walls, seeded off --terrain-seed. "
+                         "frozen: data/benchmark_frozen.npz, which has neither and draws "
+                         "from upstream's own seed. The two are different terrain (180 of "
+                         "200 cells differ), so their scores may not be compared; every "
+                         "row is stamped with which one it was.")
+    ap.add_argument("--terrain-seed", type=int, default=1,
+                    help="legged_eval's terrain draw. Seed 1 is the same 20 courses for "
+                         "every model; 1/2/3 are three draws whose spread is the error bar.")
+    ap.add_argument("--no-roughness", action="store_true",
+                    help="drop legged_eval's uniform noise. Off the protocol -- for "
+                         "isolating the noise's effect, not for scoring.")
+    ap.add_argument("--no-border-walls", action="store_true",
+                    help="drop legged_eval's 0.1 m / 0.5 m rim. Off the protocol.")
     ap.add_argument("--tasks", type=int, nargs="*", default=None)
     ap.add_argument("--levels", type=int, nargs="*", default=None)
     ap.add_argument("--episodes", type=int, default=1)
@@ -917,6 +1105,22 @@ def main() -> int:
     ap.add_argument("--allow-partial", action="store_true",
                     help="run fewer than all 200 cells. The printed mean is then a wiring "
                          "check and NOT a benchmark score; every row is stamped partial=1")
+    ap.add_argument("--video", default=None,
+                    help="directory for side-view mp4s, one per --video-cells entry. "
+                         "NEEDS A GPU and --enable_cameras; without a card Isaac Lab does "
+                         "not fail, it hangs in carb.cudainterop. Record in its own run "
+                         "and check the scores against the unrecorded one.")
+    ap.add_argument("--video-cells", type=int, nargs="*", default=None,
+                    help="which cells to film, as indices into the SELECTED cell list "
+                         "(--plan prints it). Default: cell 0.")
+    ap.add_argument("--video-width", type=int, default=960)
+    ap.add_argument("--video-height", type=int, default=540)
+    ap.add_argument("--video-stride", type=int, default=1,
+                    help="capture one frame every N control steps; fps is set from it so "
+                         "the clip stays real time")
+    ap.add_argument("--video-side-m", type=float, default=2.4,
+                    help="camera offset across the lane, metres. The lane is 4 m wide and "
+                         "the rim is 0.5 m tall, so much less than this looks over a wall.")
     ap.add_argument("--results-csv", default=None)
     ap.add_argument("--plan", action="store_true")
     ap.add_argument("--self-test", action="store_true")
@@ -942,7 +1146,7 @@ def main() -> int:
     print(f"skill {args.skill}   cells {agg['n_cells']}   episodes {agg['n_episodes']}")
     print(f"goals reached, mean over cells (equal weight): {agg['score']:.2f} / {NUM_GOALS}")
     print("\nper task:")
-    z = np.load(FROZEN_NPZ, allow_pickle=False)
+    z, _grid = load_terrain(args)
     names = [str(x) for x in z["task_names"]]
     for t in sorted(agg["per_task"]):
         print(f"  {names[t]:36s} {agg['per_task'][t]:5.2f}")

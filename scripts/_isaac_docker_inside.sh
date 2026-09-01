@@ -9,6 +9,11 @@
 # UPSTREAM_ROOT by its normal sibling rule and needs no $EUREKAVERSE_ROOT override:
 #     /workspace/go2-planner                (rw)  <- ~/projects/go2-planner
 #     /workspace/eurekaverse-go2-parkour    (ro)  <- ~/ev-go2
+#     /opt/legged_eval                      (ro)  <- ~/legged_eval
+# legged_eval is pip install -e'd on the host but the container has its own
+# site-packages, so it is mounted and put on PYTHONPATH instead. Read-only because it is
+# someone else's package and the benchmark's definition -- the same mount point and the
+# same :ro as ~/rule_walker_run.sh uses, so both entry points see one copy.
 # The upstream mount is :ro so the read-only rule is enforced by the kernel rather than
 # by discipline. The host tree is deliberately NOT chmod-locked (CLAUDE.md 1).
 set -eu
@@ -17,7 +22,10 @@ PY="${ISAACLAB_PATH:-/workspace/isaaclab}/isaaclab.sh -p"
 # /ihome/pysite carries the deps the image lacks. scipy is pinned to 1.13.1 there and
 # numpy was deliberately removed; PYTHONPATH outranks site-packages, so a numpy in
 # pysite would shadow the one this image's torch and isaacsim were built against.
-export PYTHONPATH="$REPO:/ihome/pysite${PYTHONPATH:+:$PYTHONPATH}"
+LE=/opt/legged_eval
+[ -d "$LE" ] || LE=""
+export PYTHONPATH="$REPO${LE:+:$LE}:/ihome/pysite${PYTHONPATH:+:$PYTHONPATH}"
+export LEGGED_EVAL_ROOT="${LEGGED_EVAL_ROOT:-$LE}"
 export PYTHONPYCACHEPREFIX=/tmp/pycache
 
 if [ "${QUIET:-0}" != "1" ]; then

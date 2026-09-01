@@ -46,6 +46,14 @@ PROJ=$(dirname "$HERE")
 # readlink -f because ~/projects/eurekaverse-go2-parkour is a symlink to ~/ev-go2 and a
 # bind-mount source has to be the real path.
 UPSTREAM=$(readlink -f "$PROJ/../eurekaverse-go2-parkour")
+# legged_eval defines the benchmark (terrain, seeding, episode rules, aggregation) and is
+# read-only: someone else's package. Mounted :ro so that is enforced, not just intended.
+LEGGED_EVAL=$(readlink -f "${LEGGED_EVAL_ROOT:-$HOME/legged_eval}")
+[ -f "$LEGGED_EVAL/legged_eval/terrain.py" ] || {
+  echo "[docker] legged_eval not found at $LEGGED_EVAL -- it is the benchmark's" >&2
+  echo "[docker]   definition, not an optional dependency. Set LEGGED_EVAL_ROOT." >&2
+  exit 3
+}
 
 IHOME=$HOME/isaaclab_cache/home
 mkdir -p "$IHOME/.cache/ov" "$IHOME/.nv" "$IHOME/.local/share/ov" "$HOME/isaaclab_cache/kit"
@@ -88,6 +96,7 @@ exec docker run --rm --name "$NAME" ${GPUARG} \
   -e QUIET="${QUIET:-0}" \
   -v "$PROJ":/workspace/go2-planner \
   -v "$UPSTREAM":/workspace/eurekaverse-go2-parkour:ro \
+  -v "$LEGGED_EVAL":/opt/legged_eval:ro \
   -v "$HERE/_isaac_docker_inside.sh":/opt/inside.sh:ro \
   -v "$IHOME":/ihome \
   -v "$HOME/isaaclab_cache/kit":/isaac-sim/kit/cache \
