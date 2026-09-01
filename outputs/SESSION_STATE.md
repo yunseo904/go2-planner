@@ -113,19 +113,35 @@ Investigated only; nothing applied.
   the narrowest gap on the grid is 0.10 m and the widest 5.15 m.  More torque buys apex,
   and apex is not what is binding.  Ten of twenty courses stay at zero either way.
 
-## 5. Videos — `outputs/video_le/`
+## 5. Videos — `outputs/video_le/`, and the regression check passed exactly
 
 Side-view mp4s, ported into `run_benchmark.py` from `run_calibration_grid.py`'s camera:
 created before `sim.reset()`, `update_period 0.0`, and `grab_frame()` calls `sim.render()`
 and nothing else, so the substep loop keeps its `phys_dt`, decimation and write order.
-Cells filmed mix switching with pits — `sideways_ramp` L6 (8 switches, pit),
-`box_jump_even` L6 (pit, the furthest any planner robot got at 2.09 m), `staircase_spiral`
-L3 (the largest TROT share on the grid, 0.42), `flat_circle_jump` L0 (pit, 2.18 m),
-`jump_on_and_off_box` L9 (6 switches, alive at 20 s).
+Five 20 s clips at 960x540, 25 fps, mixing switching with pits — `sideways_ramp` L6
+(8 switches, pit), `box_jump_even` L6 (pit, the furthest any planner robot got at 2.09 m),
+`staircase_spiral` L3 (the largest TROT share on the grid, 0.42), `flat_circle_jump` L0
+(pit, 2.18 m), `jump_on_and_off_box` L9 (6 switches, alive at 20 s).
 
-**Regression check: the recorded run is the full 200 cells with the same seed and settings,
-so its CSV is compared row by row against `outputs/bench_le/planner.csv`.**  See §8 for the
-outcome.
+**The regression check is the strongest form available and it passed.**  The recorded run
+is the full 200 cells at the same seed and settings, so it was compared against
+`outputs/bench_le/planner.csv` row by row: **200 rows x 27 columns, every value identical**
+— `goals`, `steps`, `settle_ok`, `alive_at_end`, `switches`, the skill fractions and the
+positions to the last digit.  Note that the recorded run also had `GPU=1` while the scored
+one had `GPU=none`, so this re-confirms `isaac_docker_run.sh`'s claim that the card changes
+nothing when nothing renders.
+
+**The first recording was 20 s of a grey wall, and the arithmetic says why.**  The camera
+sits 2.4 m across the lane, which is 0.4 m *outside* the 4 m patch — and legged_eval's rim
+stands between it and the robot.  The sight line crosses the wall at y = 3.95, which is
+0.1875 of the way from eye to target; at the old eye height of base + 0.12 m that crossing
+is at 0.40 m and the rim is 0.495 m.  `--video-eye-m` (default 0.95 m) puts the crossing at
+0.82 m, clear by 0.33, for a 16 deg look-down that still reads as a side elevation.  Worth
+remembering as a shape: **the rim was invisible in every number and immediately visible the
+first time anyone looked.**
+
+The clips also show the roughness directly — the floor is visibly faceted, which is the
+thing §2 says costs a third of the score.
 
 ## 6. `benchmark_frozen.npz` — kept, retired, labelled
 

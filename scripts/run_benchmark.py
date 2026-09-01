@@ -717,7 +717,7 @@ def run_isaac(args) -> tuple:
         for cam, k in zip(video["cams"], video["cells"]):
             y0 = float(spawns[k][1])
             eye = torch.tensor([[float(p_[k, 0]), y0 + args.video_side_m,
-                                 max(0.35, float(p_[k, 2]) + 0.12)]],
+                                 max(args.video_eye_m, float(p_[k, 2]) + 0.6)]],
                                device=sim.device, dtype=torch.float32)
             tgt_ = torch.tensor([[float(p_[k, 0]), y0, 0.28]],
                                 device=sim.device, dtype=torch.float32)
@@ -1119,8 +1119,17 @@ def main() -> int:
                     help="capture one frame every N control steps; fps is set from it so "
                          "the clip stays real time")
     ap.add_argument("--video-side-m", type=float, default=2.4,
-                    help="camera offset across the lane, metres. The lane is 4 m wide and "
-                         "the rim is 0.5 m tall, so much less than this looks over a wall.")
+                    help="camera offset across the lane, metres. The lane is 4 m wide, so "
+                         "2.4 puts the camera 0.4 m OUTSIDE the patch -- and legged_eval's "
+                         "0.1 m rim, raised 0.5 m, is then between it and the robot.")
+    ap.add_argument("--video-eye-m", type=float, default=0.95,
+                    help="camera height floor, metres. THE RIM IS WHY THIS EXISTS. At the "
+                         "default 2.4 m offset the sight line crosses the wall at y = 3.95, "
+                         "which is 0.1875 of the way from eye to target; at the old eye "
+                         "height of base+0.12 that crossing is 0.40 m and the rim is "
+                         "0.495 m, so the first recording was 20 s of a grey wall. 0.95 m "
+                         "puts the crossing at 0.82 m -- clear by 0.33 -- for a 16 deg "
+                         "look-down, which still reads as a side view.")
     ap.add_argument("--results-csv", default=None)
     ap.add_argument("--plan", action="store_true")
     ap.add_argument("--self-test", action="store_true")
