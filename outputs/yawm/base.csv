@@ -1,0 +1,2 @@
+argv,dt,executed_switches,foot_comp,gate_deferrals,heading,initial,max_cmd_jump_rad,min_switch_gap_s,n_steps,pairs,planner_switches,refused_skills,refused_ticks,run_utc,schedule,seg_not_ok,seg_ok,segments,speed_gate,speed_refusals,switch_blend_s,switch_entry,switch_gate,term_reason,terminated_s
+--schedule hold --initial TROT --heading heading-only --headless --device cpu --results-csv outputs/yawm/base.csv --trace-npz outputs/yawm/trace_base.npz,0.02,0,on,0,heading-only,TROT,,,2000,,0,,0,2026-09-01T07:23:41Z,hold,0,1,1,off,0,0.0,contact,off,,

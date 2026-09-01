@@ -758,7 +758,13 @@ def run_isaac(args) -> list:
                 robot.set_joint_effort_target(eff)
             for _ in range(decim):
                 robot.write_data_to_sim(); sim.step(); robot.update(phys_dt)
-            if yaws is not None:
+            # Recorded in BOTH arms, always -- not only when the couple is on.  The
+            # first version recorded it only in the --yaw-moment arm, which made the two
+            # rows that reached the 23.70 Nm clip unreadable: with no control column
+            # there is no way to say whether the couple pushed the hip into the clip or
+            # whether the terrain had it there already.  A saturation number without its
+            # own control is not evidence about the intervention.
+            if np.isfinite(hip_effort_limit_nm):
                 _th = np.abs(snap(robot.data.applied_torque)[:, jidx][:, 0::3]).max(axis=1)
                 tau_hip_max = np.maximum(tau_hip_max, _th)
                 hip_sat |= _th >= hip_effort_limit_nm - 1e-3

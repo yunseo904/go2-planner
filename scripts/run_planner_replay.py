@@ -401,8 +401,15 @@ def run_isaac(args) -> dict:
             note = (f"  <- MEASURED (turn_entry_phase.md), overriding the rule's "
                     f"{ph['start_frame']}")
             ph = dict(ph, start_frame=k, spread_at_start=float("nan"))
+        # A MEASUREMENT knob, not an intervention: it shifts where in its own cycle a
+        # clip is entered and changes no controller.  It exists because a result on one
+        # entry phase is one draw from a chaotic plant -- trot_straight.md 4b is what
+        # happens when that is believed -- and this rig had no way to take another.
+        if args.entry_offset:
+            k = (k + int(args.entry_offset)) % len(clips[sid]["q_des"])
+            note += f"  (+{int(args.entry_offset)} entry offset -> {k})"
         clips[sid] = rotate_clip(clips[sid], k)
-        print(f"[planner]   {sid.value:5s} entry frame {ph['start_frame']}, "
+        print(f"[planner]   {sid.value:5s} entry frame {k}, "
               f"foot spread {ph['spread_at_start']*1000:.1f} mm{note}")
 
     initial = SkillId[args.initial]
@@ -885,6 +892,12 @@ def main() -> int:
                     help="which skill carries the term (default TROT, the only one whose "
                          "heading authority is spent; WALK already meets the budget). "
                          "'all' puts it on every supported skill.")
+    ap.add_argument("--entry-offset", type=int, default=0,
+                    help="shift EVERY clip's entry frame by this many frames from whatever "
+                         "the rule chose. 0 (default) is the rule's own answer and every "
+                         "earlier result. A measurement knob: one entry phase is one draw "
+                         "from a chaotic plant, and a claim that only holds at one phase is "
+                         "not a claim (outputs/trot_straight.md 4b).")
     ap.add_argument("--entry-turn", choices=("rule", "measured"), default="rule",
                     help="where a TURN replay starts in its cycle. rule (default, and what "
                          "every earlier result used): verify_skill_replay.level_start, the "
