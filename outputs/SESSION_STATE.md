@@ -165,20 +165,80 @@ saying what it is, and CLAUDE.md §2 records the change.
   wrong, but the comparison it exists to support no longer holds.  **Not fixed: legged_eval
   is read only.**  Reported, not patched.
 
-## 8. What to do next, in order
+## 8. The oracle ceiling, depth, and the threshold — `outputs/oracle_and_depth.md`
 
-1. **Roughness is now the binding constraint, and it is 40 mm of noise.**  WALK's measured
-   step bracket is 0.04–0.06 m, so the terrain is at the limit everywhere at once.  That is
-   a sharper target than "the library is the ceiling" and it is testable: raise WALK's
-   ground clearance, or add the terrain-following the recording does not have.
-2. **The depth arm is not wired.**  `run_benchmark.py` has no camera path;
-   `legged_eval`'s `rule_walker` adapter has one, but its locomotion is a *generated* gait,
-   not our clip replay — its `RULE_MODE=clip` scored **0.00 goals on 30 cells** with the
-   open-loop clip falling at 3.68 s, matching `open_loop_replay_limit.md`.  So it does not
-   answer "our Rule-Planner with real depth"; that needs a `TiledCamera` in our harness
-   feeding `legged_eval.adapters.depth_terrain.local_maps_batch`.  Timing measured on GPU 1:
-   30 envs × 400 steps with depth is ~25 s of stepping, so 200 envs × 2000 steps is roughly
-   **15 min plus 4 min of startup**.
-3. **`effort_limit`** — still the user's call, now with the labels resolved (§4).
-4. The 21 zero-scoring cells of the old grid are now 60–143 depending on the arm; the
-   question "which cells and why" is worth asking again on this terrain.
+| | score / 8 |
+|---|---|
+| E2E teacher, same protocol, seed 1 | **4.83** |
+| **ORACLE — best single skill per cell** | **0.81** |
+| WALK fixed, no perception at all | 0.76 |
+| Rule-Planner, **depth** | 0.60 |
+| Rule-Planner, `STEP_TROT_MAX` corrected to the measured 0.03 | 0.59 |
+| Rule-Planner, as configured | 0.57 |
+| TROT fixed | 0.29 |
+| TURN fixed (new — completes the envelope) | 0.17 |
+
+**A perfect chooser gains 0.06 over always walking.**  Some skill beats WALK in 12 of 200
+cells; in the other 188 the library has nothing better.  The rules are not choosing badly,
+they are choosing among options that are not there.  **Planner redesign is not the route.**
+
+**The depth arm is 0.03 better than the privileged one**, because it never selects TROT
+(0 cells against 14) and TROT is the gait that survives 1 cell of 200.  Both numbers say
+the same thing: sees-everything 0.57, sees-what-the-robot-sees 0.60, sees-nothing 0.76.
+Perception is not the limit either.
+
+**The threshold correction is real and small.**  0.57 → 0.59, better in 5 cells worse in 1,
+TROT usage 14 cells → 5.  0.02 and 0.03 give the same score, so the choice inside the
+measured bracket does not matter and `planner/config.py` keeps its 0.08 placeholder and its
+`CALIBRATION_NEEDED` mark — the override is a run argument (`--planner-set`) and is stamped
+on every row.
+
+Everything between 0.57 and 0.81 is planner engineering and the whole of it is 0.24.
+Everything between 0.81 and 4.83 is the skill library and it is 4.02.
+
+## 9. The 37 cells the planner loses to WALK
+
+**All 37 used TURN.  None was lost while running WALK alone.**  `frac_TURN` median 0.472
+against 0.256 over the whole grid; the planner travels 0.31 m less than WALK in those cells
+and ends with 0.19 goals against WALK's 1.22.  It is upright for a median 3.42 s and spends
+**1.52 s of that turning on the spot at 0.0075 m/s**.
+
+Same mechanism as the old 6 cells, six times as many of them — the rougher ground turns the
+heading over faster, so the planner re-aims more often, and each re-aim is most of the life
+it has left.  Across the whole grid the relation is not monotone (no TURN 0.42, TURN < 0.3
+0.64, TURN >= 0.3 0.52), which is a correlation on cells of differing difficulty and not a
+demonstration that TURN causes the loss — but the paired within-cell comparison above is.
+
+## 10. Level 2 — designed, not built — `outputs/level2_design.md`
+
+A stance-phase attitude regulator on the channel `sim/yawmoment.py` already proved
+(feed-forward hip torque into the legs the recording has on the ground; 6x the authority of
+moving a swing foot; additive to the PD, measured; 11.95 N·m peak against the 23.70 clip
+with 0 of 2000 steps clipped, so there is room for a second term).
+
+The evidence says it recovers about **two thirds** of the roughness loss and not the rest:
+of the 64 cells WALK survives without roughness, 44 stop surviving with it — that part is
+balance — but in the 136 that fall either way the roughness still costs 0.23 m of travel
+and 0.33 of a goal, and there is no survival left to lose there.  Estimated ceiling ~0.98
+against WALK's 0.76, with the oracle at 0.81.  Worth having; not a route to 4.83.
+
+Falsifiable as specified: excursion must fall monotonically with gain on a flat-plus-noise
+rig, and stride and forward speed must not move (the yaw couple's claim to be free was
+v_x 0.664 → 0.661 and stride unchanged).
+
+## 11. What to do next, in order
+
+1. **The skill library is the whole question now, and the oracle proves it.**  0.81 is what
+   a perfect chooser gets; 4.83 is the teacher.  Nothing in the planner closes that.  What
+   is missing is concrete: a gait that holds on 40 mm of noise, and a forward-travelling
+   jump (`front_jump` moves 26 mm horizontally; the narrowest gap on the grid is 0.10 m).
+2. **Level 2 (§10) is the first piece of item 1** and is designed and costed.  It needs a
+   decision, not more measurement.
+3. **TURN costs more than it buys in its current form** (§9).  It is 1.5 s of a 3.4 s life
+   at 0.0075 m/s.  Either a faster re-aim, or cross-track correction inside WALK instead —
+   `SESSION_STATE` (2) §3 already measured the yaw couple taking WALK's curvature to
+   0.24 °/m, so the heading may not need TURN at all on this terrain.
+4. **`effort_limit`** — closed as far as evidence goes (§4); the decision is the user's and
+   45.43 is confirmed to be the published peak.  Recorded, not acted on.
+5. `staircase_walking_full_width` and `staircase_spiral` score **0.00 in every arm**,
+   including the oracle.  Two courses of twenty that nothing in the library touches at all.
