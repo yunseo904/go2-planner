@@ -485,3 +485,47 @@ Worth stating plainly because of what the failure looked like: **a benchmark sco
 across all 200 cells is exactly what a single-skill lower bound might legitimately produce**,
 and it would have been believable.
 
+
+---
+
+## 16. `--entry-offset` counts from a different frame in the two harnesses, and `final_dist_m` is a distance to the GOAL
+
+Two reads, both wrong, both about the same run, and both of the shape CLAUDE.md §6.5
+describes: the number returned was *almost* the number wanted.
+
+**(a) The offset origins differ.** `run_planner_replay.py --entry-offset` shifts from
+whatever `level_start` chose, and for TROT that is **frame 16**. `run_calibration_grid.py
+--entry-offset` shifts the rep-0 schedule, which starts at **frame 0**. So the same flag
+value names a different clip frame in the two harnesses:
+
+| planner offset | 0 | 16 | 17 | 29 |
+|---|---|---|---|---|
+| **clip frame** | **16** | **0** | **1** | **13** |
+
+The flat sweep found TROT survives at planner offsets 0, 16, 17, 29 — i.e. **clip frames
+16, 0, 1 and 13**. The ladder was then re-run at grid offsets 0, 16 and 17, of which the
+first two are those frames and **the third is not**: grid offset 17 is clip frame 17,
+which is a phase TROT dies at. A third of the "ladder at the surviving phases" experiment
+was run at a dead phase and reported as a survivor.
+
+Both harnesses print the resolved frame, and the planner one prints the arithmetic
+(`+17 entry offset -> 1`). The information was on the screen and was not read.
+
+**(b) `final_dist_m` is the distance from the robot to GOAL 2 when the run ended**
+(`dist = norm(root_pos_w[:, :2] - goal2)`), not the distance it travelled. Read as
+progress it inverts the sign of every comparison. The dead-phase rows came back at
+"3.85–3.88 m" at all fifteen levels and were reported as "reaches 3.87 m at every level,
+so it is failing at a fixed place" — a specific, plausible mechanism, and backwards.
+Against the trace those robots travel **0.52 m and fall at 1.50–1.52 s**, three metres
+short of an obstacle at x = 4.0. The number was identical across levels for the most
+ordinary reason available: the terrain was never reached, so the level could not matter.
+
+**What makes (b) hard to catch is that it looks like the finding.** A column that does not
+respond to the ladder parameter is exactly what a harness bug looks like *and* exactly
+what "the limit is below the smallest level" looks like (`turn_probes.md` §4 is a real
+instance of the latter). The defence is the one that worked here: open the trace and ask
+where the robot actually was, which is a second frame for the same quantity.
+
+**Guard.** Both help strings now state their origin and point here. Nothing in the code
+changed — the trap is in reading, and the harnesses were already printing enough to avoid
+it.

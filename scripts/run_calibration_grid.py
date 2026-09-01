@@ -1069,9 +1069,14 @@ def main() -> int:
                     help="magnitude bound on that half (rad). 0.04 is the largest amplitude "
                          "the open-loop probe survived on TROT; -0.06 fell at 2.77 s")
     ap.add_argument("--entry-offset", type=int, default=0,
-                    help="shift every repeat's entry frame by this many frames. 0 (default) "
-                         "is the schedule every earlier grid run used. A MEASUREMENT knob: "
-                         "it changes no controller. See entry_frames() for why it exists.")
+                    help="shift every repeat's entry frame by this many frames. At --reps 1 "
+                         "the offset IS the clip frame, because this schedule starts at "
+                         "frame 0 -- which is NOT the origin run_planner_replay.py "
+                         "--entry-offset uses (it offsets from level_start's choice, frame "
+                         "16 for TROT), so the same number means a different frame in the "
+                         "two harnesses (harness_findings.md 16). Both print the RESOLVED "
+                         "frame; read that. 0 (default) is the schedule every earlier grid "
+                         "run used. A MEASUREMENT knob: it changes no controller.")
     ap.add_argument("--yaw-moment", choices=("off", "probe", "hold"), default="off",
                     help="off (default): position targets only, bit-identical to a run from "
                          "before this flag existed. probe: a CONSTANT feed-forward hip "

@@ -261,30 +261,82 @@ which failed there because the constant was in placement space and the loop foug
 and here the constant and the loop are the *same channel* and compose — or simply raise
 the gain, which §3 measures at a cost of 2.9% of forward speed by gain 40.
 
-**It does not make `STEP_TROT_MAX` measurable, and that is now established rather than
-suspected.** The obvious follow-up to §5 was to re-run the ladder at the phases TROT can
-actually walk at, since the grid had been sampling four dead ones out of five. Done — the
-15-cell ladder at entry phases 0, 16 and 17, both arms, 90 runs:
+**It does not make TROT survive the ladder** — but chasing why produced a threshold, and
+two of the three claims in the first version of this section were misreadings. They are
+corrected in place below and recorded in `harness_findings.md` §16.
 
-| phase | arm | fell | reached goal 2 | median final dist | peak hip torque | saturated |
-|---|---|---|---|---|---|---|
-| 0 | off | 11/15 | 0 | 1.59 m | 23.66 N·m | 0 |
-| 0 | hold | 11/15 | 0 | 1.90 m | 18.03 N·m | 0 |
-| 16 | off | 10/15 | 0 | 1.79 m | 22.77 N·m | 0 |
-| 16 | hold | 12/15 | **1** | 1.60 m | 20.31 N·m | 0 |
-| 17 | off | 15/15 | 0 | 3.88 m | 16.40 N·m | 0 |
-| 17 | hold | 15/15 | 0 | 3.85 m | 12.56 N·m | 0 |
+### The two misreadings, first
 
-**One cell of ninety reaches goal 2.** A phase at which TROT holds a line for 40 s on flat
-still does not get it past a 2 cm step, so the ladder's failure was never the entry phase
-either — it is upstream of both. `STEP_TROT_MAX` stays unmeasurable and the reason is now
-narrower: not the lane departure (`lip_failure.md` §4), not the heading (§3–5 here), and
-not the entry phase.
+**`final_dist_m` is the distance from the robot to GOAL 2 when the run ended**
+(`dist = norm(root_pos_w[:, :2] - goal2)`), not the distance it travelled. Read as
+progress it inverts every comparison.
 
-Phase 17 is the one worth keeping: it reaches **3.85–3.88 m at every one of the fifteen
-levels**, the same distance on a 0.02 m step as on a 0.30 m one. A distance that does not
-respond to the level is not a step limit — it is something at a fixed place, and it is
-about 0.1 m short of goal 2.
+**`--entry-offset` counts from a different frame in the two harnesses.**
+`run_planner_replay.py` offsets from `level_start`'s choice — **frame 16** for TROT — and
+`run_calibration_grid.py` offsets from frame 0. So the flat sweep's surviving offsets
+0/16/17/29 are **clip frames 16, 0, 1 and 13**, and the grid re-run at "phases 0, 16, 17"
+was at frames 0, 16 and **17 — which is not one of them**.
+
+Those two together produced a specific, plausible and entirely wrong finding: "phase 17
+reaches 3.85–3.88 m at every one of the fifteen levels, so it is failing at a fixed
+place." Against the trace those robots travel **0.52 m and fall at 1.50–1.52 s**, three
+metres short of the riser. The column was flat across levels for the most ordinary reason
+available — the terrain was never reached.
+
+### Re-run at the four correct frames, and TROT has a step limit
+
+15 cells × clip frames 0, 1, 13, 16 × both arms, 120 runs, read as **the furthest the base
+got relative to the riser** (3.00 m ahead of the spawn) rather than off a goal column.
+Frame 13 is dropped: it survives 40 s on the flat rig but never leaves the spawn on the
+grid (0 of 15 travel more than 0.6 m), which is its own open question.
+
+| step | fr0 off | fr0 on | fr16 off | fr16 on | fr1 off | fr1 on | crossed |
+|---|---|---|---|---|---|---|---|
+| **0.020** | +0.63 | +11.20 | +4.63 | +5.75 | +0.55 | +5.07 | **6/6** |
+| **0.040** | −0.11 | +0.22 | −0.04 | +0.16 | +0.12 | +0.18 | **4/6** |
+| 0.060 | −0.13 | −0.15 | −0.17 | −0.16 | −0.17 | −0.18 | 0/6 |
+| 0.080–0.300 | | | | | | | **0/6 at every level** |
+
+(one stray at 0.120, fr1/on, +0.03 m — three centimetres past a riser is a foot over an
+edge, not a crossing.)
+
+**`STEP_TROT_MAX` is between 0.04 and 0.06 m.** Monotone, six independent runs per level,
+and it is the first ladder response TROT has produced in this project. It is **not**
+applied to `planner/config.py`, which carries 0.08 m as a `CALIBRATION_NEEDED`
+placeholder: a threshold becoming a planner guarantee is a decision, and this is a bracket
+from three entry phases rather than a calibrated number.
+
+**The couple helps at the margin, which is the level where a straightness term should
+help**: at 0.040 the off arm crosses **1 of 3** and the on arm **3 of 3**. n = 3 phases,
+so it is a direction and not a measurement.
+
+### What the stall actually is, and it is `lip_failure.md` §1's mechanism
+
+The base stops **0.15–0.29 m short of the riser** — about the front hip's own fore-aft
+offset, 0.193 m — pitched −20 to −26°, in one of two modes. Loaded foot height is the 10th
+percentile of foot z over the last second, so it is the stance value and not a mean mixed
+with swing:
+
+| | front loaded z | rear loaded z | reads as |
+|---|---|---|---|
+| fr0 @ 0.040 | 0.063 | 0.024 | 0.023 + 0.040 — **front feet ON the step** |
+| fr16 @ 0.100 | 0.124 | 0.024 | 0.023 + 0.100 — **on the step** |
+| fr1 @ 0.120 / 0.140 / 0.160 | 0.144 / 0.164 / 0.184 | 0.024 | 0.023 + step, exactly — **on the step** |
+| fr0 @ 0.060 / 0.100 / 0.120 | 0.023 | 0.024 | both pairs on the **ground** — never mounted |
+
+**The rear feet read 0.024 m in every single case**, which is `lip_failure.md` §1's measured
+foot radius (23 mm) — they are on the ground, not swinging over anything.
+
+So the dominant failure is: **the front feet mount the step, the rear feet cannot, and the
+body stops.** That is exactly the mechanism `lip_failure.md` §1 measured for WALK at 0.04 m
+("the rear feet close on the riser from −0.71 m to −0.05 m and stop there"), now measured
+for TROT. And it explains the threshold without fitting anything: the loaded foot centre
+rides at the foot's own radius, so a 20 mm riser is an edge a foot rolls over and a 40–60 mm
+riser is a wall.
+
+**This is also the WALK-4cm question**, which was priority 5 and is answered here by
+accident: "the front feet get up on the step but the body stops" is not a WALK quirk, it
+is the rear pair against a riser taller than the foot radius, and TROT does the same thing.
 
 **The saturation question from §4 is also settled, by the control column that was missing
 there.** Peak hip torque on this terrain is **higher with the couple off** (23.66 / 22.77

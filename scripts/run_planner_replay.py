@@ -893,11 +893,16 @@ def main() -> int:
                          "heading authority is spent; WALK already meets the budget). "
                          "'all' puts it on every supported skill.")
     ap.add_argument("--entry-offset", type=int, default=0,
-                    help="shift EVERY clip's entry frame by this many frames from whatever "
-                         "the rule chose. 0 (default) is the rule's own answer and every "
-                         "earlier result. A measurement knob: one entry phase is one draw "
-                         "from a chaotic plant, and a claim that only holds at one phase is "
-                         "not a claim (outputs/trot_straight.md 4b).")
+                    help="shift EVERY clip's entry frame by this many frames FROM WHATEVER "
+                         "THE RULE CHOSE -- which for TROT is frame 16, not 0. This is NOT "
+                         "the same origin as run_calibration_grid.py --entry-offset, whose "
+                         "rep-0 schedule starts at frame 0, so the same number means a "
+                         "different frame in the two harnesses (harness_findings.md 16). "
+                         "Both print the RESOLVED frame; read that, not the offset. "
+                         "0 (default) is the rule's own answer and every earlier result. A "
+                         "measurement knob: one entry phase is one draw from a chaotic "
+                         "plant, and a claim that only holds at one phase is not a claim "
+                         "(outputs/trot_straight.md 4b).")
     ap.add_argument("--entry-turn", choices=("rule", "measured"), default="rule",
                     help="where a TURN replay starts in its cycle. rule (default, and what "
                          "every earlier result used): verify_skill_replay.level_start, the "
