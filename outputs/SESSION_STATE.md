@@ -357,17 +357,71 @@ alternatives.  Same conclusion as §8, now demonstrated by an intervention that 
 3. Between them they wrote **11.5 GB** of one repeated PhysX warning.
    `isaac_docker_run.sh` now drops that line at the source (`LOGCAP=0` restores it).
 
-## 13. What to do next, in order
+## 13. Session 6 (2026-09-02) — three layers, and they disagree
 
-1. **TURN's replay gap is the highest-value open question.**  31-36 % of the logged yaw
-   rate, and backwards.  It gates the planner's only aiming mechanism, it is why
-   `--turn-target goal` is a null, and it is a *fidelity* question -- the clip is genuine, so
-   something between the clip and the robot is wrong.  Excluded already: foot placement,
-   entry phase.  Candidates left: the hip-sign convention (`convention_verified: False` in
-   the clip metadata), the contact/duty relationship at 0.715 duty, and the settle pose.
-2. **The library is still the ceiling** -- 0.88 against 4.83.  Two concrete gaps: a gait that
-   holds on 40 mm of noise, and a forward-travelling jump.
-3. `effort_limit` is the user's decision; the evidence is closed.
-4. `staircase_walking_full_width` and `staircase_spiral` remain 0.00 in every arm.  Neither
-   is a terrain problem (the teacher gets 4.49 / 4.87); both need travel distance, and one
-   needs a >=0.06 m step.
+Full detail: `outputs/three_layer_2026-09-02.md`.  Judging is now (a) flat, (b) probes,
+(c) benchmark, in that order.
+
+### The finding that matters most
+
+**The probe rig and the benchmark point opposite ways about the roll couple.**  On the
+benchmark it is +0.07 on WALK, repeated over three seeds.  On the probe rig it **lowers
+WALK's roughness limit from 0.010 to 0.005 m** (3/3 at 0.010 without it, 1/3 with), and the
+benchmark's terrain is made of roughness at 0.02–0.04 m.  Its `step_up` goes 0/3 → 1/3 at
+0.040 m — a direction, not a threshold.
+
+The gain is real; **the mechanism is not established.**  Do not describe level 2 as "better
+on rough ground" until this is resolved.  Either the benchmark gain comes from something
+else (the rim, the obstacles, the goal geometry) or the two roughnesses are not the same
+disturbance.
+
+### TURN
+
+* **Hip sign settled on the skill it matters for.**  `flip` does not turn: +1.09 °/s, 5 % of
+  the log, wrong direction, stride 1.12 → 1.94 Hz.  TURN's hips move ±0.23 rad, the most of
+  any clip, so this is a stronger test than the WALK verdict that set the default.  `keep`.
+* **`--rate hi` is worth 72 % → 83 %** of the logged yaw rate with stride cv 0.224 → 0.068,
+  and the benchmark has never used it.  **Not adopted globally**: WALK's v_x moves +13 %,
+  outside ±10 %.  TROT is free (+1 %, cv halved).
+* **A real bug fixed**: the single-skill TURN arm ran its placement law with `wz_log = 0`,
+  because `--heading off` (the only way to run TURN) skips the block that loads it.  That is
+  `turn_target.md`'s bug surviving in the one arm that never got the fix.  Worth 34 → 35 %.
+* **Half the flat→benchmark gap is the measurement window.**  The turn is a slow transient:
+  4 cycles 57 %, 25 cycles 73 %, 61 cycles 75 %.  Benchmark TURN robots are upright 3.4 s.
+  **Still open: 57 % → 35 % at a matched window.**  Excluded: roughness, obstacles, rate,
+  ω_log, hip sign, entry phase, settle mode.  Left: the per-cell lever, the 0.42 m spawn
+  drop onto rough ground, the 200-robot scene.
+* `convention_verified` is a literal `False` written by every extractor and computed by
+  nothing — a placeholder for "nobody has checked leg order and joint signs against this
+  robot".  The flat rig's identity check **is** that test; on TURN it passes at r = 0.380
+  with a 0.054 margin, which the tool flags as thin.
+
+### TROT — nothing found
+
+**0/3 at the lowest rung of every probe family**, with and without the couple: 0.020 m step,
+0.005 m roughness, the shallowest slope.  The 0.02–0.04 m `STEP_TROT_MAX` bracket came from
+a different rig and does not reproduce here.
+
+### RUN / JUMP — closed
+
+RUN: the couple cannot lift the body (0.313 → 0.311 m against 0.330 standing); a hip torque
+has no vertical component.  JUMP: published maxima, 4–200× short on gaps.
+
+### Videos — `outputs/video_turn/`
+
+Flat TURN at half speed, side and **top-down** (added: from above a turn is the motion, not
+a silhouette), plus the placement law off.  Regression identical on every column, including
+`yaw_rate_deg_s` to 16 digits.  Not done: the in-air replay of the log's joint angles, and
+the WALK couple on/off pair on a probe step.
+
+## 14. What to do next, in order
+
+1. **Resolve the layer disagreement about level 2** (probe roughness limit falls, benchmark
+   score rises).  Cheapest test: benchmark WALK with the couple at `--no-roughness`.  If the
+   gain survives without roughness, the gain is not about roughness and the probe is right.
+2. **TURN's remaining 57 % → 35 %.**  Candidates left are the per-cell lever, the 0.42 m
+   spawn drop, and the 200-robot scene.  The in-air joint-angle replay is the kinematic
+   control that would separate "the clip cannot do it here" from "the harness is losing it".
+3. `--rate hi` for TURN and TROT only, as a per-clip choice rather than a run-wide flag.
+4. **The library is still the ceiling** — 0.88 against 4.83.
+5. `effort_limit` is the user's decision; the evidence is closed.
