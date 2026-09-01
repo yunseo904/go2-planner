@@ -1,11 +1,8 @@
-# Session state — 2026-09-01, TURN solved on flat, the benchmark gets a scorer and a number
+# Session state — 2026-09-01 (2), TROT's heading is solved on flat, and the entry phase is the bigger number
 
-**Read this first next session.** Everything below is committed.
-
-CPU (`--device cpu`) for everything except the last hour: the nine side-view recordings
-needed GPU1 and the WMP training was paused, stopped, filmed around, and resumed by the
-procedure in `~/WMP_중단_재개.md`. See "The GPU borrow" at the end — there is one thing
-about the watchdog to check.
+**Read this first next session.** Everything below is committed. All CPU (`--device cpu`),
+**no GPU at any point** — GPU 1 was left alone; `nvidia-smi` showed 22.8 of 24.5 GB in use
+by `wmp_lab_train` and nothing here needed a card.
 
 ---
 
@@ -13,184 +10,132 @@ about the watchdog to check.
 
 | | before | after |
 |---|---|---|
-| TURN on flat | 2 of 5 sampled entry phases complete a 90° turn; the phase the planner actually uses was never checked | **the planner's phase never turns**, and a measured one does: 9/9 cells in both compensator arms, 0.19 m of drift, 62 sustained cycles in the second harness |
-| the benchmark | never simulated — every script that opened the archive read it with numpy | **scored**: single-skill TROT **0.98 / 8**, WALK **1.11 / 8**, all 200 cells, upstream's own goal rule |
-| RUN's swing gate | named as the untried candidate in `run_collapse.md` §6 item 3 | **excluded**: identical collapse time to fourteen decimals |
-| JUMP's torque gap | "is the fork's `effort_limit` even right?" | **it is the Go2 spec sheet**, and the real robot's excursion above it is 11–23 ms. A decision, framed, not taken |
-| the capture-point rear term | untested import | **null**, on a paired 75-run design, all three parts separately |
+| TROT heading on flat | 3.20 °/m, "authority spent", cross-track named as the only route left | **0.004–0.170 °/m**, inside the 0.565 budget at every entry phase where TROT survives, at no cost in stride or forward speed |
+| the mechanism | three routes, all foot PLACEMENT, all bounded by the trot's footfall margin | a **stance-leg yaw couple**: feed-forward hip torque, dynamics not kinematics, bounded by the friction cone and the effort limit instead |
+| TROT's entry phase | never swept ("the cheapest untried thing left") | **swept: TROT walks at 4 of its 32 phases on FLAT ground**, and the ladder has been sampling four dead ones out of five |
+| `run_benchmark.py` | no heading hold, so its scores were not comparable with the calibration sweeps | `--heading` wired, banner, per-row stamp |
+| `run_planner_replay.py` TURN | `level_start`'s frame 24, which `turn_entry_phase.md` measured as never turning | `--entry-turn measured` reaches `ENTRY_FRAME_TURN = 6` |
 
 ---
 
-## 1. TURN — solved on flat, and the criterion was the problem
+## 1. TROT heading — `outputs/trot_yaw_moment.md`
 
-`outputs/turn_entry_phase.md`. 810 grid runs: all 45 entry phases of the 45-frame clip,
-9 identical flat cells each, with `--foot-comp on` and again with it `off`.
+`trot_straight.md` was right about the routes it tried and wrong about the premise under
+them. All three moved a **swing foot**, and all three were bounded by how far a trot's
+footfall can be displaced before the trot stops being one — a bound that was already
+measured to get worse when widened.
 
-- **22 of 45 phases pass with the compensator on, 5 of 45 with it off.** Foot placement is
-  doing most of the work for TURN — a much larger effect than it has on the translating gaits.
-- **`level_start`, the rule the planner and `verify_skill_replay` both use, picks frame 24**,
-  which is inside a contiguous ten-frame dead band (20–29) that fails in **both** arms. So
-  "the compensator breaks those phases" is excluded.
-- **No pose property predicts the outcome.** Feet-down at entry: 4/4 is 3 pass, 3 fail,
-  2 mixed. Joint speed does not separate them. Coplanarity actively misleads — frame 24 has
-  the *best* foot spread in the cycle.
-- **Frame 6 is the only phase that passes 9/9 in both arms with both neighbours doing the
-  same.** It is now `planner.config.skill.ENTRY_FRAME_TURN = 6` (provenance MEASURED) and
-  reachable as `--start-phase measured`. Default stays `first`; nothing earlier changes.
+`sim/yawmoment.py` moves no foot. It adds feed-forward torque to the hips of the legs the
+**recording** has on the ground, where the load path is through the contact, so the
+torque buys a lateral ground reaction force and the forces buy a couple about the
+vertical. `tau_i = c·sign(x_i)` makes every stance leg contribute with the same sign,
+which matters because a trot only ever has a diagonal pair down — the couple does not
+switch off twice a cycle. Net roll moment is exactly zero; net lateral force is the 3.2%
+front/rear lever mismatch and nothing else.
 
-**The second harness disagrees about two of the four phases, and that is the real finding.**
-`verify_skill_replay` has **no drift term**: frame 24 turns steadily for 63 cycles while
-translating 0.41–0.58 m in the first 8 s, and its PASS verdict cannot see that. A turn in
-place that walks half a metre away is a curved walk with the right yaw rate. Frame 6 is the
-only phase two independent instruments both call good.
+**Nothing new is asked of the simulator.** `isaac_actuator_probe.json` already recorded
+it: explicit `IdealPDActuator`, effort target **additive** to the PD, 5 N·m in → 5.0 N·m
+out, PD not replaced.
 
-Against the user's own gate: stride 1.121 Hz against an expected 1.121 (exact), duty 0.613
-against the clip's 0.591, yaw −21.33 °/s against the log's −22.66. **Residual**: `vx_mean`
-0.021 m/s against the log's 0.0075 — the sim TURN still translates 2.8× the recording, in
-both passing phases. Not fixed by the entry phase and not chased.
+**Open loop** (heading hold off, baseline +5.17 °/s): linear, bidirectional, crosses zero
+at **c ≈ 0.49 N·m**, about **9–10 °/s per N·m** and safe to at least ±2 N·m — **20 °/s of
+authority against foot placement's 3.1**. Across the whole working range v_x moves
+0.664 → 0.661 and stride does not move at all.
 
-**This does not change `turn_probes.md` §4.** That reduction already used the flat control
-as its own denominator, so TURN's terrain limit — below every ladder floor, under a 0.02 m
-edge — stands unaltered.
+**Closed loop**, gain 5 N·m/rad, cap 2.0: curvature **3.20 → 0.01 °/m**, peak hip torque
+11.95 against the actuator's 23.70, **0 of 2000 control steps clipped**, and the term never
+reaches its own cap.
 
-## 2. The benchmark now has a scorer, and the first numbers
+**Read a second way** (`scripts/analyze_yaw_moment.py`, from the trajectory rather than
+the mean yaw rate, because a heading loop drives the mean to zero by construction):
+net yaw 84.4° → 0.92°, **heading excursion 89.9° → 15.4°** (a bound, not a mean), lateral
+drift 19.09 m → 3.49 m, distance along the launch heading 15.0 → 26.3 m of the same 26.6 m
+path. The two readings agree.
 
-`scripts/run_benchmark.py`, `outputs/benchmark_harness.md`. Upstream's rule exactly: goal
-within **0.20 m held for 0.10 s**, eight goals **in order**, 20 s episodes, per-cell episode
-mean, then the **equal-weight mean over all 200 cells**.
+**Why a P law works here when `trot_straight.md` §3 says it cannot.** §3 is right: a P law
+holds a standing error and this disturbance is DC. The question is only whether that
+standing error is small. Nulling the drift costs 0.49 N·m against a 2.0 N·m cap, so the
+loop has somewhere to sit instead of pinning. **The law did not change. The authority did.**
 
-| | score |
-|---|---|
-| single-skill TROT (the lower bound CLAUDE.md §2 requires) | **0.98 / 8** |
-| single-skill WALK | **1.11 / 8** |
-| upstream `walk_pretrain` baseline | 1.05 |
-| upstream E2E teacher `_10_3` | 4.48 |
+## 2. TROT's entry phase — the larger number, and it was not the target
 
-**Read the floor before quoting either.** Goal 0 sits **0.50 m from the spawn in 180 of the
-200 cells**. A score of 1.0 means the robot moved half a metre. That is why upstream's
-untrained baseline is 1.05, and it means the benchmark's useful range runs from about 1 to
-about 4.5, not from 0 to 8.
+All 32 phases, flat, 40 s, both arms. **TROT survives 4 of 32 with the term off** (phases
+0, 16, 17, 29) **and 3 of 32 with it on**. It falls at the other 28 in 0.9–2.9 s on flat
+ground with heading hold and nothing else.
 
-TROT is **flat across all ten difficulties** (0.90–1.05) — it dies before reaching anything
-the difficulty parameter controls. WALK has a shallow monotone gradient (1.30 → 1.05) and is
-the first thing in this project whose benchmark score responds to difficulty at all.
+`entry_frames(rep)` picks **0, 6, 13, 19, 26** at `--reps 5`, and only **0** survives. So
+four of every five `STEP_TROT_MAX` repeats this project has run started at a phase where
+TROT falls on flat in under three seconds. Visible in the old CSVs: `steps` is 901 for rep
+0 and 68 / 146 / 84 / 57 for reps 1–4, at every level.
 
-Three guards are in the harness, each from something that has already gone wrong: the
-infinite ground plane is deleted **and verified** (11 of 20 tasks are 16–48% pit); a run with
-fewer than 200 cells is **refused** without `--allow-partial`; and a robot that has fallen
-through the terrain is **refused** rather than scored (see §5).
+Where the question is askable, the couple wins **3 of 3** (0 of 3 inside budget without it,
+3 of 3 with it). **The one run it cost is phase 29**, which survives with the term off and
+rolls at 2.54 s with it on; the cap-hit column says why — 0.0% of stance steps at the cap
+on the surviving phases, **19.9%** on phase 29.
 
-## 3. RUN and JUMP — both closed as far as they go, neither fixed
+## 3. What the couple does NOT do
 
-**RUN**: `outputs/run_swing_gate.md`. `--foot-swing-source sim` moves the correction
-(cap-hit 26.5% → 36.8%, overwrite 66.2% → 59.6%) and the collapse time is **identical to
-fourteen decimal places**. Across three entry phases the mean change is +2.9% on a run that
-needs 19 s. `run_collapse.md` §6's ordering holds: item 1 (the base never becomes ballistic)
-is upstream of items 2 and 3. **Item 2, the loop seam, is also not the way in** — the uncut
-full-session replay already on disk survives 10.28 s but at duty 0.96 and 0.035 m/s, i.e. by
-standing rather than running.
+- **The paired 15-cell `step_up` ladder is a null**: curvature 11.97 vs 12.06 °/m, drift
+  0.77 vs 0.81 m, 11/15 fell in both. Read it next to the off-arm's own 11.97 against the
+  flat rig's 3.20 for the same controller: there TROT is being knocked over and the
+  curvature is the collapse.
+- **Re-running the ladder at the surviving phases does not rescue it either**: 90 runs,
+  **one cell of ninety reaches goal 2**. `STEP_TROT_MAX` stays unmeasurable, with the
+  reason narrowed — not lane departure, not heading, not entry phase. Phase 17 reaches
+  **3.85–3.88 m at every one of the fifteen levels**, the same on a 0.02 m step as on a
+  0.30 m one, which is not a step limit but something at a fixed place ~0.1 m short of
+  goal 2. **That is the next thing to look at.**
+- **It does not remove the lateral offset** (3.49 m over 26.6 m on flat). That is the P
+  law's standing error, ≈5.6° at gain 5, and two untried things follow directly: feed the
+  measured 0.49 N·m forward underneath the loop (same channel as the loop, so unlike
+  `trot_straight.md` §4 they compose rather than fight), or raise the gain, which costs
+  2.9% of forward speed by gain 40.
 
-Collapse time moves **0.93 → 1.64 s across three entry phases**. The 1.13 s quoted
-everywhere is one draw.
+## 4. Control group
 
-**JUMP**: `outputs/jump_torque.md`, appended. The config's 23.70 / 45.43 N·m **are the Go2
-spec sheet**, and the ratio proves it: 45.43/23.70 = 1.9169 and 30.1/15.7 = 1.9172 — the same
-motor behind a 1.917:1 knee reduction. The actuator is `IdealPDActuatorCfg`, a static clip
-chosen *over* `DCMotorCfg` to avoid torque-speed derating, so the sim is already more
-permissive at speed than a real motor.
+WALK on the same rig, both arms: **0.24 °/m, yaw +0.06, v_x 0.235, stride 1.35 — identical.**
+The term is TROT-only by table (`YAW_MOMENT_CAP_NM`), and `--yaw-moment off` reproduces
+`heading_hold.md`'s TROT row exactly (3.20, +2.12, 0.663, 1.56).
 
-The log's 54.67 N·m is **LowState's measured torque, not a command** (the calf's peak
-*command* is 38.2, inside the limit), and it reproduces on all five takes: calf 53.8–56.2,
-thigh 26.2–28.0. Time above the limit: **7–51 ms per jump, longest single bout 11–23 ms.**
-It is a momentary peak, and the user's reading was right.
+## 5. Wiring, both verified end to end
 
-**This withdraws a line in `jump_torque.md`**: "the p99.9 is over the limit too, so it is the
-shape of the push-off and not one spike" does not follow — p99.9 of a 16 s recording at
-420 Hz is the top ~7 ms, so one 20 ms excursion puts it over by itself.
+- **`run_benchmark.py --heading` / `--heading-cap`.** The 0.98 / 1.11 scores were the bare
+  Raibert law while every calibration sweep runs with heading hold, so they were never
+  numbers about the same controller. Each robot holds the heading **it** settled at.
+  Asking for `--heading` on a skill with no measured cap is **refused** — a cap of 0 would
+  stamp 200 rows `heading=heading-only` on a run where the term was identically zero.
+  Smoke (6 cells, TROT): banner fires, both arms score 1.00, which at 6 cells is the floor
+  and not a comparison.
+- **`run_planner_replay.py --entry-turn measured`**: prints `entry frame 6 <- MEASURED,
+  overriding the rule's 24`. Default stays `rule`.
 
-**`effort_limit` was not changed.** The three options are laid out at the end of that file;
-it is the user's call and it changes the E2E arm too.
+## 6. A guard that was always open
 
-## 4. The capture-point import — null, and separated so the null is readable
+The first version read the hip effort limit from `robot.data.joint_effort_limits` and got
+**1e9** — PhysX's limit, not the one an explicit `IdealPDActuator` enforces in Python. The
+headroom check accepted any cap and the saturation counter could never fire. Caught by the
+banner printing it next to a peak of 11.79 N·m. All three harnesses now read it off the
+**actuator** and refuse `--yaw-moment` outright if they cannot.
 
-`outputs/trot_capture_point.md`. Three differences, three flags, all default off, self-test
-asserts the default path is bit-identical:
-
-| | ours | theirs | paired result over 75 runs |
-|---|---|---|---|
-| gain | `T_stance/2` = 0.186 s | `sqrt(h/g)` = 0.178 s | **4.4% apart — not where the laws differ** |
-| velocity | instantaneous | 20-sample average | 69 of 75 identical |
-| clip | ±0.05 **rad** = ±0.0155 m | ±0.05 **m** | the only visible arm; 8 fewer falls of 75, p ≈ 0.11 |
-
-Curvature medians across the five arms: 11.3–14.0 °/m, non-monotone, against a within-arm
-per-cell spread of 1.7–48.9. `reached` is 0/75 in every arm. **Nothing here makes TROT go
-straight**, and `trot_straight.md` §3 predicted it: the disturbance is DC and all of this is
-still proportional.
-
-The sweep did surface that **entry phase moves TROT's fall rate from 11/15 cells to 15/15**.
-TROT's 32 phases have not been swept. That is the cheapest untried thing left.
-
-## 5. Two harness traps, both recorded
-
-`harness_findings.md` §14 and §15.
-
-- **`steps` in the grid CSV is the repeat's shared loop length, not the robot's.** Read as
-  survival it produced "median 901, min 901, max 901" across fifteen different step heights.
-  Per-robot survival is `fell`; progress is `final_dist_m`.
-- **An 11.3 M-triangle terrain cooks without error and collides with nothing.** The first
-  200-cell benchmark run scored 0 on every cell at control step 1 because the robots fell
-  through during the settle. `settle_ok` cannot catch it — the hip-to-foot lever is valid in
-  free fall. Fixed with one collider per task; guarded by a base-height check. **A 0.00 across
-  all 200 cells is exactly what a single-skill lower bound might legitimately produce.**
-
-## 6. Swing height — the three numbers converge once the basis is named
-
-`outputs/swing_height_basis.md`. Measured twice, the second time in a floored replay where
-lift-off is a physical event and the sim's contact sensor and the clip's channel agree
-within 6%:
-
-| quantity | ours (TROT) | theirs |
-|---|---|---|
-| apex above **lift-off** | **57 mm** | `quadruped_pympc` 0.2 × 0.28 m = **56 mm** |
-| the same rule for **our** body | 0.2 × 0.333 = 67 mm | — |
-| apex above **ground** | **79 mm** | Unitree `footRaiseHeight` **0.08 m** |
-
-**All three agree and the apparent dispute was entirely the basis.** There is no swing-height
-deficit in TROT.
-
-WALK's rear feet come out at **0.0 mm above lift-off** on both gates while the front pair
-manages 44–50. Recorded, not chased — WALK is deferred by request — but it is a front/rear
-asymmetry rather than a body attitude, so a level body would not fix it.
-
-The early-touchdown reflex was **not** imported: a skill that regenerates its trajectory on
-contact is reacting to terrain. Recorded as outside confirmation that a fixed trajectory does
-not climb.
+Related: the first ladder run recorded `tau_hip_max_nm` only in the arm with the term on,
+which made the two rows at the 23.70 clip unreadable. With the control column added, peak
+hip torque is **higher with the couple off** (23.66 / 22.77) than on (18.03 / 20.31) — the
+terrain puts the hips near their clip, not the couple.
 
 ## 7. What to do next, in order
 
-1. **Sweep TROT's 32 entry phases** the way TURN's 45 were. It is the largest lever
-   measured on TROT this session and it costs one grid run.
-2. **Wire heading hold into `run_benchmark.py`.** The 0.98 / 1.11 are the bare Raibert
-   lateral law; the calibration sweeps use heading hold and the two are not comparable.
-3. **Decide `effort_limit`** (`jump_torque.md`, three options). It gates JUMP entirely.
-4. **The gap re-run** from the last session is still not done — it was the first item then
-   and stayed unfinished.
-5. `run_planner_replay.py` still uses `level_start` for every clip; it now has a measured
-   frame for TURN available and does not read it. One line, but it changes what the planner
-   executes, so it is listed rather than done.
+1. **Phase 17's 3.85–3.88 m**, identical at all fifteen levels. A distance that does not
+   respond to the level is not a step limit. That is where `STEP_TROT_MAX` actually dies
+   and nothing has looked at it.
+2. **Feed 0.49 N·m forward underneath the loop** and re-measure the lateral offset. One
+   flag combination, already built (`--yaw-moment hold --yaw-moment-nm 0.49`), not run.
+3. **The full 200-cell benchmark with `--heading heading-only`**, paired with off. The
+   flag is wired and smoke-tested; the run has not been done.
+4. **`effort_limit`** (`jump_torque.md`, three options) is still the user's call and still
+   gates JUMP entirely.
+5. RUN, JUMP and WALK-4cm were **not touched this session** — deferred by the priority
+   order, not by a finding.
 
-## 8. The GPU borrow — and one thing to check
+## 8. Untouched
 
-Procedure followed exactly: `pause.sh 180` → `stop.sh` (saved `model_4272.pt`, nothing lost)
-→ nine recordings on GPU1 → `resume.sh`. GPU0 never touched.
-
-**`~/.wmp_lab_watchdog_state` was missing before the borrow**, and `~/wmp_lab_watchdog.log`
-ends at 2026-08-31 12:23 with fifteen consecutive "재시작 3회 동안 iteration 이 늘지
-않았습니다 … 멈춥니다" lines — the loop-prevention trip from 함정 1. Training itself was
-healthy at that moment (checkpoints every ~1.5 h, `model_4000` 30 minutes before the borrow),
-so the trip is stale, and with the state file gone the counter is not latched. **Worth a look
-anyway**: if the watchdog is meant to be the safety net, its state file should exist.
-
-**Regression check on the recordings** (CLAUDE.md §8: rendering must not change physics):
-every recorded run's termination matches its un-recorded CPU baseline. Table in
-`outputs/video/README.md`.
+`--effort_limit` unchanged. No clip was edited. GPU 0 never touched, GPU 1 never touched.
