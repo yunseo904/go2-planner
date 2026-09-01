@@ -350,6 +350,15 @@ def run_isaac(args) -> list:
     # what actually places them, so the importer does not need to own the origins.
     print(f"[grid] terrain: {len(V)} vertices, {len(F)} faces, {n} cells in a {rows}x{cols} grid")
 
+    # Scene light.  Nothing in this script created one, so an --video run rendered a
+    # near-black frame: the geometry was there but unlit, and the terrain the clip is
+    # supposed to show could not be seen.  Same dome and same 2000 intensity as
+    # run_benchmark.py and verify_skill_replay.py, so the three render alike.  It is
+    # created before sim.reset() like every other prim here, and it is a light: it
+    # touches nothing the physics or the control loop reads.
+    sim_utils.DomeLightCfg(intensity=2000.0).func("/World/light",
+                                                  sim_utils.DomeLightCfg(intensity=2000.0))
+
     # One robot per cell.  The prims are created first and then a SINGLE Articulation
     # picks them all up by regex, so there is one view, one write, one step for the
     # whole grid -- which is the entire point of doing it this way.
