@@ -72,6 +72,11 @@ from run_calibration import (FALL_HEIGHT_M, GOAL_RADIUS_M, PARAM_SKILL, TIME_BUD
 SKILL_SPEED = {"WALK": 0.187, "TROT": 0.444, "TURN": 0.008, "RUN": 0.514, "JUMP": 0.006}
 #: Per-skill heading cap, from the open-loop steering probe.
 HEADING_CAP = {"WALK": 0.04, "TROT": 0.02}
+#: Per-skill --yaw-moment cap, N.m of stance-hip feed-forward torque.  TROT only: it is
+#: the only skill whose foot-placement heading authority is spent (outputs/
+#: trot_straight.md), and WALK already reaches the benchmark budget without it.  0 means
+#: the term never runs; the number is filled in by the probe, not chosen here.
+YAW_MOMENT_CAP_NM = {"WALK": 0.0, "TROT": 0.0}
 #: Measured yaw rate of the TURN clip, rad/s (planner.config skill.YAW_RATE_TURN, from
 #: session turn_right_20260824_223951).  Used only to size the in-place time budget.
 YAW_RATE = {"TURN": -0.3954}
@@ -281,6 +286,7 @@ def run_isaac(args) -> list:
     from verify_skill_replay import load_clip
     from sim.replay import ground_material_cfg, quat_to_rpy_deg, set_robot_friction, snap
     from sim.footcomp import FootPlacement, stance_time_s
+    from sim.yawmoment import YawMoment
     from planner.skills import SkillId, SUPPORTED  # noqa: F401
 
     probes = load_probes()
@@ -397,8 +403,36 @@ def run_isaac(args) -> list:
     q_seq = [np.asarray(c["q_des"], dtype=np.float32) for c in per_robot_clip]
     want = [f"{leg}_{j}_joint" for leg in clips[runs[0][1]]["leg_order"]
             for j in clips[runs[0][1]]["joint_order"]]
-    idx_t = torch.as_tensor([robot.joint_names.index(nm) for nm in want],
-                            device=sim.device, dtype=torch.long)
+    jidx = [robot.joint_names.index(nm) for nm in want]
+    idx_t = torch.as_tensor(jidx, device=sim.device, dtype=torch.long)
+
+    # The hip's effort limit, READ FROM THE ACTUATOR.  Not from robot.data, which
+    # reports PhysX's 1e9 -- and PhysX is not what clips here: the actuator is an
+    # explicit IdealPDActuator, so the bound that binds is applied in Python against
+    # actuator.effort_limit.  --yaw-moment's whole safety argument is that the sum of
+    # the PD and the feed-forward stays under it, so with the limit unknown that
+    # argument is not available and the run is refused rather than run on a nominal.
+    hip_effort_limit_nm = float("nan")
+    _want_hip = robot.joint_names[jidx[0]]
+    for _act in robot.actuators.values():
+        _names = list(getattr(_act, "joint_names", []) or [])
+        _e = getattr(_act, "effort_limit", None)
+        if _e is None or _want_hip not in _names:
+            continue
+        _arr = np.asarray(snap(_e)).reshape(-1)
+        _v = float(_arr[_names.index(_want_hip)] if _arr.size == len(_names) else _arr.flat[0])
+        if np.isfinite(_v) and 0.0 < _v < 1e4:
+            hip_effort_limit_nm = _v
+            break
+    if args.yaw_moment != "off" and not np.isfinite(hip_effort_limit_nm):
+        raise SystemExit(
+            "[grid] REFUSING --yaw-moment: could not read the hip's effort limit off the "
+            "articulation, so the headroom this term needs cannot be checked. "
+            "outputs/isaac_actuator_probe.json measured it at 23.70 Nm on this config; if "
+            "that is still right, the read above is what is broken, not the limit.")
+    if args.yaw_moment != "off":
+        print(f"[grid] hip effort limit {hip_effort_limit_nm:.2f} Nm "
+              f"(the actuator's own clip, not PhysX's)")
 
     # ---- swing lift, the same edit the flat sweep uses, resolved once per CLIP ------
     if args.swing_lift > 0:
@@ -512,7 +546,7 @@ def run_isaac(args) -> list:
             com_h = np.where(np.isfinite(com_h), com_h, np.nanmedian(com_h))
         else:
             com_h = np.full(n, 0.31)
-        foots = []
+        foots, yaws = [], []
         for k, c in enumerate(per_robot_clip):
             lever = all_lever[k] if settle_ok[k] else med_lever
             hxy = np.array([quat_rotate_inv(bq[k][None, :], (bp[k, h_by[l]] - bpos[k])[None, :])[0, :2]
@@ -534,6 +568,32 @@ def run_isaac(args) -> list:
                 gain_mode=args.foot_gain, com_height_m=com_h[k],
                 vy_avg_n=args.foot_vy_avg_n,
                 offset_clip_m=args.foot_offset_clip_m))
+            # The stance-leg yaw couple, per robot, or None.  Disjoint from the placement
+            # above in BOTH legs and joints -- that one edits the swing hips' angles, this
+            # one adds torque to the stance hips -- so the two are not competing for the
+            # same authority and can be read separately.
+            ycap = (args.yaw_moment_cap_nm if args.yaw_moment_cap_nm is not None
+                    else YAW_MOMENT_CAP_NM.get(c["name"], 0.0))
+            yaws.append(None if (args.yaw_moment == "off" or ycap <= 0.0
+                                 or (args.yaw_moment_skill != "all"
+                                     and c["name"] != args.yaw_moment_skill))
+                        else YawMoment(lever_m=lever, hip_x_m=hxy[:, 0], hip_y_m=hxy[:, 1],
+                                       bias_nm=args.yaw_moment_nm,
+                                       gain_nm_per_rad=(args.yaw_moment_gain
+                                                        if args.yaw_moment == "hold" else 0.0),
+                                       cap_nm=ycap,
+                                       effort_limit_nm=hip_effort_limit_nm))
+        if not any(y is not None for y in yaws):
+            yaws = None
+        else:
+            _y = next(y for y in yaws if y is not None)
+            print(f"[grid] *** YAW MOMENT --yaw-moment {args.yaw_moment} on "
+                  f"{args.yaw_moment_skill}: feed-forward hip torque on the STANCE legs, "
+                  f"bias {args.yaw_moment_nm:+.3f} Nm, gain {args.yaw_moment_gain:+.2f} "
+                  f"Nm/rad, cap {_y.cap_nm:.2f} Nm against a {hip_effort_limit_nm:.2f} Nm "
+                  f"hip limit ({sum(y is not None for y in yaws)}/{n} robots). DYNAMIC: it "
+                  f"moves no foot, and the recording's own contact channel says which legs "
+                  f"are down. Report paired with --yaw-moment off. ***")
         print(f"[grid] *** FOOT PLACEMENT ON for all {n} robots (cap {args.foot_clip_rad:g} rad). "
               f"This CLOSES A LOOP on base velocity and OVERWRITES the recording. ***")
         if args.foot_gain != "half-stance" or args.foot_vy_avg_n or args.foot_offset_clip_m:
@@ -633,6 +693,12 @@ def run_isaac(args) -> list:
         if foots is not None:
             for f in foots:
                 f.reset()
+        tau_hip_max = np.zeros(n)
+        hip_sat = np.zeros(n, dtype=bool)
+        if yaws is not None:
+            for y in yaws:
+                if y is not None:
+                    y.reset()
 
         # The heading each robot is asked to hold: the one it settled at, per cell.
         yaw0_deg = quat_to_rpy_deg(snap(robot.data.root_quat_w))[2]
@@ -677,8 +743,25 @@ def run_isaac(args) -> list:
                                                     psi_err_rad=float(psi[k]))
             tgt[:, idx_t] = torch.as_tensor(cmd, device=sim.device, dtype=torch.float32)
             robot.set_joint_position_target(tgt)
+            if yaws is not None:
+                # A separate call from the position target, and written EVERY step
+                # including the all-zero ones: an effort target is sticky, so skipping
+                # the write would leave the last non-zero torque applied for the rest of
+                # the run.  IdealPDActuator adds it to the PD and clips the SUM at
+                # effort_limit, silently -- which is why tau_hip_max is recorded below.
+                eff = torch.zeros_like(tgt)
+                tau = np.zeros((n, 12))
+                for k in range(n):
+                    if yaws[k] is not None:
+                        tau[k] = yaws[k].step(swing[k][frames[k]], psi_err_rad=float(psi[k]))
+                eff[:, idx_t] = torch.as_tensor(tau, device=sim.device, dtype=torch.float32)
+                robot.set_joint_effort_target(eff)
             for _ in range(decim):
                 robot.write_data_to_sim(); sim.step(); robot.update(phys_dt)
+            if yaws is not None:
+                _th = np.abs(snap(robot.data.applied_torque)[:, jidx][:, 0::3]).max(axis=1)
+                tau_hip_max = np.maximum(tau_hip_max, _th)
+                hip_sat |= _th >= hip_effort_limit_nm - 1e-3
 
             pos = snap(robot.data.root_pos_w)
             if args.score == "inplace":
@@ -743,6 +826,19 @@ def run_isaac(args) -> list:
             rows_out.append({"param": param, "skill": skill, "family": family,
                              "probe": probes["names"][i], "level_m": level, "rep": rep,
                              "entry_frame": ent[k],
+                             # Which arm this row is, and what the actuator actually did.
+                             # A row that does not say whether the yaw couple was on gets
+                             # read wrong once; a peak hip torque at the limit means the
+                             # gait was being starved to pay for the couple, and that must
+                             # not have to be inferred from the outcome.
+                             "yaw_moment": args.yaw_moment,
+                             "yaw_moment_nm": args.yaw_moment_nm,
+                             "yaw_moment_gain": args.yaw_moment_gain,
+                             "yaw_moment_cap_nm": (args.yaw_moment_cap_nm
+                                                   if args.yaw_moment_cap_nm is not None
+                                                   else float("nan")),
+                             "tau_hip_max_nm": float(tau_hip_max[k]),
+                             "hip_saturated": int(bool(hip_sat[k])),
                              "reached": int(reached[k] and settle_ok[k]),
                              "settle_ok": int(settle_ok[k]),
                              "t_reached_s": t_reached[k],
@@ -957,6 +1053,25 @@ def main() -> int:
     ap.add_argument("--heading-len-cap", type=float, default=0.04,
                     help="magnitude bound on that half (rad). 0.04 is the largest amplitude "
                          "the open-loop probe survived on TROT; -0.06 fell at 2.77 s")
+    ap.add_argument("--yaw-moment", choices=("off", "probe", "hold"), default="off",
+                    help="off (default): position targets only, bit-identical to a run from "
+                         "before this flag existed. probe: a CONSTANT feed-forward hip "
+                         "torque on the stance legs, open loop, amplitude from "
+                         "--yaw-moment-nm. hold: c = --yaw-moment-gain * heading error. "
+                         "sim/yawmoment.py has the mechanism; the short version is that this "
+                         "is the only heading route in this project that is not bounded by "
+                         "how far a trot's footfall can move.")
+    ap.add_argument("--yaw-moment-nm", type=float, default=0.0,
+                    help="constant hip torque amplitude, N.m, +front/-rear")
+    ap.add_argument("--yaw-moment-gain", type=float, default=0.0,
+                    help="N.m of hip torque per radian of heading error, for --yaw-moment hold")
+    ap.add_argument("--yaw-moment-cap-nm", type=float, default=None,
+                    help="magnitude bound on the commanded torque. Default: the per-skill "
+                         "YAW_MOMENT_CAP_NM table (all zero, i.e. OFF). Refused above half "
+                         "the hip's effort limit -- the PD that plays the clip needs that "
+                         "headroom and the actuator clips their sum silently.")
+    ap.add_argument("--yaw-moment-skill", default="TROT",
+                    help="which clip carries the term (default TROT; 'all' for every clip)")
     ap.add_argument("--heading", choices=("off", "heading", "heading-only"), default="off",
                     help="hold the spawn heading with differential lateral foot placement")
     ap.add_argument("--skip-unsupported", action="store_true",

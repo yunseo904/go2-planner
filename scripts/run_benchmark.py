@@ -67,7 +67,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from sim import heightfield as HF
-from terrain_toolkit.paths import FROZEN_NPZ
+from terrain_toolkit.paths import FROZEN_NPZ, SKILL_CLIPS_META_JSON
 
 _SIM_APP = None
 
@@ -290,6 +290,15 @@ def self_test() -> int:
     return 0 if fails == 0 else 1
 
 
+#: Per-skill heading cap in radians, from the open-loop steering probe
+#: (outputs/heading_candidates.md 2): WALK took +-0.04 rad with no measurable cost, TROT
+#: falls in BOTH directions at +-0.04 and is safe at +-0.02.  The same table
+#: run_calibration_grid.py and run_planner_replay.py carry, and it has to stay the same
+#: table -- a benchmark run and a calibration run at different caps are different
+#: controllers being compared as though they were one.
+HEADING_CAP = {"WALK": 0.04, "TROT": 0.02}
+
+
 def run_isaac(args) -> tuple:
     from isaaclab.app import AppLauncher
 
@@ -309,7 +318,8 @@ def run_isaac(args) -> tuple:
     from sim.replay import (foot_body_ids, ground_material_cfg, quat_to_rpy_deg,
                             set_robot_friction, snap)
     from sim.footcomp import FootPlacement, stance_time_s
-    from verify_skill_replay import load_clip, level_start, quiescent_start, rotate_clip
+    from verify_skill_replay import (_log_motion_for, load_clip, level_start,
+                                     quiescent_start, rotate_clip)
 
     z = np.load(FROZEN_NPZ, allow_pickle=False)
     cells, names, ts, ls = cell_list(z, args.tasks, args.levels)
@@ -380,6 +390,25 @@ def run_isaac(args) -> tuple:
         set_robot_friction(robot, ucfg.ground_friction)
 
     clip = load_clip(args.skill, args.rate)
+    # --heading, resolved once.  The cap is the skill's own, from the open-loop steering
+    # probe (outputs/heading_candidates.md 2): WALK took +-0.04 rad with no measurable
+    # cost, TROT falls in BOTH directions at +-0.04 and is safe at +-0.02.  TURN is not
+    # trying to hold a heading -- it is trying to change one -- so it is 0, and asking
+    # for it there is refused rather than silently ignored.
+    yaw_mode, hcap, vy_log, wz_log = "off", 0.0, 0.0, 0.0
+    if args.heading != "off":
+        hcap = (args.heading_cap if args.heading_cap is not None
+                else HEADING_CAP.get(args.skill, 0.0))
+        if hcap <= 0.0:
+            raise SystemExit(
+                f"[bench] --heading was asked for on {args.skill}, whose measured heading "
+                f"cap is {HEADING_CAP.get(args.skill)}. Running with a cap of 0 would make "
+                f"the term identically zero while stamping every row heading={args.heading} "
+                f"-- a whole benchmark that says it held a heading and did not. Pass "
+                f"--heading-cap explicitly if that is really what is wanted.")
+        yaw_mode = args.heading
+        vy_log, wz_log = _log_motion_for(
+            json.loads(SKILL_CLIPS_META_JSON.read_text()), clip["name"])
     idx_by_name = {nm: i for i, nm in enumerate(robot.joint_names)}
     want = [f"{l}_{j}_joint" for l in clip["leg_order"] for j in clip["joint_order"]]
     idx_t = torch.as_tensor([idx_by_name[w] for w in want], device=sim.device,
@@ -467,6 +496,13 @@ def run_isaac(args) -> tuple:
                 f"skill's. Check the collider: one mesh per task is what makes 200 cells "
                 f"collide (see build_grid).")
         med = np.median(lever[settle_ok], axis=0) if settle_ok.any() else np.full(4, 0.31)
+        # The heading each robot is asked to hold: the one IT settled at, per cell.  Not
+        # a shared constant and not the cell's axis -- a robot that settles pointing 3 deg
+        # off would otherwise be handed a 3 deg error at t=0 and asked to correct terrain
+        # it cannot see.  The reference is proprioceptive and per robot, the same rule
+        # run_calibration_grid.py already uses.
+        _, _, yaw0 = quat_to_rpy_deg(snap(robot.data.root_quat_w))
+        yaw_ref = np.asarray(yaw0, dtype=float)
         foots = None
         if args.foot_comp != "off":
             from sim.replay import quat_rotate_inv
@@ -481,9 +517,18 @@ def run_isaac(args) -> tuple:
                     t_stance_s=stance_time_s(clip["contact"], clip["fs"]),
                     lever_m=lever[k] if settle_ok[k] else med,
                     hip_x_m=hxy[:, 0], hip_y_m=hxy[:, 1],
-                    cap_rad=args.foot_clip_rad, cycle_len=ncyc))
+                    cap_rad=args.foot_clip_rad, cycle_len=ncyc,
+                    yaw_mode=yaw_mode, heading_cap_rad=hcap,
+                    vy_log=vy_log, wz_log=wz_log))
             print(f"[bench] *** FOOT PLACEMENT ON (cap {args.foot_clip_rad:g} rad): closes a "
                   f"loop on base lateral velocity and overwrites the recording. ***")
+            if yaw_mode != "off":
+                print(f"[bench] *** HEADING HOLD --heading {args.heading} on "
+                      f"{args.skill}, cap {hcap:g} rad: each robot holds the heading it "
+                      f"settled at. omega_target = omega_log - psi_err/T_stance; T_stance "
+                      f"cancels, so the term carries no constant. The 0.98/1.11 scores in "
+                      f"outputs/benchmark_harness.md were measured WITHOUT this and are "
+                      f"not comparable to a run with it. ***")
 
         alive = np.ones(n, dtype=bool)
         ended = np.zeros(n, dtype=int)          # goal index at the moment it ended
@@ -493,10 +538,22 @@ def run_isaac(args) -> tuple:
             if foots is not None:
                 vb = snap(robot.data.root_lin_vel_b)
                 wb = snap(robot.data.root_ang_vel_b)
+                # Heading error per robot against ITS OWN settle heading, wrapped to
+                # (-180, 180].  Omitting this is not a small mistake: psi_err defaults to
+                # 0, which makes the heading term identically zero and --heading a flag
+                # that changes a CSV column and nothing else.  run_calibration_grid.py
+                # carries the same comment for the same reason.
+                if yaw_mode != "off":
+                    _, _, yaw_now = quat_to_rpy_deg(snap(robot.data.root_quat_w))
+                    psi = np.radians((np.asarray(yaw_now, float) - yaw_ref + 180.0)
+                                     % 360.0 - 180.0)
+                else:
+                    psi = np.zeros(n)
                 for k in range(n):
                     if alive[k]:
                         cmd[k] = cmd[k] + foots[k].step(float(vb[k, 1]), float(wb[k, 2]),
-                                                        swing_seq[frame], vx=float(vb[k, 0]))
+                                                        swing_seq[frame], vx=float(vb[k, 0]),
+                                                        psi_err_rad=float(psi[k]))
             tgt = robot.data.default_joint_pos.clone()
             tgt[:, idx_t] = torch.as_tensor(cmd, device=sim.device, dtype=torch.float32)
             robot.set_joint_position_target(tgt)
@@ -519,6 +576,11 @@ def run_isaac(args) -> tuple:
         for k, (t, l) in enumerate(cells):
             rows_out.append({"task": t, "task_name": names[t], "level": l, "episode": ep,
                              "goals": int(ended[k]), "settle_ok": int(settle_ok[k]),
+                             # Which arm this row is.  A results file whose rows do not
+                             # say whether heading hold was on is one that gets read wrong
+                             # once: `heading` and `heading-only` are not the same
+                             # controller, and neither is `off`.
+                             "heading": args.heading, "heading_cap_rad": hcap,
                              "partial": int(n < full), "skill": args.skill,
                              "start_phase": args.start_phase, "foot_comp": args.foot_comp,
                              "steps": step + 1})
@@ -543,6 +605,19 @@ def main() -> int:
     ap.add_argument("--start-phase", choices=("first", "stance", "level", "measured"),
                     default="first")
     ap.add_argument("--foot-comp", choices=("off", "on"), default="on")
+    ap.add_argument("--heading", choices=("off", "heading", "heading-only"), default="off",
+                    help="off (default, and what the 0.98 / 1.11 scores in "
+                         "outputs/benchmark_harness.md were measured with): the bare "
+                         "Raibert lateral law. heading-only: add the heading half, which "
+                         "outputs/heading_hold.md measures at WALK 13.26 -> 0.24 deg/m "
+                         "(inside the 0.565 budget) and TROT 7.79 -> 3.20. heading: the "
+                         "full substitution, which keeps the yaw-RATE term and is worse in "
+                         "both gaits. The calibration sweeps run WITH heading hold and "
+                         "these scores ran WITHOUT it, so the two were never comparable -- "
+                         "that is what this flag is for. Report paired with --heading off.")
+    ap.add_argument("--heading-cap", type=float, default=None,
+                    help="override the per-skill heading cap in rad. The default is the "
+                         "HEADING_CAP table, measured by the open-loop steering probe.")
     ap.add_argument("--foot-clip-rad", type=float, default=0.05)
     ap.add_argument("--allow-partial", action="store_true",
                     help="run fewer than all 200 cells. The printed mean is then a wiring "
