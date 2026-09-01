@@ -818,7 +818,7 @@ def run_isaac(args) -> tuple:
             _off, _rep, _ = swing_lift_offsets(robot, sim, idx_t, _srcs[_nm],
                                                args.swing_lift / 1000.0, phys_dt,
                                                symmetric=not args.swing_lift_asym,
-                                               air_z=_air)
+                                               air_z=_air, spread=True)
             lift_offsets[_nm] = _off
             print(f"[bench] swing lift {args.swing_lift:g} mm on {_nm}: "
                   + ("PER-LEG " if args.swing_lift_asym else "SYMMETRIC ")

@@ -467,7 +467,7 @@ def deviation_report(foot_u: np.ndarray, q_meas: np.ndarray, q_orig: np.ndarray,
 
 
 def swing_lift_offsets(robot, sim, idx_t, clip, target_m, phys_dt, eps=0.02, sign=None,
-                       symmetric=True, air_z=1.5):
+                       symmetric=True, air_z=1.5, spread=False):
     """Per-frame thigh/calf offsets that raise each swing foot to ``target_m`` at its apex.
 
     The real robot's ``classic_walk`` lifts its rear feet about 5 mm and its front ones
@@ -527,6 +527,15 @@ def swing_lift_offsets(robot, sim, idx_t, clip, target_m, phys_dt, eps=0.02, sig
     # terrain pass a height above it; the default is unchanged so the flat harness is
     # bit-identical.
     air[:, 2] = float(air_z)
+    # KEEP EACH ROBOT WHERE IT IS IN X-Y (spread=True).  `default_root_state` carries the
+    # articulation's configured origin, which is the SAME point for every instance -- so on
+    # a fleet this stacks all of them at one place and they measure each other.  With 200
+    # robots that is 200 interpenetrating bodies: PhysX runs out of contact blocks and the
+    # measurement stops making progress (one run sat at 121% CPU emitting nothing for
+    # twenty minutes).  Invisible on a one-robot rig, which is every caller that predates
+    # this, so the default is off and they stay bit-identical.
+    if spread:
+        air[:, :2] = robot.data.root_pos_w[:, :2]
 
     def feet_at(qv):
         qj = robot.data.default_joint_pos.clone()
