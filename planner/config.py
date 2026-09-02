@@ -77,6 +77,24 @@ class SkillLimits:
     # measured constant instead.  -1 means "no measurement, use the rule".
     ENTRY_FRAME_TURN: int = 6
 
+    # -- clip playback rate, per skill -- MEASURED, and it is NOT one setting ---------
+    # The archive carries each clip resampled two ways.  Which one is better is a per-clip
+    # question and the evidence is per clip (SESSION_STATE 12, "TURN"):
+    #
+    #   TURN  hi is worth 72 % -> 83 % of the logged yaw rate with stride cv 0.224 ->
+    #         0.068.  The largest single improvement measured on TURN.
+    #   TROT  hi is free: v_x +1 %, stride cv halved.
+    #   WALK  hi moves v_x +13 %, outside the +-10 % gate every other edit is held to, so
+    #         WALK keeps lo.  This is why the setting cannot be global.
+    #
+    # RUN and JUMP are unresolved and carry lo, the archive's default, so nothing about
+    # them changes silently.
+    RATE_WALK: str = "lo"
+    RATE_TROT: str = "hi"
+    RATE_TURN: str = "hi"
+    RATE_RUN: str = "lo"
+    RATE_JUMP: str = "lo"
+
     # -- how close the body has to be to the incoming gait's speed to switch ----
     SPEED_MATCH_MAX: float = 0.25
 
@@ -116,6 +134,14 @@ _p("skill.YAW_RATE_TURN", Provenance.MEASURED, "rad/s",
    "skill_profile.csv yaw_rate_steady_mean -0.3954 (-22.66 deg/s) for turn_right_20260824_223951. "
    "This is the MEASURED rate, not the -0.6 rad/s that was commanded to produce it, and it is "
    "the same number the low level uses as its foot-placement target (outputs/turn_target.md)")
+_p("skill.RATE_WALK", Provenance.MEASURED, "-",
+   "hi moves WALK v_x +13 %, outside the +-10 % gate; lo kept (SESSION_STATE 12)")
+_p("skill.RATE_TROT", Provenance.MEASURED, "-",
+   "hi is free on TROT: v_x +1 %, stride cv halved (SESSION_STATE 12)")
+_p("skill.RATE_TURN", Provenance.MEASURED, "-",
+   "hi is worth 72 %% -> 83 %% of the logged yaw rate, stride cv 0.224 -> 0.068")
+_p("skill.RATE_RUN", Provenance.MEASURED, "-", "unresolved skill; archive default")
+_p("skill.RATE_JUMP", Provenance.MEASURED, "-", "unresolved skill; archive default")
 _p("skill.ENTRY_FRAME_TURN", Provenance.MEASURED, "frame",
    "outputs/turn_entry_phase.md. All 45 phases of the 45-frame TURN clip were run as the "
    "in-place flat control, 9 identical cells each, in both foot-comp arms -- 810 runs. "

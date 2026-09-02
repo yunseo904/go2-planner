@@ -422,6 +422,18 @@ def self_test() -> int:
 HEADING_CAP = {"WALK": 0.04, "TROT": 0.02}
 
 
+def rate_for(skill: str, arg: str) -> str:
+    """Playback rate for one clip.
+
+    ``--rate hi|lo`` forces one rate on everything, which is what every published run
+    used.  ``--rate per-clip`` takes each skill's own measured answer from
+    ``planner.config`` -- see the RATE_* provenance there for why it is not one setting.
+    """
+    if arg != "per-clip":
+        return arg
+    return str(getattr(PLANNER_CFG.skill, f"RATE_{skill.upper()}", "lo"))
+
+
 def run_isaac(args) -> tuple:
     from isaaclab.app import AppLauncher
 
@@ -591,6 +603,20 @@ def run_isaac(args) -> tuple:
         xf.AddTranslateOp().Set(Gf.Vec3d(float(spawns[k][0]), float(spawns[k][1]), 0.0))
     robot = Articulation(UNITREE_GO2_CFG.replace(prim_path="/World/envs/env_.*/Robot"))
 
+    # Foot contact FORCES, for --trace-npz only.  SESSION_STATE 16.1 asks which foot leaves
+    # the ground when and what the support looks like as the robot goes over, and the clip's
+    # own stance mask cannot answer that -- it is what the recording did, not what this
+    # robot is standing on.  Created before sim.reset() like every other sensor in this
+    # file, and only when a trace is requested: a scored run must stay the scene the
+    # published numbers were measured in.  The regression is checked, not assumed -- see
+    # outputs/why_it_rolls.md.
+    contacts = None
+    if args.trace_npz:
+        from isaaclab.sensors import ContactSensor, ContactSensorCfg
+        contacts = ContactSensor(ContactSensorCfg(
+            prim_path="/World/envs/env_.*/Robot/.*_foot", history_length=0,
+            track_air_time=False, update_period=0.0))
+
     # ---------------------------------------------------------------- side-view video
     # One camera per recorded cell, created HERE -- before sim.reset(), like every other
     # sensor, because a camera added after the scene is built is never rendered in this
@@ -689,7 +715,8 @@ def run_isaac(args) -> tuple:
     #
     # It is still an OPTIMISTIC perception arm and has to be reported as one: the geometry
     # is ground truth put through a sensor model, not a rendered depth image.
-    clip = load_clip("WALK" if PLANNER_ARM else args.skill, args.rate)
+    _sk0 = "WALK" if PLANNER_ARM else args.skill
+    clip = load_clip(_sk0, rate_for(_sk0, args.rate))
     # --heading, resolved once.  The cap is the skill's own, from the open-loop steering
     # probe (outputs/heading_candidates.md 2): WALK took +-0.04 rad with no measurable
     # cost, TROT falls in BOTH directions at +-0.04 and is safe at +-0.02.  TURN is not
@@ -811,7 +838,7 @@ def run_isaac(args) -> tuple:
         #   TURN        its MEASURED frame 6: the coplanarity rule picks 24 and
         #               turn_entry_phase.md measured that phase as never turning.
         for nm in ("WALK", "TROT", "TURN"):
-            c = load_clip(nm, args.rate)
+            c = load_clip(nm, rate_for(nm, args.rate))
             kf_, note_ = 0, f"--start-phase {args.start_phase}"
             m_ = int(getattr(pcfg.skill, f"ENTRY_FRAME_{nm}", -1))
             if nm == "TURN" and m_ >= 0:
@@ -1053,6 +1080,16 @@ def run_isaac(args) -> tuple:
 
           bp = snap(robot.data.body_pos_w)
           foot_ids, foot_names = foot_body_ids(robot)
+          csens_col = None
+          if contacts is not None:
+              cn = [str(x).split("/")[-1] for x in getattr(contacts, "body_names", [])]
+              by = {x.split("_")[0]: i for i, x in enumerate(cn)}
+              missing = [l for l in clip["leg_order"] if l not in by]
+              if missing:
+                  raise SystemExit(f"[bench] the contact sensor reports {cn}, which does "
+                                   f"not resolve legs {missing}; refusing to trace forces "
+                                   f"against an assumed column order (harness_findings 5)")
+              csens_col = np.array([by[l] for l in clip["leg_order"]], dtype=int)
           hip_ids, hip_names = robot.find_bodies(".*_hip")
           f_by = {nm.split("_")[0]: j for j, nm in zip(foot_ids, foot_names)}
           h_by = {nm.split("_")[0]: j for j, nm in zip(hip_ids, hip_names)}
@@ -1105,7 +1142,10 @@ def run_isaac(args) -> tuple:
           # a foot the RECORDING calls planted actually stays where it was put.
           TR = None
           if args.trace_npz:
-              TR = {"root_pos_w": np.zeros((ep_steps, n, 3), np.float32),
+              TR = {"contact_f": np.zeros((ep_steps, n, 4), np.float32),
+                    "root_lin_vel_b": np.zeros((ep_steps, n, 3), np.float32),
+                    "root_ang_vel_b": np.zeros((ep_steps, n, 3), np.float32),
+                    "root_pos_w": np.zeros((ep_steps, n, 3), np.float32),
                     "root_quat_w": np.zeros((ep_steps, n, 4), np.float32),
                     "foot_pos_w": np.zeros((ep_steps, n, 4, 3), np.float32),
                     "alive": np.zeros((ep_steps, n), bool),
@@ -1443,6 +1483,8 @@ def run_isaac(args) -> tuple:
                   robot.set_joint_effort_target(eff)
               for _ in range(decim):
                   robot.write_data_to_sim(); sim.step(); robot.update(phys_dt)
+                  if contacts is not None:
+                      contacts.update(phys_dt)
 
               if video is not None and step % args.video_stride == 0:
                   grab_frame()
@@ -1454,6 +1496,13 @@ def run_isaac(args) -> tuple:
                   TR["foot_pos_w"][i_] = snap(robot.data.body_pos_w)[:, foot_ids, :]
                   TR["alive"][i_] = alive
                   TR["stance_cmd"][i_] = ~np.asarray(swing_seq[frame], bool)
+                  TR["root_lin_vel_b"][i_] = snap(robot.data.root_lin_vel_b)
+                  TR["root_ang_vel_b"][i_] = snap(robot.data.root_ang_vel_b)
+                  if contacts is not None:
+                      # Resolved to the CLIP's leg order by NAME.  The sensor's body order
+                      # is not the articulation's and not the clip's -- harness_findings 5.
+                      f_ = snap(contacts.data.net_forces_w).reshape(n, -1, 3)
+                      TR["contact_f"][i_] = np.linalg.norm(f_, axis=-1)[:, csens_col]
                   TR["n_rec"] = i_ + 1
 
               pos = snap(robot.data.root_pos_w)
@@ -1700,7 +1749,12 @@ def main() -> int:
     ap.add_argument("--skill", default="TROT",
                     help="clip to hold on every cell, or PLANNER for the "
                          "Rule-Planner arm (each robot picks its own)")
-    ap.add_argument("--rate", choices=("hi", "lo"), default="lo")
+    ap.add_argument("--rate", choices=("hi", "lo", "per-clip"), default="lo",
+                    help="clip playback rate. hi/lo force one rate on every clip and "
+                         "lo is what every published run used. per-clip takes each "
+                         "skill own measured answer from planner.config.skill.RATE_* "
+                         "-- TURN hi (72 %% -> 83 %% of the logged yaw rate), TROT hi "
+                         "(free), WALK lo (hi costs +13 %% v_x, outside the gate).")
     ap.add_argument("--terrain", choices=TERRAIN_SOURCES, default="legged_eval",
                     help="legged_eval (default): the courses generated by legged_eval, "
                          "WITH its roughness and its border walls, seeded off --terrain-seed. "
