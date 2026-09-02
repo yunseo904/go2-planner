@@ -1088,6 +1088,12 @@ def run_isaac(args, clip: dict, meta: dict, then_clip: dict | None = None,
     # is already standing.  Same settle_s for each half, so no new tuned constant.
     root = robot.data.default_root_state.clone()
     robot.write_root_state_to_sim(root)
+    # The pose --in-air pins the base to: the default orientation, lifted clear of the
+    # ground.  1.2 m is above the leg's full reach (hip-to-foot is ~0.31 m standing and the
+    # leg cannot extend past ~0.4 m), so no foot can touch whatever is below.
+    air_root = robot.data.default_root_state.clone()
+    air_root[:, 2] = 1.2
+    air_root[:, 7:] = 0.0
     q_clip0 = robot.data.default_joint_pos.clone()
     q_clip0[:, idx_t] = q_cmd[0]
 
@@ -1478,6 +1484,24 @@ def run_isaac(args, clip: dict, meta: dict, then_clip: dict | None = None,
         if fc_on or fc_bias:
             cmd_i = cmd_i + torch.as_tensor(u_foot, device=sim.device, dtype=torch.float32)
         tgt[:, idx_t] = cmd_i
+        if args.in_air:
+            # IN-AIR REPLAY.  The base is written back to a fixed pose EVERY control step,
+            # so the robot hangs with its feet clear of everything and the legs carry only
+            # their own weight.  What that separates:
+            #
+            #   RUN   run_extension.md measured a 21 deg mean thigh error and could not say
+            #         whether the PD simply cannot hold the posture or whether load pushes
+            #         it out, because the run it measured was 43 steps of a falling robot.
+            #         With no contact there is no load, so the error that remains is the
+            #         gains' own.
+            #   TURN  SESSION_STATE 13 leaves 57 % -> 35 % of the logged yaw rate open.
+            #         In air the clip's kinematics are delivered with nothing taken away by
+            #         the ground, which is the control for "what does the harness lose
+            #         before contact is even involved".
+            #
+            # Root velocity is zeroed with the pose; leaving it would let the write fight a
+            # falling body and inject a spurious acceleration into the legs each step.
+            robot.write_root_state_to_sim(air_root)
         robot.set_joint_position_target(tgt)
         if mode.needs_effort:
             eff = torch.zeros_like(tgt)
@@ -1941,6 +1965,15 @@ def main() -> int:
     ap.add_argument("--via-s", type=float, default=0.21,
                     help="how long to hold --via-clip; default is the measured median settle "
                          "time after a skill change (CLAUDE.md 3)")
+    ap.add_argument("--in-air", action="store_true",
+                    help="hold the base at a fixed pose 1.2 m up, rewritten every control "
+                         "step, so the feet touch nothing and the legs carry only their own "
+                         "weight. The KINEMATIC CONTROL: it separates what the clip and the "
+                         "PD can do from what contact and load take away. Built for two open "
+                         "questions at once -- RUN's posture (run_extension.md: is the 21 deg "
+                         "thigh error the gains or the load?) and TURN's 57 %% -> 35 %% "
+                         "(SESSION_STATE 13). A run with this on is NOT a gait; stride, duty, "
+                         "speed and yaw are meaningless and are not reported.")
     ap.add_argument("--balance-comp", choices=("off", "pd"), default="off",
                     help="off (default): open-loop replay. pd: close a loop on base attitude "
                          "-- a PD on roll added to the hip targets and on pitch added to the "
