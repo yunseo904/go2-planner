@@ -638,25 +638,87 @@ not exist. A flat TROT reference was attempted and is unusable: bare `--clip TRO
 
 ---
 
-## 15. What to do next, in order
+## 15. Session 8 (2026-09-02) — the drift is the fall, and two open questions close
 
-1. **Take the decoupling seriously: measure TRAVEL, not survival.** Two independent terms
-   now buy time upright and neither buys goals (§4b). Before adding a third balance term,
-   establish what stops a robot that stays up from going anywhere — the distance-to-next-goal
-   and cross-track columns are already in the CSV and have never been the target of an
-   intervention. **This reframes items 2–4 below rather than replacing them.**
-2. **Build the in-air replay.** It is the kinematic control for TURN's missing 57 % → 35 %
-   (§3, open since session 6) *and* the only way to settle RUN's posture question (§4). One
-   rig, two open questions.
-3. **Where does the cross-track drift come from?** Not heading, not the lateral placement
-   law at any authority. Candidates: foot slip, yaw-coupled sliding, and post-mortem drift
-   (`cross_track_m` 0.598 against `cross_track_abs_max_m` 0.408 — the gap is the fall).
-4. **Re-run the probe rig at the benchmark's own roughness (0.02–0.04 m) with more repeats**,
-   to close level 2's mechanism. Direction and dependence are settled; mechanism is not.
-5. **`--episodes 5`** to match legged_eval's 1000-env sample, now that a depth run is known
-   to cost 4.7 minutes.
-6. **Sweep `--foot-clip-rad` properly** — three seeds, both skills, support gate. An 18-cell
-   survival move from a never-examined default is worth understanding even though it is not
-   a score lead.
-7. **The library is still the ceiling** — 0.88 against 4.83. Nothing this session moved it.
-8. `effort_limit` is the user's decision; the evidence is closed.
+CPU only; GPU 1 left alone (WMP holds ~23 GB). Full detail:
+`outputs/cross_track_is_the_fall.md`, `outputs/in_air_replay.md`,
+`outputs/roll_at_the_step.md`.
+
+### The headline
+
+| question | answer |
+|---|---|
+| Where does the cross-track drift come from? | **It is the fall.** Over level walking it is 0.039 m/m, not 0.53, and 102/198 cells — chance, not a bias. |
+| Do the stance feet slide? | **No.** Interior of the bout: 0.019 m/s against a body speed of 0.192, vertical range 0.9 mm. |
+| Does the harness lose TURN's yaw before contact? | **No.** In air the thigh tracks to 0.5°. The 57 % → 35 % is entirely contact-side. |
+| Is RUN's leg pushed straight by load? | **No — it is straight with no load at all.** The calf sits on its mechanical stop 88.8 % of the run, and it is mostly the gains. |
+| Does fixing RUN's posture rescue it? | **No.** 0.91 s against 0.85 s. |
+| Do TROT and WALK climb and then fall? | **TROT at 2 cm yes (n=1). WALK never reaches 6 cm**, and where it does climb the roll goes *down*. |
+
+### 1. Cross-track — `cross_track.md` §1 is withdrawn
+
+New recording-only `--trace-npz` on `run_benchmark.py`; both arms reproduce their published
+scores exactly (0.835 with roughness, 1.090 without). The offset re-accumulated **increment
+by increment** over steps satisfying a roll cut, no-roughness arm:
+
+| cut | forward | \|lateral\| | lat/fwd | +lat cells |
+|---|---|---|---|---|
+| alive (\|roll\|<60°) | 0.974 | 0.253 | **0.259** | 110/198 |
+| \|roll\| < 20° | 0.903 | 0.089 | 0.099 | 109/198 |
+| **\|roll\| < 10°** | **0.888** | **0.034** | **0.039** | **102/198 = chance** |
+
+Forward travel does not move; lateral collapses sevenfold. Final lateral offset correlates
+with final roll at **−0.93**, median \|roll\| at the last upright step **88°**. `alive`
+admits 60° and a 0.30 m base at 55° has already moved its centre a quarter-metre sideways.
+
+**`--cross-track hold` is exonerated**: it reproduced the control at every gain, either
+sign, and 3× the authority **because there was nothing to correct**. The
+`staircase_spiral` conjecture is weakened (0.039 m/m over 2.6 m is 0.10 m, not 0.30).
+
+> A first pass of the foot measurement used whole stance bouts, reported 0.54 and
+> "the feet slide". That was touchdown and liftoff inside the window; the interior number
+> is 0.10 and reverses it. Recorded because it is the same failure the file is about.
+
+### 2. `--in-air` on `verify_skill_replay.py`
+
+Base written back to a fixed pose 1.2 m up every control step; feet touch nothing. **TURN**
+tracks to 0.009 rad of mean thigh error over 900 steps → the loss is at contact. **RUN** in
+air, 320 steps against the 43 the ground run managed:
+
+| arm | calf err | calf **at its stop** | delta ext |
+|---|---|---|---|
+| torque (clip gains 13/3/2 + ff) | 0.787 rad | **88.8 %** | +0.385 |
+| ff-only (stock gains + ff) | 0.215 | 7.8 % | +0.100 |
+| position (stock gains, no ff) | 0.069 | 0.0 % | +0.005 |
+
+The original "leg ends up straight" hypothesis is **confirmed** and `run_extension.md`'s
+reversal of it was the fall (43 steps of a toppling robot). The mechanism is **the gains**,
+not load. On the ground, position mode buys **0.06 s**; not adopted — it is not a replay of
+a torque-mode recording.
+
+### 3. Roll at the step
+
+TROT at 2 cm: \|roll\| 1.11° on the flat run-up → **3.72° in the 1 s after the riser**,
+58° and dead 1.8 s later; roll is initiated by the crossing. **n = 1** — TROT crosses only
+that rung. WALK never reaches the 6 cm riser (2.81 m of 3.00), and at 2 and 4 cm where it
+does climb, roll *falls* (ratio 0.59 / 0.83) and those are its two longest runs.
+
+## 16. What to do next, in order
+
+1. **Why does it roll over at 0.7–0.9 m?** Everything now points here: §15.1 says the
+   cross-track column is this event, §15.3 says WALK's probe failure is this event on the
+   flat approach at 14–16 s, and §14.4b's survival/score decoupling is the same thing seen
+   through the score. It has never been the target of a measurement, only of interventions
+   (the roll couple, the placement cap) that buy time without buying distance.
+2. **TURN's 57 % → 35 % is contact-side**, and the in-air control has removed the clip and
+   the PD from the candidate list. Left: the per-cell lever, the 0.42 m spawn drop, the
+   200-robot scene.
+3. **Re-run the probe rig at the benchmark's own roughness (0.02–0.04 m)** with more
+   repeats — deferred from §15, still open, still the way to close level 2's mechanism.
+4. **`--episodes 5`** to match legged_eval's 1000-env sample.
+5. **The library is still the ceiling** — 0.88 against 4.83.
+6. `effort_limit` is the user's decision; the evidence is closed.
+
+**Closed this session and not to be reopened without new evidence**: the cross-track
+channel, RUN's posture, and the question of whether the harness loses TURN's kinematics
+before contact.
