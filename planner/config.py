@@ -77,7 +77,24 @@ class SkillLimits:
     # measured constant instead.  -1 means "no measurement, use the rule".
     ENTRY_FRAME_TURN: int = 6
 
-    # -- clip playback rate, per skill -- MEASURED, and it is NOT one setting ---------
+    # -- clip playback rate, per skill -- NOT ADOPTED.  See the warning below. --------
+    #
+    # MEASURED 2026-09-02, and it stops this table from being used: `hi` and `lo` are the
+    # SAME cycle sampled at different rates -- WALK is 37 frames at 50.6 Hz and 306 at
+    # 418 Hz -- and every harness here plays ONE FRAME PER CONTROL STEP at 50 Hz.  So
+    # selecting `hi` does not play the clip faster, it stretches it by the sample-rate
+    # ratio: 0.74 s per cycle becomes 6.12 s, a slowdown of 8.3x (TROT 8.4x, TURN 8.3x).
+    #
+    # Measured on the benchmark, 200 cells, no roughness, roll couple on:
+    #
+    #   WALK rate lo   score 1.090   v_x  0.1070 m/s   alive 74/200
+    #   WALK rate hi   score 0.005   v_x -0.0045 m/s   alive  3/200
+    #
+    # That is not a gait.  SESSION_STATE 12's "TURN hi is worth 72 % -> 83 % of the logged
+    # yaw rate" was measured on a different harness and CANNOT be reconciled with a pure
+    # 8.3x slowdown as it stands -- a longer cycle gives a LOWER yaw rate in deg/s, not a
+    # higher one.  Whoever revisits it should establish what that measurement was per:
+    # per second, or per cycle.  Until then this table is inert.
     # The archive carries each clip resampled two ways.  Which one is better is a per-clip
     # question and the evidence is per clip (SESSION_STATE 12, "TURN"):
     #
@@ -90,8 +107,8 @@ class SkillLimits:
     # RUN and JUMP are unresolved and carry lo, the archive's default, so nothing about
     # them changes silently.
     RATE_WALK: str = "lo"
-    RATE_TROT: str = "hi"
-    RATE_TURN: str = "hi"
+    RATE_TROT: str = "lo"
+    RATE_TURN: str = "lo"
     RATE_RUN: str = "lo"
     RATE_JUMP: str = "lo"
 
@@ -134,14 +151,14 @@ _p("skill.YAW_RATE_TURN", Provenance.MEASURED, "rad/s",
    "skill_profile.csv yaw_rate_steady_mean -0.3954 (-22.66 deg/s) for turn_right_20260824_223951. "
    "This is the MEASURED rate, not the -0.6 rad/s that was commanded to produce it, and it is "
    "the same number the low level uses as its foot-placement target (outputs/turn_target.md)")
-_p("skill.RATE_WALK", Provenance.MEASURED, "-",
-   "hi moves WALK v_x +13 %, outside the +-10 % gate; lo kept (SESSION_STATE 12)")
-_p("skill.RATE_TROT", Provenance.MEASURED, "-",
-   "hi is free on TROT: v_x +1 %, stride cv halved (SESSION_STATE 12)")
-_p("skill.RATE_TURN", Provenance.MEASURED, "-",
-   "hi is worth 72 %% -> 83 %% of the logged yaw rate, stride cv 0.224 -> 0.068")
-_p("skill.RATE_RUN", Provenance.MEASURED, "-", "unresolved skill; archive default")
-_p("skill.RATE_JUMP", Provenance.MEASURED, "-", "unresolved skill; archive default")
+_p("skill.RATE_WALK", Provenance.CALIBRATION_NEEDED, "-",
+   "NOT ADOPTED: hi is an 8.3x slowdown in this harness, not a faster playback")
+_p("skill.RATE_TROT", Provenance.CALIBRATION_NEEDED, "-",
+   "NOT ADOPTED: hi is an 8.4x slowdown in this harness")
+_p("skill.RATE_TURN", Provenance.CALIBRATION_NEEDED, "-",
+   "NOT ADOPTED: hi is an 8.3x slowdown here; SESSION_STATE 12 needs re-reading")
+_p("skill.RATE_RUN", Provenance.CALIBRATION_NEEDED, "-", "unresolved skill; archive default")
+_p("skill.RATE_JUMP", Provenance.CALIBRATION_NEEDED, "-", "unresolved skill; archive default")
 _p("skill.ENTRY_FRAME_TURN", Provenance.MEASURED, "frame",
    "outputs/turn_entry_phase.md. All 45 phases of the 45-frame TURN clip were run as the "
    "in-place flat control, 9 identical cells each, in both foot-comp arms -- 810 runs. "

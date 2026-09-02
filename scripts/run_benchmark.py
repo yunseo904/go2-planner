@@ -431,7 +431,17 @@ def rate_for(skill: str, arg: str) -> str:
     """
     if arg != "per-clip":
         return arg
-    return str(getattr(PLANNER_CFG.skill, f"RATE_{skill.upper()}", "lo"))
+    r = str(getattr(PLANNER_CFG.skill, f"RATE_{skill.upper()}", "lo"))
+    if r != "lo":
+        # Refused rather than run.  `hi` is the SAME cycle sampled at 418 Hz instead of
+        # 50, and this harness plays one frame per control step, so it is an 8.3-8.4x
+        # SLOWDOWN -- measured, WALK 1.090 -> 0.005 with v_x 0.107 -> -0.005 m/s.  Shipping
+        # a table that selects it would quietly turn two skills into slow motion.
+        raise SystemExit(
+            f"[bench] --rate per-clip wants {r!r} for {skill}, and {r!r} is an 8.3x "
+            f"slowdown in this harness, not a faster playback (planner.config RATE_*). "
+            f"Refusing. Use --rate lo, or fix the resampling first.")
+    return r
 
 
 def run_isaac(args) -> tuple:
