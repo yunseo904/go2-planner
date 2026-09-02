@@ -1,5 +1,16 @@
 # The robot cannot go straight, and foot placement cannot make it
 
+> **CORRECTION, later than this document — `outputs/cross_track_is_the_fall.md`.**
+> §1's headline is withdrawn. The 0.53 m/m and the 149/200 are read at the END of the
+> episode, and `alive` admits |roll| up to 60°: a 0.30 m base at 55° has already carried its
+> centre a quarter of a metre sideways with every foot where it was put. Accumulated over
+> steps with |roll| < 10° the same no-roughness arm gives **0.039 m/m** and **102/198 cells
+> the same way, which is chance**. The final lateral offset correlates with the final roll
+> at **−0.93**. §2–§4's finding stands and is now explained rather than merely measured:
+> the cross-track term changed nothing at any gain, either sign, or three times the
+> authority **because there was nothing there to correct**. The title is wrong; the robot
+> goes straight and then falls over.
+
 ## 1. The drift is real, large, and one-sided
 
 Heading hold closes a loop on the yaw ANGLE and measures 13.26 -> 0.24 deg/m.  Nothing

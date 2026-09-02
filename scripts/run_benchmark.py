@@ -1094,6 +1094,23 @@ def run_isaac(args) -> tuple:
           x_ref = snap(robot.data.root_pos_w)[:, 0].astype(float).copy()
           ct_err = np.zeros(n)
           ct_abs_max = np.zeros(n)
+          # ---- per-step trace, RECORDING ONLY -------------------------------------
+          # Nothing here is read by the controller and nothing is written to the sim.
+          # It exists because SESSION_STATE 15.3 asks where the cross-track drift comes
+          # from, and the summary columns cannot answer it: cross_track_m is read at the
+          # END of the episode and so includes post-mortem sliding, while
+          # cross_track_abs_max_m stops at the last upright step.  The gap between them
+          # (0.598 vs 0.408) is the fall, and separating the two needs the time series.
+          # Foot world positions are here for the other half of the question -- whether
+          # a foot the RECORDING calls planted actually stays where it was put.
+          TR = None
+          if args.trace_npz:
+              TR = {"root_pos_w": np.zeros((ep_steps, n, 3), np.float32),
+                    "root_quat_w": np.zeros((ep_steps, n, 4), np.float32),
+                    "foot_pos_w": np.zeros((ep_steps, n, 4, 3), np.float32),
+                    "alive": np.zeros((ep_steps, n), bool),
+                    "stance_cmd": np.zeros((ep_steps, 4), bool),
+                    "n_rec": 0}
           vy_b = np.zeros(n)
           foots = None
           rolls = None
@@ -1430,6 +1447,15 @@ def run_isaac(args) -> tuple:
               if video is not None and step % args.video_stride == 0:
                   grab_frame()
 
+              if TR is not None:
+                  i_ = TR["n_rec"]
+                  TR["root_pos_w"][i_] = snap(robot.data.root_pos_w)
+                  TR["root_quat_w"][i_] = snap(robot.data.root_quat_w)
+                  TR["foot_pos_w"][i_] = snap(robot.data.body_pos_w)[:, foot_ids, :]
+                  TR["alive"][i_] = alive
+                  TR["stance_cmd"][i_] = ~np.asarray(swing_seq[frame], bool)
+                  TR["n_rec"] = i_ + 1
+
               pos = snap(robot.data.root_pos_w)
               idx = tracker.update(pos[:, :2])
               roll, pitch, yaw_t = quat_to_rpy_deg(snap(robot.data.root_quat_w))
@@ -1471,6 +1497,19 @@ def run_isaac(args) -> tuple:
           ended[alive] = tracker.idx[alive]        # the rest time out, upstream's way
           # Where each robot finished, and how far it still had to go.  Recorded because the
           # integer goal count has about three and a half units of usable range.
+          if TR is not None:
+              m_ = TR.pop("n_rec")
+              out_ = {k_: v_[:m_] for k_, v_ in TR.items()}
+              Path(args.trace_npz).parent.mkdir(parents=True, exist_ok=True)
+              np.savez_compressed(
+                  args.trace_npz, dt=dt, cells=np.asarray(cells),
+                  task_names=np.asarray([names[t_] for (t_, _l) in cells]),
+                  levels=np.asarray([l_ for (_t, l_) in cells]),
+                  spawns=spawns, goals=goals, offs=offs, y_ref=y_ref, x_ref=x_ref,
+                  leg_order=np.asarray(clip["leg_order"]),
+                  foot_names=np.asarray(foot_names), **out_)
+              print(f"[bench] trace -> {args.trace_npz} ({m_} steps x {n} cells)")
+
           fin_xy = snap(robot.data.root_pos_w)[:, :2]
           dist_next = np.array([np.linalg.norm(fin_xy[k] - goals[k, min(ended[k], NUM_GOALS - 1)])
                                 for k in range(n)])
@@ -1806,6 +1845,13 @@ def main() -> int:
                          "--planner-set skill.STEP_TROT_MAX=0.03. planner/config.py is NOT "
                          "written to: a CALIBRATION_NEEDED placeholder stays one. Every row "
                          "is stamped with what was overridden.")
+    ap.add_argument("--trace-npz", default=None,
+                    help="write a per-step trace (root pose, foot world positions, the "
+                         "alive mask and the clip's own stance mask). RECORDING ONLY -- "
+                         "nothing in it is read by a controller. Needed because the "
+                         "summary columns cannot separate drift-while-upright from "
+                         "post-mortem sliding, which is the gap between cross_track_m and "
+                         "cross_track_abs_max_m.")
     ap.add_argument("--results-csv", default=None)
     ap.add_argument("--plan", action="store_true")
     ap.add_argument("--self-test", action="store_true")
