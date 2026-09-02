@@ -703,22 +703,66 @@ TROT at 2 cm: \|roll\| 1.11° on the flat run-up → **3.72° in the 1 s after t
 that rung. WALK never reaches the 6 cm riser (2.81 m of 3.00), and at 2 and 4 cm where it
 does climb, roll *falls* (ratio 0.59 / 0.83) and those are its two longest runs.
 
-## 16. What to do next, in order
+## 16. Session 9 (2026-09-02) — the roll measured, and a flag that meant the opposite
 
-1. **Why does it roll over at 0.7–0.9 m?** Everything now points here: §15.1 says the
-   cross-track column is this event, §15.3 says WALK's probe failure is this event on the
-   flat approach at 14–16 s, and §14.4b's survival/score decoupling is the same thing seen
-   through the score. It has never been the target of a measurement, only of interventions
-   (the roll couple, the placement cap) that buy time without buying distance.
-2. **TURN's 57 % → 35 % is contact-side**, and the in-air control has removed the clip and
-   the PD from the candidate list. Left: the per-cell lever, the 0.42 m spawn drop, the
-   200-robot scene.
-3. **Re-run the probe rig at the benchmark's own roughness (0.02–0.04 m)** with more
-   repeats — deferred from §15, still open, still the way to close level 2's mechanism.
-4. **`--episodes 5`** to match legged_eval's 1000-env sample.
+CPU only; GPU 1 untouched. Detail: `why_it_rolls.md`, `trot_4cm.md`.
+
+### Confirmed and closed (carried forward from session 8, unchanged)
+
+- **cross-track hold is a null** — there was nothing to correct.
+- **RUN is unresolved and the posture is not the cause** — calf on its stop 88.8 % of an
+  in-air run, and delivering the posture buys 0.06 s.
+- **WALK does not reach a 6 cm riser**; at 2 and 4 cm, where it does climb, roll *falls*.
+- **TURN's 57 % → 35 % is entirely contact-side.**
+
+### 1. The roll: measured, not intervened on — `why_it_rolls.md`
+
+| | |
+|---|---|
+| onset is tighter than the fall | \|roll\|>20° at CV **0.47**, the fall itself CV 0.64 |
+| 10° and 20° are the same moment | 0.88 vs 0.89 m — a step change, not a lean |
+| **the trigger is TIME, not distance** | time CV **0.38**, distance CV **0.47**; implied speed CV 0.31 |
+| roughness | brings it forward (0.28 m) and randomises it (CV 0.97). It does not create it |
+| every skill, own clock | TROT **3.65 s**, WALK **5.78 s**, TURN **11.82 s** (CV 0.19) |
+| **the real robot does not do it** | worst \|roll\| in any `03_slow_walk` session **3.39°**; the sim's flat-ground mean is 2.3–2.6° |
+
+"0.7–0.9 m" is a consequence of the speed spread, not the thing. **Mechanism still open** —
+the contact-force instrument is built and the which-foot-unloads-first analysis is not done.
+
+### 2. TROT at 4 cm — `trot_4cm.md`
+
+At the surviving clip frames, **2 of 3 never reach the riser** (2.89 m and 2.96 m of 3.00 m).
+The one that does climbs it and dies **7.3 s later**, with roll 2.12° → 2.73° and support
+*improving* 2.38 → 2.52 feet; what moves is pitch, −13° nose-down, and forward progress
+stops. **The observed front-pair-caught / diagonal-collapse mode is not the dominant one at
+these phases** (the videos were not made at these phases; the observation is not disputed).
+The real asymmetry is front/rear load — duty FL/FR 0.35–0.48 against RL/RR 0.73–0.79, on a
+clip whose own duty is 0.578. **Same event as §16.1**, as anticipated.
+
+### 3. `--rate` — NOT ADOPTED, and the flag means the opposite of what was assumed
+
+`hi` and `lo` are the **same cycle sampled at 418 Hz and 50 Hz**, and every harness plays one
+frame per control step at 50 Hz. So `hi` **stretches the gait 8.3×** (WALK 0.74 → 6.12 s per
+cycle). Measured: **WALK hi scores 0.005, v_x −0.0045 m/s, 3/200 alive**, against lo's 1.090 /
++0.1070 / 74.
+
+`planner.config.RATE_*` are all `lo`, provenance **CALIBRATION_NEEDED**, and
+`--rate per-clip` **refuses**. **§12's "TURN hi is worth 72 % → 83 % of the logged yaw rate"
+cannot be reconciled with a pure 8.3× slowdown** — a longer cycle gives a *lower* yaw rate in
+°/s. Whoever revisits it must establish whether that was measured per second or per cycle.
+
+## 17. What to do next, in order
+
+1. **Which foot unloads first through the roll onset.** The `ContactSensor` is wired behind
+   `--trace-npz` and the traces carry the forces; only the analysis is missing. Pipe runs
+   through `grep -aFv getMaterialFromInternalFaceIndex` — unfiltered it is ~3 GB of PhysX
+   warning per 200-cell run and it fills the disk.
+2. **Re-read §12's `--rate` evidence** against §16.3 before anything else uses it.
+3. **Re-run the probe rig at the benchmark's own roughness (0.02–0.04 m)**, still open.
+4. **§13's remaining TURN candidates** — per-cell lever, the 0.42 m spawn drop, the
+   200-robot scene. All contact-side, none examined.
 5. **The library is still the ceiling** — 0.88 against 4.83.
 6. `effort_limit` is the user's decision; the evidence is closed.
 
-**Closed this session and not to be reopened without new evidence**: the cross-track
-channel, RUN's posture, and the question of whether the harness loses TURN's kinematics
-before contact.
+**No new intervention was added this session**, by instruction and because the roll's
+mechanism is still unknown — which is the reason the roll couple's mechanism is unknown too.
