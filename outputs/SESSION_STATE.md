@@ -751,18 +751,77 @@ cycle). Measured: **WALK hi scores 0.005, v_x −0.0045 m/s, 3/200 alive**, agai
 cannot be reconciled with a pure 8.3× slowdown** — a longer cycle gives a *lower* yaw rate in
 °/s. Whoever revisits it must establish whether that was measured per second or per cycle.
 
-## 17. What to do next, in order
+## 17. Session 10 (2026-09-02) — the replay is faithful, the terrain is not survivable
 
-1. **Which foot unloads first through the roll onset.** The `ContactSensor` is wired behind
-   `--trace-npz` and the traces carry the forces; only the analysis is missing. Pipe runs
-   through `grep -aFv getMaterialFromInternalFaceIndex` — unfiltered it is ~3 GB of PhysX
-   warning per 200-cell run and it fills the disk.
-2. **Re-read §12's `--rate` evidence** against §16.3 before anything else uses it.
-3. **Re-run the probe rig at the benchmark's own roughness (0.02–0.04 m)**, still open.
-4. **§13's remaining TURN candidates** — per-cell lever, the 0.42 m spawn drop, the
-   200-robot scene. All contact-side, none examined.
+CPU only; GPU 1 untouched. Detail: `real_vs_sim.md`, `rate_resolved.md`.
+
+### The headline
+
+| question | answer |
+|---|---|
+| Reproduction failure, or a limit of open-loop replay? | **Neither.** The sim tracks the joints better than the real robot's own PD on 2 of 3, and holds a bounded 3.71° roll for 19 cycles on flat. |
+| Does the sim's roll accumulate? | **No.** Trend −0.048°/cycle over 19 cycles; the worst cycle is the first (the settle). |
+| So where is the 20° roll? | **It needs terrain.** Flat 1.68° mean, benchmark 6.28° (WALK) / 8.28° (TROT). |
+| Is TROT's front/rear bias in the clip? | **No — the replay makes it**, equally in WALK. |
+| Which foot lets go first? | **Skill-specific**: WALK a front foot 97 %, TURN the rear-left 99 %. |
+| Is `--rate hi` a slowdown or an improvement? | **Both**, and that is now explained. |
+
+### 1. Real vs sim — `real_vs_sim.md`
+
+Per-cycle peak \|roll\|, each clip against **its own source session**: real 2.38 / 3.39 /
+1.59 / 1.87 / 1.64, median **1.87°**; sim flat 6.66 then 2.99–4.23 through **19 cycles**,
+median **3.71°**, trend **−0.048°/cycle**. Twice as much roll, **not growing**, and the worst
+cycle is the settle.
+
+Joint tracking, \|q − q_cmd\| rad — **the real robot's own PD is the worse tracker on two
+joints of three**: hip 0.0466 real / 0.0641 sim, thigh 0.0674 / **0.0559**, calf 0.1676 /
+**0.1457**.
+
+**So the question as posed has no third option left: it is not reproduction and it is not
+open-loop replay. It is the terrain.**
+
+### 2. The rear-load bias is made by the replay
+
+Front/rear stance duty: **clip 1.042 (WALK) / 1.056 (TROT), real robot 0.934 / 0.970, sim
+0.798 / 0.793.** Not in the recording, not TROT-specific. **Pitch is excluded** — nose-down
+would load the front *more*, and the base is nose-down everywhere (real −1.42°, sim −2.85°).
+Unexplained, and it is the most specific lead in the project, because —
+
+### 3. — the front pair is also the pair that lets go
+
+Leg most unloaded in the 0.5 s before \|roll\| passes 10°: **WALK front 97 %** (FL 42 / FR 55),
+TROT front-biased but mixed (FL 48 / FR 14 / RL 23 / RR 15), **TURN rear-left 99 %**. Feet
+down across the onset 3.12 → 2.70, 2.42 → 2.19, 3.37 → 2.80. **Same shape, different leg.**
+
+### 4. `--rate` resolved — `rate_resolved.md`
+
+`hi` and `lo` are the same cycle at 418 Hz and 50 Hz, played one frame per control step, so
+`hi` is **8.3× real time** — and `lo` is a **decimated** recording. Both facts follow:
+
+- WALK benchmark **1.090 → 0.005**, v_x +0.107 → **−0.0045**. Fatal to anything that travels.
+- TURN flat rig, per second, against the log's −22.66 °/s: `lo` **63 %**, `hi` **85 %**, and
+  v_x's sign comes right (+0.0149 against `lo`'s −0.0296, log +0.0075). **§12's 72 → 83 % is
+  confirmed, per second.**
+
+**TURN's replay gap is two gaps**: benchmark `lo` 35 %, flat `lo` 63 %, flat `hi` 85 % — about
+**28 points is the rig and 22 the sampling**. `skill_push` §3's "largest single unexplained
+gap in the library" overstates what remains. **Not licensed**: `hi` is 8.3× real time. The fix
+is resampling to the control rate, which is a change to how clips are played, not a
+measurement, and would move every published number.
+
+## 18. What to do next, in order
+
+1. **Why is the front pair under-loaded?** §17.2 + §17.3: the replay puts 0.79 front/rear
+   against the clip's 1.05, and the front pair is what lets go before the roll. Pitch is
+   excluded. This is the one lead that is both specific and unexplained.
+2. **Which terrain feature.** §17.1 says the roll needs terrain and the benchmark's
+   `--no-roughness` arm still rolls, so it is the task geometry or the 0.42 m spawn drop,
+   not the added roughness. Neither has been separated.
+3. **Resampling `hi` to the control rate** would test §17.4 properly. It moves every
+   published number, so it is a decision, not a measurement.
+4. **Re-run the probe rig at the benchmark's own roughness (0.02–0.04 m)**, still open.
 5. **The library is still the ceiling** — 0.88 against 4.83.
 6. `effort_limit` is the user's decision; the evidence is closed.
 
-**No new intervention was added this session**, by instruction and because the roll's
-mechanism is still unknown — which is the reason the roll couple's mechanism is unknown too.
+**No new intervention was added, in this session or the last**, by instruction and because
+the mechanism is still open.
